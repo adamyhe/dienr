@@ -1,5 +1,26 @@
 """NB2 fitting with a shared dispersion, plus dispersion estimation.
 
+**Deprioritized. Prefer `dienr.solvers.inference` quasi-Poisson.** Gate D
+established two things that between them remove most of NB2's reason to exist
+on the designs this package actually builds:
+
+1. On a rounded binary design NB2 **cannot change the point estimate at all.**
+   The identity-link score weights residuals by ``1 / V(mu)``, so a constant
+   ``mu`` across a model's support makes that weight constant and the
+   estimating equation reduces to the sample mean whatever the variance
+   function is. Least squares, Poisson and NB2 agree to ``0.000e+00`` even at
+   dispersion 3.0.
+2. What NB2 legitimately offers is calibrated uncertainty, and **quasi-Poisson
+   delivers that to within a few percent** using one scalar from a Poisson fit
+   — no second likelihood, no per-fit fixed dispersion, no non-convex
+   objective, and no mean-collapse guard, all of which this module needs.
+
+Keep it for the case it is genuinely required: a design where the fitted mean
+varies enough across a locus that the full variance function matters for the
+estimate too. That means non-binary occupancy, which in practice means the
+shape profile — currently a v1 non-goal. Until that exists, selecting
+``likelihood="negative_binomial"`` buys nothing over ``"quasi_poisson"``.
+
 Section 4.3 of the plan. NB2 means ``Var(y) = mu + phi mu^2``. Writing
 ``r = 1 / phi`` for the size parameter, the negative log-likelihood is
 

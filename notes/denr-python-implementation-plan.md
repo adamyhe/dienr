@@ -1186,8 +1186,27 @@ on effect size — inherits that overconfidence.
    constant ``mu`` the Pearson statistic estimates ``1 + phi mu``, which is
    exactly the NB2 inflation factor.
 
-So the honest recommendation is to **report quasi-Poisson standard errors from
-the Poisson fit, and treat NB2 as optional**. QP needs no second likelihood, no
+**Implemented.** `dienr.solvers.inference` supplies Wald standard errors and a
+pooled quasi-Poisson dispersion, and `fit(likelihood="quasi_poisson")` returns
+the Poisson abundances with errors scaled by ``sqrt(phi)``. Three details worth
+recording:
+
+- The dispersion is pooled over every locus of **every sample** in the run,
+  which needs a second pass after fitting. Per-locus estimation is forbidden
+  here for the same reason section 4.3 forbids it for NB2.
+- Standard errors are **NaN where a Wald error is not defined**: a model at the
+  nonnegativity boundary has a one-sided sampling distribution, and a singular
+  information matrix leaves the error undefined rather than large. Emitting a
+  big finite number in either case would invite a symmetric interval that does
+  not exist.
+- `is_overdispersed` requires the estimate to clear 1 by ``z`` standard errors,
+  where the Pearson statistic's standard error is ``sqrt(2 / df)`` under the
+  null. A bare ``> 1`` test fires on about half of perfectly equidispersed
+  datasets; it did so during development, at 1.0215 on Poisson data.
+
+So the honest recommendation, now the shipped behavior, is to **report
+quasi-Poisson standard errors from the Poisson fit, and treat NB2 as
+optional**. QP needs no second likelihood, no
 dispersion held fixed per fit, no non-convex objective, and no mean-collapse
 guard — all of which NB2 required. NB2 earns its place only where ``mu`` varies
 enough across a locus that the full variance function matters for the estimate

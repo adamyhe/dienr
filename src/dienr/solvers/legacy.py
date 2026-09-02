@@ -58,6 +58,12 @@ class LocusFit:
         converged: Whether the optimizer met its convergence criteria.
         message: Optimizer message, verbatim.
         failure_reason: Populated when `status` is a failure.
+        standard_error: Wald standard error per model, or None when the
+            likelihood does not supply one. The legacy objectives leave it
+            None: a sum of squares on either scale implies no variance model,
+            so any error derived from it would be inventing one. NaN entries
+            mean the error is undefined for that model -- see
+            `dienr.solvers.inference.standard_errors`.
     """
 
     abundance: np.ndarray
@@ -68,6 +74,7 @@ class LocusFit:
     converged: bool
     message: str
     failure_reason: str | None = None
+    standard_error: np.ndarray | None = None
 
 
 def predict(models: np.ndarray, abundance: np.ndarray) -> np.ndarray:

@@ -7,6 +7,7 @@ so a workflow engine can cache each stage independently (plan section 11).
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Literal
 
 import numpy as np
@@ -15,16 +16,21 @@ import polars as pl
 from .counts import SampleCounts
 from .design import Design
 from .results import FitResult, collect_results
-from .solvers import negative_binomial, poisson
+from .solvers import inference, negative_binomial, poisson
 from .solvers._glm import Exposure
 from .solvers.legacy import LocusFit, Transform, fit_locus
 from .solvers.penalties import NO_PENALTY, Penalty
-from .status import FitStatus
+from .status import FitStatus, is_failure
 
-Likelihood = Literal["legacy", "poisson", "negative_binomial"]
+Likelihood = Literal["legacy", "poisson", "quasi_poisson", "negative_binomial"]
 
 #: Likelihoods that need raw counts rather than a per-base mean.
-_COUNT_LIKELIHOODS = ("poisson", "negative_binomial")
+_COUNT_LIKELIHOODS = ("poisson", "quasi_poisson", "negative_binomial")
+
+#: Likelihoods whose point estimate comes from the Poisson solver.
+#: quasi-Poisson is not a different estimator -- it is the same fit with an
+#: honest variance -- so it must not be implemented as a separate objective.
+_POISSON_ESTIMATORS = ("poisson", "quasi_poisson")
 
 
 def fit(
@@ -47,7 +53,23 @@ def fit(
         design: Reusable locus geometry.
         counts: One or more samples counted against `design`.
         likelihood: ``"legacy"`` (default, and the only one with established R
-            parity), ``"poisson"``, or ``"negative_binomial"``.
+            parity), ``"poisson"``, ``"quasi_poisson"``, or
+            ``"negative_binomial"``.
+
+            ``"quasi_poisson"`` gives **the same abundances as** ``"poisson"``
+            and differs only in the reported standard errors, which are scaled
+            by ``sqrt(phi)`` for a dispersion pooled across loci. That is the
+            recommended choice when the counts are overdispersed: a Poisson
+            standard error understates the true spread by 23% at ``phi = 0.1``
+            and 64% at ``phi = 1.0``, while quasi-Poisson tracks it to within a
+            few percent and needs no second likelihood.
+
+            ``"negative_binomial"`` is **deprioritized**. On a rounded binary
+            design it cannot change the point estimate at all -- see plan
+            Gate D -- and quasi-Poisson matches it on uncertainty far more
+            cheaply. It remains available for designs where the fitted mean
+            varies enough across a locus for the full variance function to
+            matter.
         transform: Legacy objective; ignored by the count likelihoods.
         penalty: Named penalty. Only the count likelihoods accept one; the
             legacy solver has no penalty support, matching the reference.
@@ -123,11 +145,8 @@ def fit(
                 )
                 continue
 
-            exposure = Exposure(
-                sample_scale=sample.exposure,
-                bin_exposure=design.bin_lengths[locus_id] if use_bin_exposure else None,
-            )
-            if likelihood == "poisson":
+            exposure = _sample_exposure(design, sample, locus_id, use_bin_exposure)
+            if likelihood in _POISSON_ESTIMATORS:
                 fits.append(
                     poisson.fit_locus(
                         models,
@@ -156,7 +175,26 @@ def fit(
                 )
         fitted.append((sample, fits))
 
+    dispersion_record: dict[str, Any] = {}
+    if likelihood in _POISSON_ESTIMATORS:
+        # Quasi-Poisson needs a second pass: the dispersion is pooled over
+        # every locus of every sample, which cannot be known while fitting one
+        # locus. Section 4.3's rule against per-locus dispersion applies here
+        # exactly as it does to NB.
+        estimate = (
+            inference.POISSON_DISPERSION
+            if likelihood == "poisson"
+            else inference.estimate_quasi_poisson_dispersion(
+                _dispersion_inputs(design, fitted, use_bin_exposure)
+            )
+        )
+        dispersion_record = dict(estimate.describe())
+        if likelihood == "poisson":
+            dispersion_record["dispersion_method"] = "poisson_assumed"
+        _attach_standard_errors(design, fitted, estimate.dispersion, use_bin_exposure)
+
     merged: dict[str, Any] = {"likelihood": likelihood}
+    merged.update(dispersion_record)
     if likelihood == "legacy":
         merged["transform"] = transform
     else:
@@ -194,6 +232,59 @@ def _require_count_equivalent(sample: SampleCounts, likelihood: str) -> None:
             f"sample {sample.sample_id!r} has value_kind {sorted(transformed)}, "
             f"but likelihood {likelihood!r} requires untransformed counts."
         )
+
+
+def _sample_exposure(
+    design: Design, sample: SampleCounts, locus_id: int, use_bin_exposure: bool
+) -> Exposure:
+    """The exposure a given locus of a given sample was fitted under."""
+    return Exposure(
+        sample_scale=sample.exposure,
+        bin_exposure=design.bin_lengths[locus_id] if use_bin_exposure else None,
+    )
+
+
+def _dispersion_inputs(
+    design: Design,
+    fitted: list[tuple[SampleCounts, list[LocusFit]]],
+    use_bin_exposure: bool,
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Completed fits eligible to contribute to a pooled dispersion.
+
+    Failed loci are excluded: their abundance is NaN, and an all-zero locus
+    contributes no residual information about overdispersion either.
+    """
+    triples = []
+    for sample, fits in fitted:
+        for locus_id, fit in enumerate(fits):
+            if is_failure(fit.status) or fit.status is FitStatus.ALL_ZERO:
+                continue
+            triples.append((design.models[locus_id], sample.values[locus_id], fit.abundance))
+    return triples
+
+
+def _attach_standard_errors(
+    design: Design,
+    fitted: list[tuple[SampleCounts, list[LocusFit]]],
+    dispersion: float,
+    use_bin_exposure: bool,
+) -> None:
+    """Fill in each fit's `standard_error` at the pooled dispersion.
+
+    `LocusFit` is frozen, so this replaces entries in place rather than
+    mutating them.
+    """
+    for sample, fits in fitted:
+        for locus_id, fit in enumerate(fits):
+            if is_failure(fit.status):
+                continue
+            errors = inference.standard_errors(
+                design.models[locus_id],
+                fit.abundance,
+                exposure=_sample_exposure(design, sample, locus_id, use_bin_exposure),
+                dispersion=dispersion,
+            )
+            fits[locus_id] = replace(fit, standard_error=errors)
 
 
 def _pinned_models(

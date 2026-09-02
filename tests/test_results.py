@@ -548,3 +548,80 @@ def test_empty_result_has_an_empty_summary(design):
 def test_extra_provenance_is_merged(design):
     result = fit(design, synthetic_counts(design), provenance={"run_label": "smoke"})
     assert result.provenance["run_label"] == "smoke"
+
+
+# --- quasi-Poisson end to end ----------------------------------------------
+
+
+def test_quasi_poisson_gives_the_same_abundances_as_poisson(design):
+    """It is a variance model, not a different estimator.
+
+    If the abundances ever diverge, quasi-Poisson has been implemented as a
+    separate objective, which it must not be.
+    """
+    counts = count_equivalent_counts(design, seed=10)
+    plain = fit(design, counts, likelihood="poisson")
+    quasi = fit(design, counts, likelihood="quasi_poisson")
+    np.testing.assert_allclose(
+        plain.model_abundance["abundance_raw"].to_numpy(),
+        quasi.model_abundance["abundance_raw"].to_numpy(),
+        rtol=1e-12,
+    )
+
+
+def test_quasi_poisson_standard_errors_scale_by_root_dispersion(design):
+    counts = count_equivalent_counts(design, seed=11)
+    plain = fit(design, counts, likelihood="poisson")
+    quasi = fit(design, counts, likelihood="quasi_poisson")
+
+    phi = quasi.provenance["dispersion"]
+    assert plain.provenance["dispersion"] == 1.0
+    assert plain.provenance["dispersion_method"] == "poisson_assumed"
+    assert quasi.provenance["dispersion_method"] == "quasi_poisson_pearson_pooled"
+
+    ratio = (
+        quasi.model_abundance["abundance_standard_error"].to_numpy()
+        / plain.model_abundance["abundance_standard_error"].to_numpy()
+    )
+    finite = ratio[np.isfinite(ratio)]
+    assert finite.size > 0
+    np.testing.assert_allclose(finite, np.sqrt(phi), rtol=1e-9)
+
+
+def test_standard_errors_are_reported_in_the_output(design):
+    counts = count_equivalent_counts(design, seed=12)
+    result = fit(design, counts, likelihood="quasi_poisson")
+    errors = result.model_abundance["abundance_standard_error"]
+    assert errors.null_count() == 0
+    assert np.isfinite(errors.to_numpy()).any()
+
+
+def test_legacy_reports_no_standard_error(design):
+    """A sum of squares implies no variance model, so inventing one would lie."""
+    result = fit(design, synthetic_counts(design))
+    assert result.model_abundance["abundance_standard_error"].null_count() == (
+        result.model_abundance.height
+    )
+
+
+def test_failed_locus_has_no_standard_error(design):
+    counts = count_equivalent_counts(design, seed=13)
+    counts.locus_status[0] = FitStatus.MISSING_CONTIG
+    counts.values[0] = np.full_like(counts.values[0], np.nan)
+    result = fit(design, counts, likelihood="quasi_poisson")
+    failed = result.model_abundance.filter(pl.col("locus_id") == 0)
+    assert failed["abundance_standard_error"].is_null().all()
+
+
+def test_dispersion_pools_across_samples(design):
+    """The dispersion is one number for the run, not one per sample.
+
+    Pooling across every locus of every sample is what makes it stable, and is
+    why the fit needs a second pass.
+    """
+    samples = [count_equivalent_counts(design, f"s{i}", seed=20 + i) for i in range(3)]
+    result = fit(design, samples, likelihood="quasi_poisson")
+    assert result.provenance["dispersion_n_bins"] > 0
+    # One dispersion, applied to every sample's errors.
+    assert isinstance(result.provenance["dispersion"], float)
+    assert result.model_abundance["sample_id"].n_unique() == 3

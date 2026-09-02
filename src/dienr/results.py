@@ -39,6 +39,7 @@ MODEL_ABUNDANCE_SCHEMA: Schema = {
     "model_id": pl.String,
     "model_index": pl.UInt32,
     "abundance_raw": pl.Float64,
+    "abundance_standard_error": pl.Float64,
     "abundance_normalized": pl.Float64,
     "normalization_method": pl.String,
     "equivalence_class_size": pl.UInt32,
@@ -382,6 +383,15 @@ def collect_results(
                         "model_id": model_ids[key],
                         "model_index": model_index,
                         "abundance_raw": float(value),
+                        # NaN where a Wald error is undefined: a model at the
+                        # nonnegativity boundary, a singular information
+                        # matrix, or a likelihood with no variance model at all
+                        # (the legacy objectives).
+                        "abundance_standard_error": (
+                            float(fit.standard_error[model_index])
+                            if fit.standard_error is not None
+                            else None
+                        ),
                         "abundance_normalized": None,
                         "normalization_method": None,
                         "equivalence_class_size": class_sizes[key],

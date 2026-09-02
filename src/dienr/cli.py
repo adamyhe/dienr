@@ -123,10 +123,13 @@ def build_parser() -> argparse.ArgumentParser:
     fit_parser.add_argument("--output", required=True, type=Path)
     fit_parser.add_argument(
         "--likelihood",
-        choices=("legacy", "poisson", "negative_binomial"),
+        choices=("legacy", "poisson", "quasi_poisson", "negative_binomial"),
         default="legacy",
-        help="legacy least squares (default, the only one with R parity), "
-        "Poisson, or NB2 at a fixed dispersion",
+        help="legacy least squares (default, the only one with R parity); "
+        "poisson; quasi_poisson, which gives identical abundances to poisson "
+        "with standard errors scaled by a pooled dispersion and is the "
+        "recommended choice for overdispersed counts; or negative_binomial, "
+        "which is deprioritized (see plan Gate D)",
     )
     fit_parser.add_argument("--transform", choices=("log", "identity"), default="log")
     fit_parser.add_argument(
