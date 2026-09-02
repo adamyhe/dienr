@@ -1005,6 +1005,77 @@ Proceed beyond legacy MVP only if design matrices, masks, and equivalence classe
 
 Adopt Poisson as the recommended count-data solver only if it improves prespecified simulation or held-out predictive metrics and behaves robustly at zero/low counts.
 
+**Verdict: partially met, and the headline finding is about the legacy default
+rather than about Poisson.** Evidence from `scripts/validate_likelihoods.py`,
+four prespecified regimes, contiguous held-out blocks, paired per-fold
+comparison, stable across four seeds. Numbers below are the fraction of folds
+Poisson wins on held-out deviance.
+
+| regime | vs `legacy_log` (DENR's default) | vs `legacy_identity` |
+|---|---|---|
+| low count (mean 0.5) | **78-88%** | 40-50% |
+| moderate (mean 8) | 51-64% | 50-64% |
+| high count (mean 200) | 45-57% | 42-62% |
+| heterogeneous depth (10x) | 61-67% | 53-56% |
+
+Three conclusions.
+
+1. **DENR's default `transform = "log"` is badly misspecified once zeros are
+   common.** At mean 0.5 counts per bin its held-out deviance is about 3.1
+   against 1.2 for every alternative, and it loses 78-88% of folds. The cause
+   is structural: a bin with ``y = 0`` contributes
+   ``[log(1e-3) - log(mu + 1e-3)]^2``, roughly 38 at ``mu = 0.5``, so empty
+   bins dominate the objective and drag the fit toward zero. This is a
+   criticism of the reference method, not of our implementation of it, and it
+   is the single most actionable result here.
+2. **Switching the legacy transform to `identity` recovers nearly all of the
+   achievable gain.** Poisson's *marginal* edge over `legacy_identity` is nil
+   in the low-count regime the gate names explicitly (40-50%), modest at
+   moderate counts and under heterogeneous depth (53-64%), and
+   indistinguishable from noise at high counts. So the gate's own criterion —
+   improvement over legacy fitting in the low-count regime — is **not met**
+   against the strongest legacy objective, though it is met decisively against
+   the default one.
+3. **No regression at high counts**, as required.
+
+Poisson's justification therefore is not point accuracy. It is the exposure
+term, which no legacy objective has: across a tenfold depth spread the
+abundance estimate's relative spread is 0.16 for Poisson against 0.17-0.21 for
+`legacy_identity` and 0.29 for `legacy_log`, because only Poisson can return a
+depth-independent abundance. Add the principled variance model needed for
+later inference and the case is real, but it is a narrower case than "Poisson
+is more accurate."
+
+**Actions taken.** Legacy stays the default, since it is the only likelihood
+with R parity. Poisson is positioned for multi-sample and heterogeneous-depth
+work rather than as a general accuracy improvement. The low-count behavior of
+`transform = "log"` is documented where users will meet it.
+
+**A fourth finding, from the same run: a fixed ridge weight does not transfer
+across count scales and must never be a default.** The ridge term grows as
+``a^2`` while the Poisson log-likelihood grows roughly as ``a``, so
+``lambda = 0.01`` is negligible at ``a ~ 1`` and catastrophic at ``a ~ 200``:
+held-out deviance 68.7 against 1.06 unpenalized, winning 1-3% of folds.
+Scaling ``lambda`` by a moment estimate of the abundance removes the failure
+entirely (57% of folds, best abundance error in the regime).
+
+The mechanism is exact enough to give a rule. The ridge gradient is
+``2 lambda a`` while the Poisson score accumulates over bins, so the relative
+shrinkage a ridge weight imposes is
+
+    shrinkage ~ 2 lambda a / n_bins
+
+verified within 25% at three combinations of ``n_bins`` and abundance. Two
+consequences follow. A weight chosen at one count scale is wrong at another, in
+proportion to the abundance ratio. And ``lambda`` proportional to ``1 / a``
+cancels the dependence, leaving shrinkage at ``2c / n_bins`` — still falling
+with the amount of data, which is the desired behavior for a penalty.
+
+This is concrete motivation for the Phase 4 hyperparameter-selection
+deliverable, and until that exists any penalty weight must be chosen per
+dataset rather than inherited. `dienr fit --lambda2` is deliberately not
+defaulted to anything nonzero.
+
 ### Gate C: Does regularization improve stability rather than merely appearance?
 
 Recommend a penalty only if it improves replicate or bootstrap stability and simulated abundance recovery without hiding non-identifiability.

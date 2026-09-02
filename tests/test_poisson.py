@@ -404,3 +404,97 @@ def test_pinning_every_model_leaves_nothing_to_fit(design):
     result = poisson.fit_locus(design, observed, inactive=np.array([True, True]))
     assert result.status is FitStatus.INSUFFICIENT_BINS
     assert np.isnan(result.abundance).all()
+
+
+# --- Gate B findings, pinned as regressions ---------------------------------
+
+
+def test_legacy_log_is_misspecified_at_low_counts():
+    """The dominant Gate B finding, kept as a test so it cannot be forgotten.
+
+    A zero-count bin contributes ``[log(1e-3) - log(mu + 1e-3)]^2`` to the
+    legacy log objective, roughly 38 at ``mu = 0.5``. Empty bins therefore
+    dominate and drag the fit toward zero, which is why the reference's default
+    transform is the worst option on sparse data.
+    """
+    from dienr.solvers import legacy
+
+    matrix = np.ones((40, 1))
+    truth = np.array([0.5])
+    rng = np.random.default_rng(0)
+
+    log_errors, identity_errors = [], []
+    for _ in range(30):
+        observed = rng.poisson(matrix @ truth).astype(np.float64)
+        log_errors.append(
+            abs(legacy.fit_locus(matrix, observed, transform="log").abundance[0] - 0.5)
+        )
+        identity_errors.append(
+            abs(legacy.fit_locus(matrix, observed, transform="identity").abundance[0] - 0.5)
+        )
+
+    # The log transform is not merely worse, it is biased far low.
+    assert np.median(log_errors) > 2 * np.median(identity_errors)
+
+
+def mean_ridge_shrinkage(n_bins, truth, weight, replicates=20, seed=1):
+    """Mean shrinkage of a ridge fit relative to the unpenalized fit.
+
+    Measuring against the unpenalized fit on the *same* counts cancels the
+    sampling noise the two share, which makes the penalty's effect visible at
+    bin counts where comparing against the truth would not resolve it.
+    """
+    matrix = np.ones((n_bins, 1))
+    rng = np.random.default_rng(seed)
+    values = []
+    for _ in range(replicates):
+        observed = rng.poisson(matrix @ np.array([truth])).astype(np.float64)
+        unpenalized = poisson.fit_locus(matrix, observed).abundance[0]
+        penalized = poisson.fit_locus(matrix, observed, penalty=penalties.ridge(weight)).abundance[
+            0
+        ]
+        values.append((unpenalized - penalized) / unpenalized)
+    return float(np.mean(values))
+
+
+def test_ridge_shrinkage_follows_two_lambda_a_over_n_bins():
+    """The scaling law that makes a fixed penalty weight untransferable.
+
+    The ridge gradient is ``2 lambda a`` while the Poisson score accumulates
+    over bins, so relative shrinkage goes as ``2 lambda a / n_bins``: it grows
+    with the abundance and shrinks with the amount of data. Predicted against
+    measured, which is what makes the next two tests interpretable rather than
+    magic numbers.
+    """
+    for n_bins, truth in [(40, 1.0), (40, 200.0), (400, 200.0)]:
+        predicted = 2 * 0.01 * truth / n_bins
+        measured = mean_ridge_shrinkage(n_bins, truth, 0.01)
+        assert measured == pytest.approx(predicted, rel=0.25), (n_bins, truth)
+
+
+def test_a_fixed_ridge_weight_biases_more_as_counts_grow():
+    """Why a penalty weight must never be a shipped default.
+
+    Same weight, same design, two count scales: negligible at one, an 8% bias
+    at the other. Gate B saw the extreme version of this, a held-out deviance
+    of 68.7 against 1.06 unpenalized.
+    """
+    low = mean_ridge_shrinkage(40, 1.0, 0.01)
+    high = mean_ridge_shrinkage(40, 200.0, 0.01)
+    assert low < 0.005
+    assert high > 0.05
+    assert high > 10 * low
+
+
+def test_scaling_the_ridge_weight_restores_transfer():
+    """The fix: ``lambda`` proportional to ``1 / a`` cancels the a-dependence.
+
+    A moment estimate of the abundance suffices, and the resulting shrinkage is
+    comparable at both ends of the count range.
+    """
+    shrinkage = {}
+    for truth in (1.0, 200.0):
+        # lambda = c / a leaves shrinkage at 2c / n_bins, independent of a.
+        shrinkage[truth] = mean_ridge_shrinkage(40, truth, 0.01 / truth)
+    assert max(shrinkage.values()) < 0.005
+    assert shrinkage[200.0] == pytest.approx(shrinkage[1.0], rel=0.5)
