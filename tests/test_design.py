@@ -291,3 +291,36 @@ def test_multiple_loci_produce_independent_matrices():
     )
     assert design.n_loci == 2
     assert [m.shape for m in design.models] == [(4, 1), (4, 1)]
+
+
+def test_mask_anchors_on_unrounded_occupancy():
+    """Masks must be derived before `bin_operation` rounds occupancy away.
+
+    A transcript starting 210 bases into a 250bp bin occupies 40/250 = 0.16 of
+    it. Rounding first would zero that bin, moving the transcript's 5' anchor
+    one bin later and shifting every masked bin with it. The reference computes
+    masks from the fractional matrix and rounds afterwards.
+    """
+    design = build_design(
+        annotation([("anchor", "chr1", 0, 5000, "+"), ("late", "chr1", 210, 4090, "+")]),
+        bin_size=250,
+        mask_start_bins=(1, 0),
+    )
+    masked = np.flatnonzero(design.mask(0)).tolist()
+    # 'late' starts in bin 0 (210 of 250 bases in, so 0.16 occupancy), so both
+    # transcripts anchor at bin 0 and only bin 0 is masked. Rounding first
+    # would have anchored 'late' at bin 1 and masked bin 1 too.
+    assert masked == [0]
+
+
+def test_subbin_start_does_not_shift_the_mask_on_minus_strand():
+    design = build_design(
+        annotation([("anchor", "chr1", 0, 5000, "-"), ("early", "chr1", 910, 4790, "-")]),
+        bin_size=250,
+        mask_start_bins=(1, 0),
+    )
+    n_bins = design.bin_count(0)
+    masked = np.flatnonzero(design.mask(0)).tolist()
+    # On the minus strand the 5' end is the high coordinate. 'early' ends at
+    # 4790, which is 40 bases into bin 19, so it anchors there rather than 18.
+    assert n_bins - 1 in masked

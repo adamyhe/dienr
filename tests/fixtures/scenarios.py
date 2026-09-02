@@ -230,6 +230,38 @@ SCENARIOS: tuple[Scenario, ...] = (
         signal={_PLUS: _ramp("chr1", 500, 6_000, 50, 1.0), _MINUS: ()},
     ),
     Scenario(
+        name="subbin_first_bin_masking",
+        purpose=(
+            "masks must derive from unrounded occupancy: transcripts whose "
+            "first bin is under half covered would otherwise anchor one bin late"
+        ),
+        transcripts=(
+            # Offsets chosen so first-bin occupancy is well under half a bin:
+            # the locus starts at 1000, so tx_late covers only 40/250 of bin 0
+            # and 90/250 of its final bin.
+            Transcript("tx_anchor", "gene_n", "chr1", 1_001, 6_000, _PLUS),
+            Transcript("tx_late", "gene_n", "chr1", 1_211, 5_090, _PLUS),
+            Transcript("tx_later", "gene_n", "chr1", 1_231, 5_070, _PLUS),
+        ),
+        contig_sizes={"chr1": 20_000},
+        signal={_PLUS: _ramp("chr1", 500, 8_000, 50, 1.0), _MINUS: ()},
+        mask_start_bins=(2, 1),
+        mask_end_bins=(2, 1),
+    ),
+    Scenario(
+        name="subbin_minus_strand_masking",
+        purpose="the same, mirrored: sub-half final bin on the minus strand",
+        transcripts=(
+            Transcript("tx_m_anchor", "gene_o", "chr1", 1_001, 6_000, _MINUS),
+            Transcript("tx_m_late", "gene_o", "chr1", 1_211, 5_090, _MINUS),
+            Transcript("tx_m_later", "gene_o", "chr1", 1_231, 5_070, _MINUS),
+        ),
+        contig_sizes={"chr1": 20_000},
+        signal={_PLUS: (), _MINUS: _ramp("chr1", 500, 8_000, 50, 1.0)},
+        mask_start_bins=(2, 1),
+        mask_end_bins=(2, 1),
+    ),
+    Scenario(
         name="absent_contig",
         purpose="a locus on a contig the signal file omits is a failure, not a zero",
         transcripts=(

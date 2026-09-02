@@ -211,9 +211,16 @@ def _build(annotation: Annotation, config: DesignConfig) -> Design:
         effective = np.minimum(bin_ends, hi) - bin_starts
 
         matrix = _occupancy_matrix(members, bin_starts, bin_ends, width)
-        rounded = _BIN_OPERATIONS[config.bin_operation](matrix)
 
-        masked = _mask_bins(rounded, members["strand"].to_list(), config)
+        # Masks come from the *unrounded* occupancy, and rounding happens after.
+        # The order matters and is not interchangeable: a transcript whose first
+        # bin is less than half covered rounds to zero there, so deriving the
+        # mask from the rounded matrix would put its 5' anchor one bin too far
+        # in and shift every masked bin with it. That silently changed which
+        # models collapsed together on 12 of 124 loci in the benchmark, in both
+        # directions, while every small fixture still passed.
+        masked = _mask_bins(matrix, members["strand"].to_list(), config)
+        rounded = _BIN_OPERATIONS[config.bin_operation](matrix)
         rounded[masked, :] = 0.0
 
         representatives, class_members = _collapse(rounded)
