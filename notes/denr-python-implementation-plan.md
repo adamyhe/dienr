@@ -1479,11 +1479,13 @@ global calibration constant removed per arm. Results, seed 5 / seed 17:
 | shape / legacy_identity | 0.562 / 0.384 | 0.650 / 0.566 | 0.199 / 0.178 |
 | shape / poisson | 0.328 / 0.283 | 0.656 / 0.573 | 0.186 / 0.160 |
 
-**Shape modeling improves isoform ranking and not isoform magnitude.** Rank
-correlation rises by 0.03-0.08 in every objective and both seeds, and the
-fraction of models estimated as exactly zero falls. Magnitude error rises,
-consistently, and sharply under least squares. Dominant-isoform accuracy swings
-between +9.8 and -2.4 points across seeds and supports no claim either way.
+**Corrected by 18.8 below.** The first reading of these two seeds was that
+shape modeling "improves isoform ranking and not magnitude". A five-seed paired
+follow-up does not support the ranking half: about half of that gain was the
+zero-reduction effect appearing in rank correlation, and the remainder is not
+sign-stable. Magnitude error does rise, consistently, and sharply under least
+squares. Dominant-isoform accuracy swings between +9.8 and -2.4 points across
+these two seeds, which was the first sign that two seeds were not enough.
 
 **Why magnitudes do not improve, and it is not a defect.** The magnitude
 estimand is a mean, and a mean is insensitive to shape. For a single column,
@@ -1598,6 +1600,65 @@ structural rather than a second `abs()` call: both the sign and the
 short-window padding now live in `read_binned`, at the I/O boundary, so there
 is one reader and the corrections are not optional. Two readers, one of which
 forgets a correction, is the shape of the defect.
+
+
+### 18.8 Is a shape profile worth applying? Mostly not
+
+`scripts/validate_shape_usefulness.py`, five 1500-locus simulations, scored on
+multi-model loci only (the profile is pure loss where there is nothing to
+apportion), paired at the same locus and likelihood, calibrated within the
+stratum. Built to be capable of returning "no", and it does.
+
+| what | result | replicates? |
+|---|---|---|
+| dominant isoform: share of *discordant* loci shape gets right | 0.53 (Poisson), 0.50 (legacy_log) | **wash** |
+| magnitude: fraction of loci where shape has lower error | 0.50, 0.50 | **wash** |
+| within-locus ranking: mean per-locus rho | +0.022 | 3 of 5 seeds |
+| pooled rho, excluding zero estimates | +0.013 | 3 of 5 seeds |
+| pooled rho, including zero estimates | +0.026 | 5 of 5 seeds |
+| expressed models estimated as exactly zero | 18.9% -> 17.1% | **5 of 5 seeds** |
+
+The last two rows are one finding. Zero estimates are a tie block at the bottom
+of a ranking, so removing some raises rank correlation by itself -- which is why
+the pooled gain halves when zeros are excluded and loses sign stability. **The
+"improves ranking" claim in 18.6 was substantially the zero-reduction effect.**
+
+**The proposed mechanism does not survive either.** Conditioning genuinely
+improves -- median condition number at multi-model loci 7.44 -> 4.98, 90th
+percentile 39.0 -> 17.6 -- and the natural story was that this breaks ties
+between near-collinear overlapping isoforms. That predicts a *within-locus*
+gain, and the within-locus measurements are exactly the ones that flip sign
+between seeds. Better conditioning is real and does not cash out as accuracy.
+
+**It does not improve dominant-isoform identification, the paper's headline use
+case.** Of four arms, the best dominant accuracy is `binary/legacy_log` --
+DENR's default with no profile at all (0.761 vs 0.750 shaped, 0.733
+binary/poisson, 0.737 shape/poisson).
+
+So the defensible uses are narrow:
+
+1. **Fewer spurious zeros** (5 of 5 seeds, ~9% relative). A zero is a
+   qualitative claim that an isoform is off, so this is worth something.
+2. **The profile as a measurement.** A pausing index, a 5'/3' ratio, or a
+   comparison of profiles across samples is a readout in its own right and
+   needs no design reweighting -- fit it, inspect `profile.table()`, stop.
+   This is what the paper's Supplementary Figure S5 is, and it is probably the
+   most defensible use of the feature.
+3. **As a prerequisite, not a benefit.** A graded design is what makes the
+   likelihood choice matter at all (18.6), but `shape/poisson` does not beat
+   `binary/poisson`, so the enabling does not cash out.
+
+**Guidance: fit a profile and inspect it; be skeptical about applying it.** If
+applied, apply with `poisson` and only at multi-model loci. The feature exists
+because the published method specifies it and because the reference's
+implementation is broken in ways worth documenting -- not because it has been
+shown to improve estimates.
+
+A caveat that cuts the other way: `nascentRNASim` gives every simulated isoform
+one of 62 archetype profiles, so simulated shape heterogeneity is bounded by
+the archetype set. Real genes may vary more (weakening the case further) or the
+archetypes may understate how *predictable* shape is within a cell type
+(strengthening it). Real data would settle it; see 18.6 for the accessions.
 
 
 ## 19. Definition of done for version 1.0

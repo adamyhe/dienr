@@ -67,29 +67,66 @@ Reproduce with `scripts/simulate_nascentrnasim.R` then
 
 (seed 5 / seed 17.)
 
-**Yes for ranking isoforms, no for calibrating their magnitudes.** Isoform-level
-rank correlation improves with a shape profile in every objective and both
-seeds, by 0.03–0.08 — and ordering isoforms within a locus is the deconvolution
-problem. The fraction of models estimated as exactly zero drops as well
-(0.186 → 0.156, 0.166 → 0.135). But the magnitude error gets *worse*,
-consistently, and badly so under least squares.
+**Mostly no, and one narrow yes.** A first pass reported that shape modeling
+"improves isoform ranking"; a five-seed paired follow-up
+(`scripts/validate_shape_usefulness.py`, multi-model loci only, since the
+profile is pure loss where there is nothing to apportion) does not support
+that. Five 1500-locus simulations, paired at the same locus and likelihood:
 
-**The magnitude regression has a mechanism, and it is the answer to the second
-question.** A fitted profile puts a 4–5× weight on the first bin, and
-unweighted least squares is dominated by the largest entries of the design, so
-a gene whose own pausing peak departs from the shared average profile is fitted
-mostly on the bins where that departure is largest. Poisson weights each bin by
-`1/μ`, which is exactly the right correction, and the difference is stark:
+| what | result | replicates? |
+|---|---|---|
+| **dominant isoform** — share of *discordant* loci shape gets right | 0.53 (Poisson), 0.50 (legacy_log) | **wash** |
+| **magnitude** — fraction of loci where shape has lower error | 0.50, 0.50 | **wash** |
+| **within-locus ranking** — mean per-locus rho | +0.022 | 3 of 5 seeds |
+| **pooled rho, excluding zero estimates** | +0.013 | 3 of 5 seeds |
+| **pooled rho, including zero estimates** | +0.026 | 5 of 5 seeds |
+| **fraction of expressed models estimated as exactly zero** | 18.9% → 17.1% | **5 of 5 seeds** |
 
-| | Poisson vs identity least squares |
-|---|---|
-| binary design | **−1% to −5%** isoform error |
-| shape-reshaped design | **−26% to −42%** isoform error |
+The last two rows are the same finding. Zero estimates form a tie block at the
+bottom of a ranking, so removing some of them raises rank correlation on its
+own — which is why the pooled gain halves when zeros are excluded and stops
+being sign-stable. **The apparent ranking improvement was substantially the
+zero-reduction effect.**
 
-So **a graded design is what makes the choice of likelihood matter**, by roughly
-an order of magnitude — measured on the authors' own benchmark, and predicted in
-advance by Gate B from the estimating equations. On a binary design the two are
-nearly the same estimator; on a shaped one they are not close.
+So on this benchmark the only effect that replicates across every seed is
+**about 9% fewer models collapsing to exactly zero**. That is worth something:
+a zero is a qualitative claim that an isoform is off, not a small number.
+
+**It does not improve dominant-isoform identification, which is the paper's
+headline use case** (§3.4 is built on dominant-isoform differences between cell
+types). Of the four arms tested, the best dominant-isoform accuracy belongs to
+`binary/legacy_log` — DENR's default scheme with no shape profile at all
+(0.761 against 0.750 shaped, 0.733 binary/poisson, 0.737 shape/poisson).
+
+**And the mechanism proposed earlier does not survive.** A graded design really
+is better conditioned — median condition number at multi-model loci falls from
+7.44 to 4.98, 90th percentile 39.0 to 17.6 — and the natural story was that
+this breaks ties between near-collinear overlapping isoforms. That story
+predicts a *within-locus* accuracy gain, and the within-locus measurements are
+the ones that flip sign between seeds. Better conditioning is real and does not
+cash out as accuracy here.
+
+### What it is actually for
+
+1. **Fewer spurious zeros** (5 of 5 seeds). The one replicating accuracy-side
+   effect.
+2. **Measuring the profile itself.** A pausing index, a 5′:3′ ratio, or a
+   comparison of profiles between samples or conditions is a biological readout
+   in its own right, and needs no design reweighting at all — fit the profile,
+   look at `profile.table()`, and stop there. This is what the paper's own
+   Supplementary Figure S5 is. It is probably the most defensible use.
+3. **As a prerequisite, not a benefit.** A graded design is what makes the
+   choice of likelihood matter at all: on a binary design least squares and
+   Poisson are the same estimator to four decimal places, and on a shaped one
+   they are 26–42% apart. That is established (below) — but it is an enabling
+   condition. `shape/poisson` does not beat `binary/poisson`, so the enabling
+   does not cash out.
+
+**Recommendation: fit a profile and inspect it; be skeptical about applying
+it.** If you do apply it, apply it with `poisson` and only at multi-model loci.
+The honest summary is that this feature exists because the method specifies it
+and because the reference's implementation of it is broken in ways worth
+documenting — not because it has been shown to make estimates better.
 
 ### Why magnitudes don't improve
 
@@ -163,11 +200,10 @@ benchmark removes cannot fairly score it. Rank correlation, which needs no
 calibration, is best for that variant (0.816), but the error comparison would
 need per-stratum calibration to mean anything.
 
-**The practical recommendation follows: use a shape profile with `poisson`, not
-with least squares.** `shape/poisson` is the only arm that improves ranking
-without paying for it in magnitude — its error matches the best binary arm to
-within 2.4% while gaining 0.04 in rank correlation. The paper could not reach
-this conclusion because least squares was its only option.
+**If a profile is applied at all, apply it with `poisson`.** Least squares on a
+graded design is the worst of the four arms; Poisson recovers most of the
+damage. The paper could not reach this conclusion because least squares was its
+only option.
 
 **And the reference's `span = 0.4` is actively harmful here**, not merely
 wasteful. At 0.4 the fitted profile spans 2.0× instead of 4.5×, and isoform rank
