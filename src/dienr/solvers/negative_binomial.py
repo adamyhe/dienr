@@ -57,7 +57,14 @@ import numpy as np
 from scipy.special import gammaln, xlogy
 
 from ..status import FitStatus, is_failure
-from ._glm import Exposure, mean, moment_initialization, pearson_residuals, usable_bins
+from ._glm import (
+    MU_FLOOR,
+    Exposure,
+    mean,
+    moment_initialization,
+    pearson_residuals,
+    usable_bins,
+)
 from ._lbfgsb import minimize_bounded
 from .legacy import _FREE_UPPER, _INACTIVE_UPPER, LocusFit, _short_circuit
 from .penalties import NO_PENALTY, Penalty
@@ -232,24 +239,46 @@ def _value_and_grad(
     n_bins = models.shape[0]
     scale = exposure.scale(n_bins)
     offset = exposure.offset(n_bins)
-    usable = usable_bins(models, exposure, pinned)
-    y = observed[usable]
-    scale_usable = scale[usable]
     size = 1.0 / max(dispersion, MIN_DISPERSION)
-    # Terms with no dependence on the abundance are dropped from the value the
-    # optimizer sees; `negative_log_likelihood` reports the complete figure.
-    weight = np.zeros(n_bins)
+
+    # As in the Poisson closure: fold the usable mask into precomputed vectors
+    # and preallocate, so no per-call indexing or temporaries. Terms with no
+    # dependence on the abundance are dropped from the value the optimizer
+    # sees; `negative_log_likelihood` reports the complete figure.
+    keep = usable_bins(models, exposure, pinned).astype(np.float64)
+    observed_keep = observed * keep
+    weight_scale = scale * keep * size
+
+    mu = np.empty(n_bins)
+    weight = np.empty(n_bins)
+    scratch = np.empty(n_bins)
 
     def fused(abundance: np.ndarray) -> tuple[float, np.ndarray]:
-        mu = mean(abundance, models, scale, offset)
-        m = mu[usable]
-        value = float(np.sum(size * np.log1p(m / size) + xlogy(y, 1.0 + size / m)))
-        weight[:] = 0.0
-        weight[usable] = scale_usable * size * (m - y) / (m * (size + m))
+        np.matmul(models, abundance, out=mu)
+        np.multiply(mu, scale, out=mu)
+        np.add(mu, offset, out=mu)
+        np.maximum(mu, MU_FLOOR, out=mu)
+
+        # r log1p(mu/r)
+        np.divide(mu, size, out=scratch)
+        np.log1p(scratch, out=scratch)
+        value = size * float(keep @ scratch)
+        # + y log1p(r/mu)
+        np.divide(size, mu, out=scratch)
+        np.log1p(scratch, out=scratch)
+        value += float(observed_keep @ scratch)
+
+        # weight = scale * keep * r (mu - y) / (mu (r + mu))
+        np.add(mu, size, out=scratch)
+        np.multiply(scratch, mu, out=scratch)
+        np.subtract(mu, observed, out=weight)
+        np.multiply(weight, weight_scale, out=weight)
+        np.divide(weight, scratch, out=weight)
+
         grad = models.T @ weight
         if penalty.is_active:
             value += penalty.value(abundance)
-            grad = grad + penalty.gradient(abundance)
+            grad += penalty.gradient(abundance)
         return value, grad
 
     return fused

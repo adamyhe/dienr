@@ -827,6 +827,66 @@ the remaining scaffolding work is done, and only with a fresh profile:
   the gradient, so dropping them changes the reported objective value but not
   the argmin — the constant must be added back for R parity.
 
+### 14.3 The JIT question, revisited after the scaffolding was removed
+
+The section 14.1 verdict was correct for the code it measured and is now
+obsolete, because the thing it deferred to has happened: with the lean L-BFGS-B
+driver in place and the `Design.mask()` scan gone, the fused
+objective-and-gradient closure is the dominant cost in every solver — 63% of the
+legacy fitting stage, 61% Poisson, 68% NB. Arithmetic is no longer 9% of the
+work; it is most of it.
+
+The free option was taken first. Folding the usable mask into precomputed
+vectors and preallocating every temporary removed per-call allocation and
+boolean indexing, worth 1.3-1.4x on a Poisson or NB evaluation at realistic
+size and, unlike a JIT, never a regression at any size. End to end it took the
+Poisson fitting stage from 0.594 s to 0.504 s and NB from 0.891 s to 0.749 s.
+Legacy barely moved, at 1.03x, because its closure was already lean.
+
+What Numba would add on top, measured against the optimized NumPy and verified
+bit-identical at every shape:
+
+| locus shape | legacy | Poisson | NB2 |
+|---|---|---|---|
+| 120 x 2 | 3.4x | 3.6x | 3.8x |
+| **329 x 3** (realistic median) | 1.9x | **2.1x** | **2.2x** |
+| 1000 x 8 | 1.4x | 1.6x | 1.6x |
+| 4000 x 30 | **0.29x** | **0.32x** | **0.41x** |
+
+Two things stand out. The count likelihoods gain more than legacy, consistently,
+because they carry more elementwise work per matrix-vector product — `xlogy`,
+`log1p`, divisions — and that is exactly what a JIT fuses and NumPy cannot.
+And the last row is a trap: a naive JIT kernel is **three times slower** than
+NumPy on large loci, because a hand-written loop cannot compete with BLAS on a
+4000 x 30 product. Any adoption therefore needs a size-dependent dispatch, not
+a wholesale replacement.
+
+Applying Amdahl to the realistic regime, a 2.1x Poisson evaluation inside a
+stage that is 61% evaluation yields about 1.5x on fitting and roughly 1.2x end
+to end.
+
+**Decision: still no, and the reasoning has changed.** It is no longer that the
+gain is negligible — it is real and now well quantified. The costs are:
+
+- a 38 MB `llvmlite` dependency in the core, for a package whose current
+  dependency list is deliberately five entries long;
+- a size-dispatch threshold that has to be tuned per solver and revisited on
+  new hardware;
+- and the decisive one, a **second implementation of every likelihood** that
+  must stay bit-identical to the first. That is precisely the duplication that
+  produced the naive NB2 formula bug, and there are now three likelihoods plus
+  four penalty combinations to keep in step.
+
+Against that, wall time is already 14.5x better than R DENR with both section
+14 targets met, so the marginal 1.2x buys nothing anyone is waiting for.
+
+Revisit if any of these change: profiling shows the fused closure back above
+roughly 70% of a stage that someone is actually blocked on; a whole-genome
+multi-sample run moves the realistic locus distribution toward the small shapes
+where the gain is 3x rather than 2x; or a JAX or PyTorch backend arrives for the
+ML adapters anyway, at which point the JIT dependency is already paid for and
+the batched-loci idea below becomes the natural way to use it.
+
 ### 14.2 Measured comparison against R DENR
 
 Both implementations run on identical generated datasets

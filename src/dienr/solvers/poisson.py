@@ -27,7 +27,7 @@ import numpy as np
 from scipy.special import xlogy
 
 from ..status import FitStatus, is_failure
-from ._glm import Exposure, mean, moment_initialization, usable_bins
+from ._glm import MU_FLOOR, Exposure, mean, moment_initialization, usable_bins
 from ._lbfgsb import minimize_bounded
 from .legacy import _FREE_UPPER, _INACTIVE_UPPER, LocusFit, _short_circuit
 from .penalties import NO_PENALTY, Penalty
@@ -122,21 +122,37 @@ def _value_and_grad(
     n_bins = models.shape[0]
     scale = exposure.scale(n_bins)
     offset = exposure.offset(n_bins)
-    usable = usable_bins(models, exposure, pinned)
-    y_usable = observed[usable]
-    scale_usable = scale[usable]
-    weight = np.zeros(n_bins)
+
+    # The usable mask is folded into precomputed vectors rather than applied by
+    # boolean indexing per call. Fancy indexing allocates, and this closure is
+    # the single largest cost in a Poisson fit.
+    keep = usable_bins(models, exposure, pinned).astype(np.float64)
+    scale_keep = scale * keep
+    observed_keep = observed * keep
+    observed_scaled = observed_keep * scale
+
+    mu = np.empty(n_bins)
+    weight = np.empty(n_bins)
+    scratch = np.empty(n_bins)
 
     def fused(abundance: np.ndarray) -> tuple[float, np.ndarray]:
-        mu = mean(abundance, models, scale, offset)
-        mu_usable = mu[usable]
-        value = float(np.sum(mu_usable - xlogy(y_usable, mu_usable)))
-        weight[:] = 0.0
-        weight[usable] = scale_usable * (1.0 - y_usable / mu_usable)
+        np.matmul(models, abundance, out=mu)
+        np.multiply(mu, scale, out=mu)
+        np.add(mu, offset, out=mu)
+        np.maximum(mu, MU_FLOOR, out=mu)
+
+        # sum over usable bins of (mu - y log mu); the log is finite everywhere
+        # thanks to the floor, and observed_keep is zero outside the mask, so
+        # excluded bins contribute nothing to either term.
+        np.log(mu, out=scratch)
+        value = float(keep @ mu - observed_keep @ scratch)
+
+        np.divide(observed_scaled, mu, out=weight)
+        np.subtract(scale_keep, weight, out=weight)
         grad = models.T @ weight
         if penalty.is_active:
             value += penalty.value(abundance)
-            grad = grad + penalty.gradient(abundance)
+            grad += penalty.gradient(abundance)
         return value, grad
 
     return fused
