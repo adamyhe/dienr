@@ -63,28 +63,47 @@ class Scenario:
     distance: int | None = None
     bin_operation: str = "round"
     transform: str = "log"
+    #: Per-bin summary. "mean" matches the reference, whose add_data hardcodes
+    #: it; a scenario using anything else cannot be compared against R.
+    summary: str = "mean"
+    #: Set when R cannot process the scenario at all, with the reason. Such a
+    #: scenario is an intended divergence, not missing coverage.
+    r_incompatible: str | None = None
     tolerances: dict[str, float] = field(default_factory=dict)
 
     def gtf_lines(self) -> list[str]:
-        """Render the annotation as GTF text."""
+        """Render the annotation as GTF text.
+
+        Each transcript gets both a ``transcript`` record and a single
+        full-span ``exon``. The exon is required, not decorative:
+        ``GenomicFeatures::makeTxDbFromGFF`` builds a TxDb from subfeatures and
+        yields an empty database from ``transcript`` lines alone, so the R side
+        would silently have nothing to quantify.
+
+        A single exon spanning the whole transcript is also the correct pre-RNA
+        representation — nascent transcription covers introns — and our own
+        parser takes the min start and max end over all records, so both sides
+        see the same span.
+        """
         lines = [f"##dienr parity scenario: {self.name}"]
         for tx in self.transcripts:
             attributes = f'gene_id "{tx.gene_id}"; transcript_id "{tx.transcript_id}";'
-            lines.append(
-                "\t".join(
-                    [
-                        tx.contig,
-                        "dienr",
-                        "transcript",
-                        str(tx.start),
-                        str(tx.end),
-                        ".",
-                        tx.strand,
-                        ".",
-                        attributes,
-                    ]
+            for feature in ("transcript", "exon"):
+                lines.append(
+                    "\t".join(
+                        [
+                            tx.contig,
+                            "dienr",
+                            feature,
+                            str(tx.start),
+                            str(tx.end),
+                            ".",
+                            tx.strand,
+                            ".",
+                            attributes,
+                        ]
+                    )
                 )
-            )
         return lines
 
 
@@ -220,6 +239,12 @@ SCENARIOS: tuple[Scenario, ...] = (
         # chrGhost is deliberately absent from the BigWig headers.
         contig_sizes={"chr1": 20_000},
         signal={_PLUS: _ramp("chr1", 500, 6_000, 50, 1.0), _MINUS: ()},
+        r_incompatible=(
+            "R's add_data calls assert_chromosome_exists and aborts the entire "
+            "run with 'chromosome chrGhost does not exist in ...'. It cannot "
+            "produce a golden here, which is the divergence this scenario "
+            "documents: we record missing_contig per locus and keep going."
+        ),
     ),
 )
 

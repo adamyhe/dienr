@@ -47,6 +47,10 @@ VALUE_KINDS: tuple[str, ...] = (
 #: Likelihoods that require count-equivalent input.
 _COUNT_LIKELIHOODS = frozenset({"poisson", "negative_binomial"})
 
+#: Per-bin summaries that preserve counts. ``mean`` divides by bin width, so it
+#: is a density and cannot be fed to a count likelihood.
+_COUNT_SUMMARIES = frozenset({"sum"})
+
 
 @dataclass(frozen=True)
 class SignalFile:
@@ -74,13 +78,25 @@ class SignalFile:
         if self.strand not in ("+", "-"):
             raise ValueError(f"{self.path}: strand must be '+' or '-', got {self.strand!r}")
 
-    def require_count_equivalent(self, likelihood: str) -> None:
-        """Raise if `likelihood` needs counts but this file is transformed."""
-        if likelihood in _COUNT_LIKELIHOODS and self.value_kind != "raw":
+    def require_count_equivalent(self, likelihood: str, summary: str = "sum") -> None:
+        """Raise if `likelihood` needs counts but the input is not count-like.
+
+        Two distinct ways the input can fail to be a count: the file itself was
+        transformed, or the per-bin summary divided by bin width.
+        """
+        if likelihood not in _COUNT_LIKELIHOODS:
+            return
+        if self.value_kind != "raw":
             raise ValueError(
                 f"{self.path}: likelihood {likelihood!r} requires count-equivalent "
                 f"signal, but value_kind is {self.value_kind!r}. Use an untransformed "
                 "BigWig or select a non-count likelihood explicitly."
+            )
+        if summary not in _COUNT_SUMMARIES:
+            raise ValueError(
+                f"{self.path}: likelihood {likelihood!r} requires a count-preserving "
+                f"summary, but summary is {summary!r}, which is a per-base density. "
+                f"Use one of {sorted(_COUNT_SUMMARIES)}."
             )
 
 
@@ -172,7 +188,7 @@ def count_sample(
     sample_id: str,
     signal: SignalFile | tuple[SignalFile, ...],
     *,
-    summary: Summary = "sum",
+    summary: Summary = "mean",
     exposure: float = 1.0,
 ) -> SampleCounts:
     """Aggregate stranded BigWig signal into `design`'s bins.
@@ -185,7 +201,13 @@ def count_sample(
         sample_id: Identifier for this sample.
         signal: One `SignalFile` per strand. A single file is accepted only when
             every locus lies on its strand.
-        summary: Per-bin statistic passed to `read_binned`.
+        summary: Per-bin statistic. Defaults to ``"mean"`` because that is what
+            the reference implementation uses -- ``add_data`` hardcodes
+            ``summary_operation <- "mean"`` -- so its abundances are in units of
+            mean per-base polymerase density, not counts. Verified against R:
+            our ``"sum"`` was exactly ``bin_size`` times its values. A count
+            likelihood needs ``"sum"`` instead, and must not be combined with
+            ``"mean"``.
         exposure: Known sample scaling factor, recorded but not applied here.
 
     Returns:

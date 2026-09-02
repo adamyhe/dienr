@@ -89,6 +89,7 @@ def built(tmp_path):
             design,
             "parity",
             (SignalFile(paths["plus"], "+"), SignalFile(paths["minus"], "-")),
+            summary=scenario.summary,
         )
         return design, counts
 

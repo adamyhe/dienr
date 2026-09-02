@@ -60,6 +60,19 @@ scenarios <- jsonlite::fromJSON(spec_path, simplifyDataFrame = FALSE)
 #' GRanges is 1-based inclusive. Emitting 0-based half-open here means the
 #' Python side compares numbers directly rather than re-deriving a convention,
 #' which is where an off-by-one would otherwise hide.
+#' Build a TxDb from a GTF, across Bioconductor versions.
+#'
+#' `makeTxDbFromGFF` moved from GenomicFeatures to the txdbmaker package and is
+#' defunct in GenomicFeatures >= 1.61.1. The published DENR container predates
+#' that split, so both spellings are supported rather than pinning one and
+#' making this script work in only one of the two reference environments.
+txdb_from_gtf <- function(path) {
+  if (requireNamespace("txdbmaker", quietly = TRUE)) {
+    return(suppressWarnings(txdbmaker::makeTxDbFromGFF(path, format = "gtf")))
+  }
+  suppressWarnings(GenomicFeatures::makeTxDbFromGFF(path, format = "gtf"))
+}
+
 granges_to_frame <- function(gr) {
   data.frame(
     contig = as.character(GenomicRanges::seqnames(gr)),
@@ -78,9 +91,7 @@ export_one <- function(scenario) {
   bw_plus <- file.path(inputs_dir, paste0(name, "_plus.bw"))
   bw_minus <- file.path(inputs_dir, paste0(name, "_minus.bw"))
 
-  txdb <- suppressWarnings(
-    GenomicFeatures::makeTxDbFromGFF(gtf, format = "gtf")
-  )
+  txdb <- txdb_from_gtf(gtf)
   transcripts <- GenomicFeatures::transcripts(txdb, columns = c("tx_name", "gene_id"))
   transcripts$gene_id <- as.character(unlist(transcripts$gene_id))
 
@@ -106,11 +117,22 @@ export_one <- function(scenario) {
     tq, transform = scenario$transform, heuristic_inactive_override = FALSE
   ))
 
-  # Per-locus geometry. Names of the bins list are DENR's group ids.
+  # Per-locus geometry.
+  #
+  # Everything is indexed *positionally*. bins, models, counts and masks are
+  # all named by group id, but `fit()` builds abundances with
+  # `estim <- list(); estim[[i]] <- ...`, which produces an UNNAMED list, so
+  # name-based lookup of model_abundance silently fails. The lists are built in
+  # the same order, which the stopifnot below verifies.
   locus_names <- names(tq@bins)
-  loci <- lapply(locus_names, function(locus) {
-    bins <- granges_to_frame(tq@bins[[locus]])
-    models <- tq@models[[locus]]
+  stopifnot(identical(names(tq@models), locus_names))
+  stopifnot(identical(names(tq@counts), locus_names))
+  stopifnot(length(fitted@model_abundance) == length(locus_names))
+
+  loci <- lapply(seq_along(locus_names), function(i) {
+    locus <- locus_names[[i]]
+    bins <- granges_to_frame(tq@bins[[i]])
+    models <- tq@models[[i]]
     list(
       locus_key = locus,
       bin_starts = bins$start,
@@ -122,17 +144,17 @@ export_one <- function(scenario) {
       # Column-major flattening; the Python side reshapes with order="F".
       models = as.numeric(models),
       model_colnames = colnames(models),
-      counts = as.numeric(tq@counts[[locus]]),
-      masked_bins_0based = sort(as.integer(tq@masks[[locus]]) - 1L),
-      abundance = as.numeric(fitted@model_abundance[[locus]]),
+      counts = as.numeric(tq@counts[[i]]),
+      masked_bins_0based = sort(as.integer(tq@masks[[i]]) - 1L),
+      abundance = as.numeric(fitted@model_abundance[[i]]),
       objective = DENR:::sum_squares_lasso(
-        fitted@model_abundance[[locus]],
+        fitted@model_abundance[[i]],
         models,
-        DENR:::mask_data(tq@counts[[locus]], tq@masks[[locus]]),
+        DENR:::mask_data(tq@counts[[i]], tq@masks[[i]]),
         lambda = 0,
         transform = scenario$transform
       ),
-      predicted = as.numeric(models %*% fitted@model_abundance[[locus]])
+      predicted = as.numeric(models %*% fitted@model_abundance[[i]])
     )
   })
   names(loci) <- locus_names
@@ -169,7 +191,9 @@ for (scenario in scenarios) {
   })
   if (is.null(golden)) next
   out <- file.path(output_dir, paste0(scenario$name, ".json"))
-  write(jsonlite::toJSON(golden, auto_unbox = TRUE, digits = 17, null = "null"), out)
+  # digits = NA keeps full double precision; a fixed digit count would round
+  # away exactly the differences a parity test exists to detect.
+  write(jsonlite::toJSON(golden, auto_unbox = TRUE, digits = NA, null = "null"), out)
   message("  wrote ", out)
 }
 

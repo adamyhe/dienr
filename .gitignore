@@ -79,3 +79,6 @@ site/
 # sensitive data. https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# ignore generated parity inputs
+build/

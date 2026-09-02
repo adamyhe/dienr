@@ -40,12 +40,30 @@ GEOMETRY_ATOL = 1e-12
 FIT_RTOL = 1e-4
 
 
+def as_array(value) -> np.ndarray:
+    """Coerce a golden field to a 1-D array.
+
+    `jsonlite::toJSON(auto_unbox = TRUE)` renders a length-1 R vector as a bare
+    JSON scalar rather than a one-element list, so any field that is normally a
+    list arrives as a scalar in single-transcript or single-bin scenarios.
+    """
+    return np.atleast_1d(np.asarray(value))
+
+
+def as_list(value) -> list:
+    """`as_array` for string fields, preserving Python types."""
+    return [value] if isinstance(value, str) else list(value)
+
+
 def golden_path(name: str) -> Path:
     return GOLDEN_DIR / f"{name}.json"
 
 
 def load_golden(name: str) -> dict:
     """Load a golden file, skipping the test when it has not been produced."""
+    scenario = SCENARIOS_BY_NAME[name]
+    if scenario.r_incompatible:
+        pytest.skip(f"{name}: no R counterpart by design. {scenario.r_incompatible}")
     path = golden_path(name)
     if not path.exists():
         pytest.skip(
@@ -74,7 +92,7 @@ def match_loci(design, golden: dict) -> dict[int, dict]:
     for locus in golden["loci"].values():
         contig = locus["contig"] if isinstance(locus["contig"], str) else locus["contig"][0]
         strand = locus["strand"] if isinstance(locus["strand"], str) else locus["strand"][0]
-        key = (contig, strand, int(np.min(locus["bin_starts"])))
+        key = (contig, strand, int(as_array(locus["bin_starts"]).min()))
         if key in ours:
             paired[ours[key]] = locus
         else:
@@ -87,8 +105,10 @@ def match_loci(design, golden: dict) -> dict[int, dict]:
 
 def golden_matrix(locus: dict) -> np.ndarray:
     """Rebuild R's model matrix from its column-major flattening."""
-    return np.asarray(locus["models"], dtype=np.float64).reshape(
-        (locus["n_bins"], locus["n_models"]), order="F"
+    return (
+        as_array(locus["models"])
+        .astype(np.float64)
+        .reshape((locus["n_bins"], locus["n_models"]), order="F")
     )
 
 
@@ -114,10 +134,10 @@ def test_bin_boundaries_match(name, built):
     for locus_id, locus in match_loci(design, golden).items():
         bins = design.bins.filter(design.bins["locus_id"] == locus_id).sort("bin_index")
         np.testing.assert_array_equal(
-            bins["start"].to_numpy(), np.asarray(locus["bin_starts"]), err_msg=f"{name} starts"
+            bins["start"].to_numpy(), as_array(locus["bin_starts"]), err_msg=f"{name} starts"
         )
         np.testing.assert_array_equal(
-            bins["end"].to_numpy(), np.asarray(locus["bin_ends"]), err_msg=f"{name} ends"
+            bins["end"].to_numpy(), as_array(locus["bin_ends"]), err_msg=f"{name} ends"
         )
 
 
@@ -127,7 +147,7 @@ def test_mask_indices_match(name, built):
     design, _ = built(SCENARIOS_BY_NAME[name])
     for locus_id, locus in match_loci(design, golden).items():
         ours = np.flatnonzero(design.mask(locus_id))
-        theirs = np.asarray(locus["masked_bins_0based"], dtype=int)
+        theirs = as_array(locus["masked_bins_0based"]).astype(int)
         np.testing.assert_array_equal(ours, theirs, err_msg=f"{name} locus {locus_id} mask")
 
 
@@ -158,7 +178,7 @@ def test_binned_signal_matches(name, built):
     golden = load_golden(name)
     design, counts = built(SCENARIOS_BY_NAME[name])
     for locus_id, locus in match_loci(design, golden).items():
-        theirs = np.abs(np.asarray(locus["counts"], dtype=np.float64))
+        theirs = np.abs(as_array(locus["counts"]).astype(np.float64))
         ours = counts.values[locus_id]
         # R stores unmasked counts; mask both sides before comparing.
         mask = design.mask(locus_id)
@@ -177,7 +197,12 @@ def test_equivalence_classes_match(name, built):
 
     key = golden["transcript_model_key"]
     their_groups: dict[tuple[int, int], set[str]] = {}
-    for tx, group, model in zip(key["tx_name"], key["group"], key["model"], strict=True):
+    for tx, group, model in zip(
+        as_list(key["tx_name"]),
+        as_array(key["group"]).tolist(),
+        as_array(key["model"]).tolist(),
+        strict=True,
+    ):
         their_groups.setdefault((group, model), set()).add(tx)
     their_partition = {frozenset(members) for members in their_groups.values()}
 
@@ -218,7 +243,7 @@ def test_predicted_signal_and_objective_match(name, built):
             transform=scenario.transform,  # type: ignore[arg-type]
             prior_status=counts.locus_status[locus_id],
         )
-        theirs_predicted = np.asarray(locus["predicted"], dtype=np.float64)
+        theirs_predicted = as_array(locus["predicted"]).astype(np.float64)
         ours_predicted = models @ fit.abundance
         np.testing.assert_allclose(
             ours_predicted,
@@ -259,7 +284,7 @@ def test_abundance_matches_where_identifiable(name, built):
             transform=scenario.transform,  # type: ignore[arg-type]
             prior_status=counts.locus_status[locus_id],
         )
-        theirs = np.asarray(locus["abundance"], dtype=np.float64)
+        theirs = as_array(locus["abundance"]).astype(np.float64)
         # Column order is not part of the contract; compare sorted values.
         np.testing.assert_allclose(
             np.sort(fit.abundance),
@@ -297,11 +322,15 @@ def test_parity_coverage_is_reported(capsys):
     task — but it makes the gap visible instead of letting a fully skipped
     parity suite read as success.
     """
-    present = sorted(name for name in ALL_NAMES if golden_path(name).exists())
-    missing = sorted(name for name in ALL_NAMES if not golden_path(name).exists())
+    comparable = [name for name in ALL_NAMES if not SCENARIOS_BY_NAME[name].r_incompatible]
+    excluded = [name for name in ALL_NAMES if SCENARIOS_BY_NAME[name].r_incompatible]
+    present = sorted(name for name in comparable if golden_path(name).exists())
+    missing = sorted(name for name in comparable if not golden_path(name).exists())
     with capsys.disabled():
         print(
-            f"\nR parity coverage: {len(present)}/{len(ALL_NAMES)} scenarios verified."
-            + (f" Missing: {', '.join(missing)}" if missing else " Complete.")
+            f"\nR parity coverage: {len(present)}/{len(comparable)} comparable "
+            "scenarios verified."
+            + (f" Missing: {', '.join(missing)}." if missing else " Complete.")
+            + (f" Excluded as R-incompatible by design: {', '.join(excluded)}." if excluded else "")
         )
-    assert len(present) + len(missing) == len(ALL_NAMES)
+    assert len(present) + len(missing) == len(comparable)

@@ -313,6 +313,16 @@ Legacy/non-count input:
 
 Every input must record whether values are raw, spike-in scaled, library normalized, or otherwise transformed. The CLI must reject incompatible likelihood/input combinations by default.
 
+**The reference's "counts" are not counts.** `add_data` hardcodes
+`summary_operation <- "mean"`, so each bin holds *mean per-base coverage*, and
+DENR abundances are in units of mean polymerase density. Confirmed against the R
+export: a `sum` summary gave exactly `bin_size` times R's values. Two
+consequences. Legacy-compatible extraction must use `mean`, which is why
+`count_sample` defaults to it. And a Poisson or negative-binomial fit must use
+`sum`: feeding it a per-base mean would hand a count likelihood a density
+divided by bin width. `SignalFile.require_count_equivalent` now rejects that
+combination alongside a transformed `value_kind`.
+
 BigWig uncovered-region semantics must be pinned explicitly rather than inherited from library defaults. In nascent-RNA BigWigs an absent interval means zero observed polymerase, not a missing observation, but recent `pybigtools` returns uncovered positions and empty bins as `NaN` by default; `fillna=0` is required to obtain count semantics, and `oob` governs reads past a contig end. The `uncovered` argument additionally controls whether uncovered bases enter the denominator of a `mean` summary, which silently changes the fitted value. Set all three at the single I/O boundary, record them in provenance, and cover them with fixtures — a `NaN` leaking into a bin vector would otherwise propagate into the objective as a numerical failure rather than a legitimate zero.
 
 ### TSS activity evidence

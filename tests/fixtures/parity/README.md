@@ -4,10 +4,41 @@ Golden intermediate values frozen from the R DENR reference implementation.
 Each `<scenario>.json` corresponds to a scenario in `tests/fixtures/scenarios.py`
 and is consumed by `tests/test_parity.py`.
 
-**This directory is empty until Phase 0 is done.** The parity tests skip with an
-actionable message when a golden file is missing, and
-`test_parity_coverage_is_reported` prints how many scenarios remain unverified —
-so a fully skipped parity suite does not read as success.
+**Status: 10/10 comparable scenarios verified.** `absent_contig` is excluded by
+design — see the bottom of this file.
+
+The parity tests still skip with an actionable message if a golden goes missing,
+and `test_parity_coverage_is_reported` prints coverage every run, so a
+regression to zero cannot read as success.
+
+## Environment that produced the current goldens
+
+Not the container. Singularity/Apptainer is Linux-only and this is macOS arm64,
+where the published amd64 SIF would need qemu emulation. The full stack resolves
+natively through conda instead:
+
+```bash
+mamba create -y -n dienr-rref -c conda-forge -c bioconda \
+  bioconductor-genomicranges bioconductor-genomicfeatures \
+  bioconductor-rtracklayer bioconductor-annotationdbi bioconductor-txdbmaker \
+  bioconductor-biomart bioconductor-gviz bioconductor-s4vectors \
+  bioconductor-iranges bioconductor-genomeinfodb bioconductor-biocgenerics \
+  r-keras r-tensorflow r-remotes r-jsonlite r-data.table r-stringr \
+  r-rappdirs r-iterators r-foreach r-snow r-dosnow r-reshape2 \
+  r-viridislite r-ggplot2 r-yaml r-matrixstats
+
+# Install DENR from the frozen local clone, not over the network, so the source
+# is exactly the pinned commit.
+~/miniforge3/envs/dienr-rref/bin/Rscript -e \
+  'remotes::install_local("_reference/DENR", dependencies = FALSE)'
+```
+
+Recorded in every golden: DENR 1.0.0, R 4.5.3, commit `09d6cde`. Note this is
+**newer Bioconductor than the container**, which is a real fidelity caveat: it
+already surfaced one API move (`makeTxDbFromGFF` relocated to `txdbmaker` and is
+defunct in GenomicFeatures >= 1.61.1). `scripts/export_r_golden.R` handles both
+spellings so it runs in either environment. Re-exporting inside the container
+remains worthwhile for final Phase 0 sign-off.
 
 ## Producing them
 
@@ -34,6 +65,15 @@ Python side reports it when a comparison fails.
 A local R also works, but needs the Bioconductor stack (`GenomicRanges`,
 `GenomicFeatures`, `rtracklayer`, `AnnotationDbi`) plus DENR itself. The
 container is preferred precisely because it pins those versions.
+
+## What R will not do
+
+`absent_contig` has no golden and never will. R's `add_data` calls
+`assert_chromosome_exists` and **aborts the whole run** with "chromosome
+chrGhost does not exist in ...". One bad contig in an annotation therefore
+kills an entire DENR job. We record `missing_contig` for that locus and keep
+going, which is the section 10 policy. The scenario documents the divergence and
+is excluded from the coverage denominator.
 
 ## What is compared
 

@@ -55,7 +55,7 @@ The legacy path is complete end to end: `annotation` (GTF/GFF → pre-RNA spans)
 
 **Not yet written:** Poisson/NB/penalized solvers, BAM counting, TSS-evidence mapping, normalization factor computation, and the ML adapters beyond `FitResult.to_numpy`.
 
-**⚠ No R parity has been established yet.** The 88 skips are the parity suite waiting on Phase 0 golden files. The tests that do pass assert the *specified* behavior, not agreement with the reference. Treat the geometry as plausible, not verified, until `uv run pytest tests/test_parity.py` reports non-zero coverage.
+**R parity is established: 10/10 comparable scenarios verified** against DENR 1.0.0 at commit `09d6cde`. Locus membership, bin boundaries, mask indices, the reduced design matrix, equivalence classes, binned signal, predicted signal, objective values and full-rank abundances all agree. Coverage is printed on every run, so a regression to zero cannot pass unnoticed.
 
 ## R parity workflow
 
@@ -89,6 +89,8 @@ These are deliberate departures from the R package; do not "restore" the R behav
 - **A second, independent binning implementation exists as the test oracle**: `pybigtools.records()` streamed into a Polars fan-out, exact by construction. It agreed with the primary path to `max|diff| = 0.0`. If you ever collect that fanned frame eagerly, use `collect(engine="streaming")` — dense per-base input amplified 8k bins into 2M rows and 384MB RSS eagerly, ~0MB streamed. Long RLE runs are *not* the hazard (~1 row per bin).
 - **Single-model loci take a fast path**, because profiling showed ~91% of a median realistic locus (64 bins, 1 model) was L-BFGS-B scaffolding, not arithmetic. Identity has a closed form; log uses a bounded scalar search. Any change there must keep `test_single_model_fast_path_matches_general_optimizer` passing.
 - **Numba was evaluated and rejected** — see plan §14.1. It cannot beat BLAS on large loci (1.09×) and the small-loci win it does offer (2.5–3.3×) addresses the 9% of runtime that is arithmetic, not the 91% that was optimizer overhead.
+- **The reference's "counts" are mean per-base coverage, not counts.** R's `add_data` hardcodes `summary_operation <- "mean"`, so DENR abundances are polymerase *density*. `count_sample` therefore defaults to `summary="mean"`; a `sum` summary gave exactly `bin_size` times R's values. Poisson/NB will need `"sum"`, and `require_count_equivalent` rejects the `mean` + count-likelihood combination.
+- **R aborts on an unknown contig; we do not.** `assert_chromosome_exists` kills an entire DENR run over one bad contig name. We record `missing_contig` for that locus and continue. The `absent_contig` scenario documents this and is excluded from parity coverage since R cannot produce a golden for it.
 - **Two verified `pybigtools` *writer* quirks**, worked around in `tests/fixtures/scenarios.py`: a BigWig written with zero intervals is unreadable (`BBIReadError`), and contigs passed in the size map but carrying no interval are **dropped from the header**. Since the header is what separates `missing_contig` from `all_zero`, a fixture needs an explicit zero-valued placeholder base on every declared contig.
 - **Non-goals for v1:** Gviz plotting, TxDb download/caching, the legacy TSS CNN, de novo transcript discovery.
 
