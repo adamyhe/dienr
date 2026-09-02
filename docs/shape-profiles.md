@@ -91,6 +91,78 @@ an order of magnitude — measured on the authors' own benchmark, and predicted 
 advance by Gate B from the estimating equations. On a binary design the two are
 nearly the same estimator; on a shaped one they are not close.
 
+### Why magnitudes don't improve
+
+Not a defect in the profile — the magnitude estimand is one a uniform design
+already gets right.
+
+**A magnitude is a mean, and a mean does not care about shape.** For a single
+model column the least-squares estimate is `â = Σ M_b y_b / Σ M_b²`. With
+`M ≡ 1` that is just `mean(y)`, so if the truth is defined as the gene's mean
+density, the uniform design is unbiased *whatever the shape is*. Measured over
+377 training genes, its multiplicative bias has median **1.006**. There is
+nothing here for a shape profile to fix.
+
+**Weighting by a shared profile can therefore only inject misspecification.**
+With `M = p`, `â/a = ⟨g,p⟩/⟨p,p⟩` where `g` is the gene's own profile, and that
+equals 1 only when `g ∝ p`. It doesn't:
+
+| | value |
+|---|---|
+| shared profile at the peak, `p(0)` | 4.06 |
+| **across-gene SD of `g(0)`** | **6.32** |
+| median across-gene CV of `g(x)` | 0.83 |
+| `p²` weight in the first 5% of the axis | **26.7%** (uniform: 5.5%) |
+| bias dispersion, uniform design | SD(log2) 0.228 |
+| bias dispersion, shaped design | SD(log2) **0.264** |
+
+The peak height varies more between genes than its own average value, and `p²`
+concentrates five times more weight there than a uniform design does. So the
+profile weights the estimate most heavily at exactly the position where genes
+disagree most. **An average-gene profile is a good estimate of a mean and a bad
+model of any individual gene**, and magnitude estimation is a per-gene problem.
+
+**What the profile does buy is conditioning, which is a different estimand.**
+Overlapping isoforms are nearly collinear under a uniform design, which says
+they are identical wherever they overlap, so their split is decided only by the
+non-overlapping bins. A graded design breaks the tie, because each isoform's
+peak sits at its own TSS — inside the other's body. At multi-model loci:
+
+| design | median condition number | 90th percentile |
+|---|---|---|
+| binary | 7.44 | 39.00 |
+| shape-reshaped | **4.98** | **17.61** |
+
+And the gain is confined to exactly where that matters. Stratifying by locus
+complexity, with the calibration constant taken within each stratum:
+
+| arm | single-model loci (n=320) | | multi-model loci (n≈1300) | |
+|---|---|---|---|---|
+| | \|log2\| err | rho | \|log2\| err | rho |
+| binary / legacy_identity | **0.076** | 0.986 | 0.452 | 0.738 |
+| binary / poisson | **0.076** | 0.986 | 0.438 | 0.747 |
+| shape / legacy_identity | 0.342 | 0.969 | 0.553 | **0.766** |
+| shape / poisson | 0.182 | 0.985 | 0.456 | **0.773** |
+
+**At single-model loci a shape profile is pure loss** — 4.5× worse magnitude
+error under least squares, 2.4× under Poisson, and no gain in ranking, because
+there is nothing to apportion. The rank-correlation improvement lives entirely
+at multi-model loci. (Note the two objectives are *identical* to four decimal
+places on the binary single-model stratum, which is Gate B's collapse showing
+up in the data.)
+
+This also explains the Poisson interaction exactly: the damage is `p²` leverage
+on the peak, and Poisson's `1/μ` weighting downweights precisely those
+high-mean bins, recovering most of it — 0.342 → 0.182 at single-model loci,
+0.553 → 0.456 at multi-model ones.
+
+Applying the profile only where it can help is the obvious consequence and is
+**not yet validated**: a design that mixes binary and shaped loci has two
+natural abundance scales, and the single global calibration constant this
+benchmark removes cannot fairly score it. Rank correlation, which needs no
+calibration, is best for that variant (0.816), but the error comparison would
+need per-stratum calibration to mean anything.
+
 **The practical recommendation follows: use a shape profile with `poisson`, not
 with least squares.** `shape/poisson` is the only arm that improves ranking
 without paying for it in magnitude — its error matches the best binary arm to

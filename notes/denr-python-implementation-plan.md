@@ -1485,6 +1485,44 @@ fraction of models estimated as exactly zero falls. Magnitude error rises,
 consistently, and sharply under least squares. Dominant-isoform accuracy swings
 between +9.8 and -2.4 points across seeds and supports no claim either way.
 
+**Why magnitudes do not improve, and it is not a defect.** The magnitude
+estimand is a mean, and a mean is insensitive to shape. For a single column,
+least squares gives `a_hat = sum(M y) / sum(M^2)`, which for `M = 1` is
+`mean(y)` -- unbiased for a mean-normalized truth *whatever* the gene's shape.
+Measured over 377 training genes, the uniform design's multiplicative bias has
+median 1.006. Weighting by a shared profile can therefore only inject
+misspecification: `a_hat/a = <g,p>/<p,p>`, which is 1 only if the gene's own
+profile `g` is proportional to `p`, and it is not. Across-gene SD of `g(0)` is
+**6.32** against a shared `p(0)` of 4.06 -- the peak height varies more than its
+own mean -- while `p^2` places 26.7% of its weight in the first 5% of the axis
+against 5.5% for a uniform design. So the profile weights the estimate most
+heavily exactly where genes disagree most, and bias dispersion rises from
+SD(log2) 0.228 to 0.264. An average-gene profile is a good estimate of a mean
+and a bad model of any individual gene.
+
+What it buys instead is **conditioning**, a different estimand. Overlapping
+isoforms are near-collinear under a uniform design, which asserts they are
+identical wherever they overlap; a graded design breaks the tie because each
+isoform's peak sits at its own TSS, inside the other's body. Median condition
+number at multi-model loci falls 7.44 -> 4.98, 90th percentile 39.0 -> 17.6.
+Stratified, with calibration taken within each stratum:
+
+| arm | 1 model: err / rho | 2+ models: err / rho |
+|---|---|---|
+| binary / legacy_identity | **0.076** / 0.986 | 0.452 / 0.738 |
+| binary / poisson | **0.076** / 0.986 | 0.438 / 0.747 |
+| shape / legacy_identity | 0.342 / 0.969 | 0.553 / **0.766** |
+| shape / poisson | 0.182 / 0.985 | 0.456 / **0.773** |
+
+**At single-model loci a shape profile is pure loss** -- 4.5x worse magnitude
+under least squares, 2.4x under Poisson, no ranking gain, because there is
+nothing to apportion. The whole rank-correlation improvement lives at
+multi-model loci. The two objectives agree to four decimals on the binary
+single-model stratum, which is Gate B's collapse appearing in the data.
+Applying the profile only at multi-model loci is the obvious consequence and is
+**not yet validated**: such a design has two natural abundance scales and the
+single global calibration constant here cannot score it fairly.
+
 **And a graded design is what makes the likelihood matter**, which settles the
 Gate B question on the authors' own benchmark rather than by simulation of our
 own design:
