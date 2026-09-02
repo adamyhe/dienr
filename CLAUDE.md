@@ -61,12 +61,12 @@ The legacy path is complete end to end: `annotation` (GTF/GFF → pre-RNA spans)
 
 Measured against R DENR on identical data (`scripts/benchmark_*`, plan §14.2), model counts agreeing exactly:
 
-| regime | total | fitting | aggregation | design |
-|---|---|---|---|---|
-| dense (124 loci, ~18 tx/locus) | **14.9×** | 9.3× | 24× | 27× |
-| sparse (955 loci, ~3 models/locus) | **14.5×** | 3.8× | 38× | 14× |
+| regime | total | fitting | aggregation | design | peak RSS |
+|---|---|---|---|---|---|
+| dense (124 loci, ~18 tx/locus) | **14.9×** | 9.3× | 24× | 27× | 301 MB vs 2417 MB (8.0×) |
+| sparse (955 loci, ~3 models/locus) | **14.5×** | 3.8× | 38× | 14× | 249 MB vs 2265 MB (9.1×) |
 
-Peak RSS on dense: 301 MB vs R's 2417 MB (8×). The plan's 3× target is met in both regimes.
+Both the 3× wall-time and 2× memory targets are met. RSS is measured externally (`/usr/bin/time -l`) for both sides; R has no usable in-process figure since `gc()` reports heap cells, not RSS.
 
 **Two performance traps this codebase has already fallen into**, both recorded in §14.2:
 

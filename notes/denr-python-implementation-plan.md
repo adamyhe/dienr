@@ -715,6 +715,10 @@ Both implementations run on identical generated datasets
 bins, log transform. Model counts agree exactly, so the ratios compare like
 with like.
 
+Peak RSS is measured externally for both, with `/usr/bin/time -l`, because R
+offers no reliable in-process figure: `gc()` reports heap cells rather than
+resident set size, and deriving MB from it gave a nonsensical result.
+
 Dense regime — 20 Mb contig, 124 loci, 2838 models, median 18 transcripts per
 locus:
 
@@ -737,7 +741,7 @@ much closer to a real annotation:
 | signal aggregation | 12.28 s | 0.33 s | 38x |
 | fitting | 2.82 s | 0.74 s | 3.8x |
 | **total** | **17.2 s** | **1.19 s** | **14.5x** |
-| peak RSS | not measured | 250 MB | — |
+| peak RSS | 2265 MB | 249 MB | 9.1x |
 
 The section 14 target of 3x end-to-end is met in both regimes, with the
 narrowest single-stage margin being 3.8x on sparse fitting.
@@ -777,7 +781,9 @@ Provisional performance targets, to be finalized after Phase 0:
   benchmark. **Met: 14.9× dense and 14.5× sparse (section 14.2).** The
   narrowest stage margin is 3.8× on sparse fitting.
 - At least 2× lower peak memory or a documented explanation of the limiting
-  representation. **Met on the dense benchmark: 301 MB against R's 2417 MB, 8×.**
+  representation. **Met in both regimes: 301 MB against 2417 MB dense (8.0×),
+  249 MB against 2265 MB sparse (9.1×). R's footprint is roughly flat at about
+  2.3 GB across both, while ours tracks the data.**
 - Near-linear useful scaling through four CPU workers for the fitting stage.
 - Reusing a design for a new sample must avoid all annotation and equivalence-class reconstruction.
 
