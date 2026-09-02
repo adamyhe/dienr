@@ -30,6 +30,19 @@ fit. `estimate_dispersion` therefore pools Pearson residuals from a completed
 Poisson fit over every locus and returns one shared value, which is then held
 fixed. That is the two-stage procedure the section describes.
 
+**The NB2 negative log-likelihood is not globally convex here.** With the
+identity link used throughout this package, the per-bin second derivative is
+
+    f''(mu) = r (-mu^2 + 2 mu y + r y) / (mu^2 + r mu)^2
+
+so a bin is convex only while ``mu < y + sqrt(y^2 + r y)``, and a zero-count bin
+is *always* concave: ``f''(mu) = -r / (mu + r)^2 < 0``. The Poisson objective
+loses nothing to this (``r -> inf`` makes the condition vacuous), which is why
+section 4.2 can claim convexity and this section cannot. In practice the
+moment initialization lands in the convex region and no local optima have
+turned up in testing, but the guarantee is absent, so a pathological start can
+terminate with a collapsed mean and `fit_locus` checks for exactly that.
+
 NB is **not** the default and should not become one without the evidence Gate D
 asks for: reproducible overdispersion, stable estimation, and a material
 held-out improvement over Poisson. `compare_dispersion_models` produces the
@@ -48,6 +61,7 @@ from ._glm import Exposure, mean, moment_initialization, pearson_residuals, usab
 from ._lbfgsb import minimize_bounded
 from .legacy import _FREE_UPPER, _INACTIVE_UPPER, LocusFit, _short_circuit
 from .penalties import NO_PENALTY, Penalty
+from .poisson import MU_FLOOR_CHECK
 
 #: Smallest dispersion treated as overdispersion at all. Below this the NB is
 #: numerically indistinguishable from a Poisson and `fit_locus` says so rather
@@ -360,6 +374,21 @@ def fit_locus(
     if not np.all(np.isfinite(abundance)):
         return _short_circuit(
             n_models, FitStatus.INVALID_MEAN, "optimizer returned non-finite abundance"
+        )
+
+    # The same guard the Poisson solver applies, and NB needs it more: unlike
+    # the Poisson negative log-likelihood, the NB2 one with an identity link is
+    # not globally convex -- every zero-count bin contributes a concave term,
+    # ``f''(mu) = -r / (mu + r)^2`` -- so a poor starting point can terminate
+    # somewhere the mean has collapsed. Without this check that came back as an
+    # apparently converged fit of exactly zero with a badly wrong objective.
+    mu = mean(abundance, models, scale, offset)
+    collapsed = usable & (observed > 0)
+    if collapsed.any() and np.any(mu[collapsed] <= MU_FLOOR_CHECK):
+        return _short_circuit(
+            n_models,
+            FitStatus.INVALID_MEAN,
+            "fitted mean vanished in a bin with nonzero counts",
         )
 
     return LocusFit(

@@ -284,3 +284,116 @@ def test_objective_includes_the_constant_terms(design):
     assert result.objective == pytest.approx(
         nb.negative_log_likelihood(result.abundance, design, observed, 0.25)
     )
+
+
+# --- score structure and convexity -----------------------------------------
+
+
+def test_score_is_weight_times_residual(design):
+    """NB2's score uses the residual linearly, weighted by 1 / V(mu).
+
+    This is the standard GLM form, ``sum_b M_bk (mu_b - y_b) / V(mu_b)`` with
+    ``V(mu) = mu + phi mu^2``. The residual drives the fit; only the *weight*
+    is a function of the fitted mean.
+    """
+    dispersion = 0.4
+    observed = simulate_nb(design, np.array([30.0, 30.0]), dispersion, seed=50)
+    point = np.array([28.0, 31.0])
+
+    mu = design @ point
+    variance = mu + dispersion * mu**2
+    glm_form = design.T @ ((mu - observed) / variance)
+    np.testing.assert_allclose(
+        nb.gradient(point, design, observed, dispersion), glm_form, rtol=1e-12
+    )
+
+
+def test_influence_of_an_observation_is_unbounded():
+    """Why NB2 is not robust: the score grows without bound in y.
+
+    The weight depends only on the fitted mean, so a larger residual
+    contributes proportionally more, with no cap. Bounding it would require an
+    estimating equation whose weights depend on y, which is M-estimation and a
+    different estimator, not NB2 maximum likelihood.
+    """
+    matrix = np.ones((6, 1))
+    dispersion = 0.4
+    contributions = []
+    for spike in (5.0, 40.0, 400.0):
+        observed = np.full(6, 5.0)
+        observed[2] = spike
+        contributions.append(abs(nb.gradient(np.array([5.0]), matrix, observed, dispersion)[0]))
+    # Strictly increasing and roughly linear in the spike size.
+    assert contributions[0] < contributions[1] < contributions[2]
+    assert contributions[2] / contributions[1] > 5.0
+
+
+@pytest.mark.parametrize(
+    ("observed_value", "mu", "dispersion", "expect_convex"),
+    [
+        (5.0, 5.0, 0.4, True),
+        (5.0, 30.0, 0.4, False),
+        (0.0, 10.0, 0.4, False),  # a zero-count bin is always concave
+        (1.0, 20.0, 2.0, False),
+    ],
+)
+def test_nb_identity_link_is_not_globally_convex(observed_value, mu, dispersion, expect_convex):
+    """Unlike Poisson, NB2 with an identity link can be locally concave.
+
+    Checked against a numerical second derivative so the analytic condition in
+    the module docstring cannot drift from the implementation.
+    """
+    matrix = np.ones((1, 1))
+    step = 1e-4
+
+    def value(m):
+        return nb.negative_log_likelihood(
+            np.array([m]), matrix, np.array([observed_value]), dispersion
+        )
+
+    second = (value(mu + step) - 2 * value(mu) + value(mu - step)) / step**2
+    size = 1.0 / dispersion
+    analytic = (
+        size
+        * (-(mu**2) + 2 * mu * observed_value + size * observed_value)
+        / (mu**2 + size * mu) ** 2
+    )
+    assert second == pytest.approx(analytic, rel=1e-3)
+    assert (second > 0) is expect_convex
+
+
+@pytest.mark.parametrize("dispersion", [0.1, 1.0, 10.0])
+@pytest.mark.parametrize("mu", [0.5, 5.0, 50.0])
+def test_zero_count_bins_are_always_concave(dispersion, mu):
+    """The clearest source of the non-convexity, measured on the real objective."""
+    matrix = np.ones((1, 1))
+    step = 1e-4
+
+    def value(m):
+        return nb.negative_log_likelihood(np.array([m]), matrix, np.array([0.0]), dispersion)
+
+    second = (value(mu + step) - 2 * value(mu) + value(mu - step)) / step**2
+    assert second < 0
+
+
+def test_collapsed_mean_is_flagged_not_returned_as_zero(design):
+    """Regression: NB lacked the Poisson solver's mean-collapse guard.
+
+    A pathological start terminated with abundance exactly zero and an
+    objective off by orders of magnitude, reported as a converged fit. Because
+    the NB2 identity-link objective is not globally convex, this cannot be
+    ruled out by appealing to convexity the way it can for Poisson.
+    """
+    observed = simulate_poisson(design, np.array([1.5, 1.5]), seed=51)
+    result = nb.fit_locus(design, observed, dispersion=1e-6, initial=np.full(2, 1e4))
+    assert result.status is FitStatus.INVALID_MEAN
+    assert np.isnan(result.abundance).all()
+    assert "vanished" in result.failure_reason
+
+
+def test_default_initialization_avoids_the_collapse(design):
+    """The moment start lands in the convex region, which is why it is default."""
+    observed = simulate_poisson(design, np.array([1.5, 1.5]), seed=51)
+    result = nb.fit_locus(design, observed, dispersion=1e-6)
+    assert result.status is FitStatus.OK
+    assert np.all(result.abundance > 0)

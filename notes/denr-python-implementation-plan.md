@@ -159,13 +159,37 @@ comparison Gate D needs.
 Two findings that bear on Gate D, and both argue for keeping NB low priority:
 
 - **NB2 is not an outlier-robust estimator, and should not be presented as one.**
-  Its score weights bin ``b`` by ``r / (mu_b (r + mu_b))``, which depends on the
-  fitted mean and not on how far the observation lies from it. Bins sharing a
-  fitted mean share a weight, so a single large excursion pulls an NB2 fit
-  essentially as hard as it pulls a Poisson fit. What NB2 changes is the
-  variance function and therefore inference. Where fitted means differ across a
-  locus it does reallocate abundance materially; where they are flat, Poisson
-  and NB2 agree to within a few percent.
+  Its score is the standard GLM form ``sum_b M_bk (mu_b - y_b) / V(mu_b)`` with
+  ``V(mu) = mu + phi mu^2``: the residual enters *linearly* and drives the fit,
+  while the weight ``1 / V(mu_b)`` depends only on the fitted mean. So the
+  residual is fully used, but an observation's influence is unbounded — triple
+  the excursion, triple its contribution — and bins sharing a fitted mean share
+  a weight regardless of how far each observation sits from it. A single large
+  excursion therefore pulls an NB2 fit essentially as hard as it pulls a
+  Poisson fit.
+
+  Weighting *by* the residual is not available within maximum likelihood. The
+  weight is fixed by the assumed variance function, so changing it stops being
+  NB2; and any weight depending on ``y`` breaks the unbiasedness of the
+  estimating equation, since ``E[w(y)(y - mu)] != 0`` in general. Bounding
+  influence means moving to M-estimation with a consistency correction — a
+  different estimator with different guarantees, not a variant of this one. If
+  robustness to excursions is the actual requirement, that is the honest route,
+  and it should be scoped separately rather than expected from NB.
+
+  What NB2 does change is the variance function and therefore inference. Where
+  fitted means differ across a locus it reallocates abundance materially; where
+  they are flat, Poisson and NB2 agree to within a few percent.
+- **NB2 with an identity link is not globally convex, so it does not inherit
+  the guarantee section 4.2 gives Poisson.** The per-bin second derivative is
+  ``f''(mu) = r(-mu^2 + 2 mu y + r y) / (mu^2 + r mu)^2``, positive only while
+  ``mu < y + sqrt(y^2 + r y)``, and a zero-count bin is always concave at
+  ``f''(mu) = -r/(mu + r)^2``. Poisson escapes this because ``r -> inf`` makes
+  the condition vacuous. No local optima have appeared in testing from the
+  moment initialization, but the guarantee is genuinely absent, and a
+  pathological start did terminate with a collapsed mean reported as a
+  converged fit of exactly zero until `fit_locus` gained the same
+  mean-collapse guard the Poisson solver already had.
 - **The textbook NB2 likelihood is numerically unusable at small dispersion.**
   ``(y + r) log(r + mu) - r log r`` cancels two large numbers once ``r`` is
   large, and the naive form fails to reproduce the Poisson limit at all. The
