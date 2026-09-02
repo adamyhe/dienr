@@ -708,9 +708,62 @@ the remaining scaffolding work is done, and only with a fresh profile:
   the gradient, so dropping them changes the reported objective value but not
   the argmin — the constant must be added back for R parity.
 
+### 14.2 Measured comparison against R DENR
+
+Both implementations were run on identical generated datasets
+(`scripts/benchmark_*`), 3000 transcripts and 3 samples, bin size 250, masks
+±4 bins, log transform. Model counts agree exactly, so the ratios compare like
+with like. **The result depends entirely on locus geometry, and in the more
+realistic regime the section 14 target is not met.**
+
+Dense regime — 20 Mb contig, 124 loci, 2838 models, median 18 transcripts per
+locus:
+
+| stage | DENR | dienr | ratio |
+|---|---|---|---|
+| annotation parse | 0.54 s | 0.01 s | 60x |
+| design construction | 3.65 s | 0.12 s | 32x |
+| signal aggregation | 8.28 s | 0.48 s | 17x |
+| fitting | 6.46 s | 1.10 s | 5.9x |
+| **total** | **18.9 s** | **1.70 s** | **11.2x** |
+| peak RSS | 2417 MB | 308 MB | 7.8x |
+
+Sparse regime — 200 Mb contig, 955 loci, 2865 models, about 3 models per locus,
+which is much closer to a real annotation:
+
+| stage | DENR | dienr | ratio |
+|---|---|---|---|
+| annotation parse | 0.54 s | 0.01 s | 68x |
+| design construction | 1.58 s | 0.11 s | 14x |
+| signal aggregation | 12.28 s | 5.66 s | 2.2x |
+| fitting | 2.82 s | 7.06 s | **0.4x — slower** |
+| **total** | **17.2 s** | **12.8 s** | **1.3x** |
+
+Two conclusions, both uncomfortable and both actionable:
+
+1. **We are slower than R at fitting many small loci.** This confirms the
+   section 14.1 profiling from the other direction. R's `optim` is a thin
+   wrapper over C, whereas `scipy.optimize.minimize` adds
+   `_differentiable_functions` and `_minimize_lbfgsb` layers in Python that are
+   paid per locus. With about 3 models per locus the single-model fast path
+   rarely applies, so that overhead dominates and R wins outright. Fixing this
+   is now required work, not an optimization: call L-BFGS-B below `minimize`,
+   or batch same-shaped loci into one vectorized solve.
+2. **Per-locus BigWig reads stop scaling.** 2865 targeted `values()` calls cost
+   5.66 s against R's 12.28 s for one bulk pass per strand — only 2.2x, versus
+   17x in the dense regime where there are 20x fewer windows. Batching reads
+   per contig or per chunk, rather than per locus, is the fix.
+
+Annotation parsing and design construction are 14-68x faster and hold up across
+both regimes, so the geometry work is settled. Everything else about the
+performance story is unfinished, and the honest current headline is **1.3x
+end-to-end on realistic geometry, not 11x.**
+
 Provisional performance targets, to be finalized after Phase 0:
 
-- At least 3× lower end-to-end wall time than R DENR on the agreed multi-sample benchmark.
+- At least 3× lower end-to-end wall time than R DENR on the agreed multi-sample
+  benchmark. **Currently unmet on realistic geometry: 1.3× measured (section
+  14.2). Met comfortably, 11.2×, only on dense many-isoform loci.**
 - At least 2× lower peak memory or a documented explanation of the limiting representation.
 - Near-linear useful scaling through four CPU workers for the fitting stage.
 - Reusing a design for a new sample must avoid all annotation and equivalence-class reconstruction.
