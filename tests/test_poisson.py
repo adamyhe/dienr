@@ -498,3 +498,57 @@ def test_scaling_the_ridge_weight_restores_transfer():
         shrinkage[truth] = mean_ridge_shrinkage(40, truth, 0.01 / truth)
     assert max(shrinkage.values()) < 0.005
     assert shrinkage[200.0] == pytest.approx(shrinkage[1.0], rel=0.5)
+
+
+def test_poisson_rejects_a_design_with_no_models():
+    result = poisson.fit_locus(np.zeros((10, 0)), np.ones(10))
+    assert result.status is FitStatus.INSUFFICIENT_BINS
+    assert result.abundance.size == 0
+
+
+def test_poisson_accepts_an_explicit_initial_point(design):
+    """An explicit start must be honoured, and reach the same optimum."""
+    truth = np.array([60.0, 90.0])
+    observed = simulate(design, truth, seed=70)
+    default = poisson.fit_locus(design, observed)
+    explicit = poisson.fit_locus(design, observed, initial=np.array([50.0, 80.0]))
+    assert explicit.status is FitStatus.OK
+    np.testing.assert_allclose(explicit.abundance, default.abundance, rtol=1e-4)
+
+
+def test_iteration_cap_reports_nonconvergence(design):
+    """The maxiter path, which sets the NONCONVERGED status.
+
+    A converged-looking result from a truncated run would be the worst kind of
+    silent failure, so this asserts the status rather than the numbers.
+    """
+    observed = simulate(design, np.array([500.0, 900.0]), seed=71)
+    result = poisson.fit_locus(design, observed, max_iterations=1)
+    assert result.status is FitStatus.NONCONVERGED
+    assert not result.converged
+    assert "EXCEEDS LIMIT" in result.message
+    # A truncated estimate is still returned, not NaN: it is a qualified
+    # result, not a failure.
+    assert np.all(np.isfinite(result.abundance))
+
+
+@pytest.mark.parametrize(
+    "exposure",
+    [
+        Exposure(bin_exposure=np.ones(3)),  # wrong length
+        Exposure(background=np.ones(99)),
+    ],
+)
+def test_misshaped_exposure_arrays_raise(design, exposure):
+    """A shape mismatch is a programming error, not a data condition."""
+    observed = simulate(design, np.array([5.0, 5.0]), seed=72)
+    with pytest.raises(ValueError, match="expected"):
+        poisson.fit_locus(design, observed, exposure=exposure)
+
+
+def test_non_finite_bin_exposure_is_reported(design):
+    observed = simulate(design, np.array([5.0, 5.0]), seed=73)
+    bad = np.ones(8)
+    bad[3] = np.inf
+    result = poisson.fit_locus(design, observed, exposure=Exposure(bin_exposure=bad))
+    assert result.status is FitStatus.INVALID_EXPOSURE

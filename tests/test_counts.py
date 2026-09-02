@@ -190,3 +190,67 @@ def test_full_pipeline_fits_and_explains_signal(two_locus_design, plus_bw, minus
     assert any(f.abundance.sum() > 0 for f in fits)
     for fit in fits:
         assert np.isfinite(fit.abundance).all()
+
+
+# --- input validation and edge paths ---------------------------------------
+
+
+def test_signal_file_rejects_a_bad_strand(plus_bw):
+    with pytest.raises(ValueError, match="strand must be"):
+        SignalFile(plus_bw, "?")
+
+
+def test_signal_file_rejects_an_unknown_value_kind(plus_bw):
+    with pytest.raises(ValueError, match="value_kind"):
+        SignalFile(plus_bw, "+", value_kind="normalised")
+
+
+def test_require_count_equivalent_rejects_a_mean_summary(plus_bw):
+    """The per-bin summary is the second way input can fail to be a count.
+
+    Coverage found this branch untested: only the transformed-file branch was
+    exercised, even though the mean summary is the likelier mistake, being the
+    default.
+    """
+    signal = SignalFile(plus_bw, "+")
+    with pytest.raises(ValueError, match="count-preserving summary"):
+        signal.require_count_equivalent("poisson", summary="mean")
+    # The count-preserving summary passes, and a non-count likelihood is
+    # unconstrained either way.
+    signal.require_count_equivalent("poisson", summary="sum")
+    signal.require_count_equivalent("legacy", summary="mean")
+
+
+def test_window_clipped_at_the_contig_end_is_zero_padded(plus_bw):
+    """A locus running off the end of a contig must still align to the design.
+
+    pybigtools returns fewer bins than requested when the window is clipped,
+    so the vector is padded rather than left short, which would misalign every
+    downstream index.
+    """
+    length = declared_contigs(plus_bw)["1"]
+    frame = pl.DataFrame(
+        {
+            "transcript_id": ["tx_edge"],
+            "contig": ["1"],
+            # Deliberately overruns the declared contig length.
+            "start": [length - 600],
+            "end": [length + 4_000],
+            "strand": ["+"],
+        }
+    )
+    design = build_design(Annotation.from_frame(frame), bin_size=250)
+    counts = count_sample(design, "s", SignalFile(plus_bw, "+"))
+    assert counts.values[0].size == design.bin_count(0)
+    assert np.isfinite(counts.values[0]).all()
+    # The bins past the contig end carry no signal.
+    assert counts.values[0][-1] == 0.0
+
+
+def test_total_signal_sums_across_loci(two_locus_design, plus_bw, minus_bw):
+    counts = count_sample(
+        two_locus_design,
+        "s",
+        (SignalFile(plus_bw, "+"), SignalFile(minus_bw, "-")),
+    )
+    assert counts.total_signal() == pytest.approx(sum(v.sum() for v in counts.values))

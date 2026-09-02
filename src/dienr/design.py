@@ -54,7 +54,10 @@ class DesignConfig:
         mask_end_bins: The same at the 3' end.
         mask_tss: ``(upstream, downstream)`` bases masked around each
             transcript's TSS, measured along the direction of transcription. A
-            bin is masked when it overlaps that genomic window. Preferred over
+            bin is masked when it overlaps that genomic window, which includes
+            the anchor base, so ``(n, n)`` spans ``2n + 1`` bases. ``(0, 0)``
+            disables masking at that end rather than masking the single anchor
+            base. Preferred over
             `mask_start_bins`: the masked span is then a fixed number of bases
             rather than a count of bins, so it does not change meaning when
             `bin_size` changes and does not jitter by up to a bin depending on
@@ -510,7 +513,11 @@ def _mask_bins_by_bases(
             tss, pas = span_end - 1, span_start
 
         for window, anchor in ((config.mask_tss, tss), (config.mask_pas, pas)):
-            if window is None:
+            # (0, 0) disables that end, matching how the legacy bin-count form
+            # treats it. Without this it would still mask the single base at
+            # the anchor, and hence its whole bin, which is not what a caller
+            # writing (0, 0) means.
+            if window is None or window == (0, 0):
                 continue
             upstream, downstream = window
             if strand == "+":

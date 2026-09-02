@@ -342,3 +342,119 @@ def test_inactive_transcript_file_is_applied(annotation_gtf, samples_csv, tmp_pa
     ]
     pinned = result.model_abundance.filter(pl.col("locus_id") == minus_locus)
     assert (pinned["abundance_raw"] == 0.0).all()
+
+
+def test_heavily_masked_loci_are_warned_about(tmp_path, capsys):
+    """A locus fitted on a fraction of its bins must say so at build time."""
+    gtf = write_gtf(
+        tmp_path / "narrow.gtf",
+        [
+            {
+                "transcript_id": "tx",
+                "gene_id": "g",
+                "contig": "1",
+                "start": 1_001,
+                "end": 2_000,
+                "strand": "+",
+            }
+        ],
+    )
+    assert (
+        main(
+            [
+                "build-design",
+                "--gtf",
+                str(gtf),
+                "--output",
+                str(tmp_path / "d"),
+                "--mask-tss",
+                "0",
+                "600",
+            ]
+        )
+        == 0
+    )
+    assert "lost more than half their bins" in capsys.readouterr().err
+
+
+def test_poisson_via_the_cli(annotation_gtf, samples_csv, tmp_path):
+    """The count likelihoods must be reachable end to end from the CLI.
+
+    Counting has to use --summary sum, since the parity default of mean is
+    rejected for a count likelihood.
+    """
+    design_dir, counts_dir, results_dir = (tmp_path / "d", tmp_path / "c", tmp_path / "r")
+    main(["build-design", "--gtf", str(annotation_gtf), "--output", str(design_dir)])
+    main(
+        [
+            "count",
+            "--design",
+            str(design_dir),
+            "--samples",
+            str(samples_csv),
+            "--output",
+            str(counts_dir),
+            "--summary",
+            "sum",
+        ]
+    )
+    assert (
+        main(
+            [
+                "fit",
+                "--design",
+                str(design_dir),
+                "--counts",
+                str(counts_dir),
+                "--output",
+                str(results_dir),
+                "--likelihood",
+                "poisson",
+                "--penalty",
+                "ridge",
+                "--lambda2",
+                "0.01",
+            ]
+        )
+        == 0
+    )
+    result = FitResult.read(results_dir)
+    assert result.provenance["likelihood"] == "poisson"
+    assert result.provenance["penalty_type"] == "ridge"
+
+
+def test_mean_summary_is_rejected_for_poisson_via_the_cli(annotation_gtf, samples_csv, tmp_path):
+    """The default `dienr count` is a per-base mean, for R parity.
+
+    So the default count output cannot feed a count likelihood, and the guard
+    has to fire rather than silently fitting a density. This also pins the CLI
+    default to `mean`: it was `sum`, which meant the all-defaults pipeline
+    quietly diverged from the reference it is supposed to reproduce.
+    """
+    design_dir, counts_dir = tmp_path / "d", tmp_path / "c"
+    main(["build-design", "--gtf", str(annotation_gtf), "--output", str(design_dir)])
+    main(
+        [
+            "count",
+            "--design",
+            str(design_dir),
+            "--samples",
+            str(samples_csv),
+            "--output",
+            str(counts_dir),
+        ]
+    )
+    with pytest.raises(ValueError, match="per-base density"):
+        main(
+            [
+                "fit",
+                "--design",
+                str(design_dir),
+                "--counts",
+                str(counts_dir),
+                "--output",
+                str(tmp_path / "r"),
+                "--likelihood",
+                "poisson",
+            ]
+        )

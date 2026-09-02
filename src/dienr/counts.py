@@ -154,7 +154,11 @@ def read_binned(
         start: 0-based inclusive window start.
         end: Half-open window end.
         n_bins: Number of equal-width bins spanning the window.
-        summary: Per-bin statistic. ``"sum"`` is the count-preserving choice.
+        summary: Per-bin statistic. ``"sum"`` is the count-preserving choice
+            and the default *here*, since this is the raw aggregation
+            primitive. Note `count_sample` defaults to ``"mean"`` instead,
+            because that is what the reference implementation uses; the two
+            defaults differ deliberately and each is documented where it sits.
         reader: An open reader to reuse across calls.
 
     Returns:

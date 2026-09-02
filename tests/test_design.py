@@ -435,3 +435,64 @@ def test_base_masking_changes_the_design_digest():
     base = build_design(annotation(rows), bin_size=250)
     assert build_design(annotation(rows), bin_size=250, mask_tss=(500, 500)).digest != (base.digest)
     assert build_design(annotation(rows), bin_size=250, mask_pas=(500, 500)).digest != (base.digest)
+
+
+def test_all_zero_column_is_skipped_when_masking():
+    """A model with no occupied bin has no end to anchor a mask to.
+
+    Reached whenever a sub-bin transcript rounds away, so it must not raise or
+    mask arbitrary bins.
+    """
+    design = build_design(
+        annotation([("tiny", "chr1", 100, 110, "+"), ("real", "chr1", 100, 3000, "+")]),
+        bin_size=250,
+        mask_start_bins=(1, 0),
+    )
+    # 'tiny' rounds to an all-zero column; only 'real' anchors a mask.
+    assert design.unsupported_models.height >= 0
+    assert np.flatnonzero(design.mask(0)).tolist() == [0]
+
+
+def test_zero_width_base_window_disables_that_end():
+    """`(0, 0)` must disable an end, not mask the single anchor base.
+
+    A window includes its anchor base, so `(n, n)` spans `2n + 1` bases and a
+    naive reading of `(0, 0)` would still mask one base -- and therefore its
+    whole bin. That is not what a caller writing `(0, 0)` means, and the
+    legacy bin-count form already treats it as disabled.
+    """
+    design = build_design(
+        annotation([("tx", "chr1", 0, 5000, "+")]),
+        bin_size=250,
+        mask_tss=(0, 0),
+        mask_pas=(0, 250),
+    )
+    masked = np.flatnonzero(design.mask(0)).tolist()
+    assert 0 not in masked, "the TSS end should be disabled"
+    assert masked == [19], "only the PAS window should bite"
+
+
+def test_from_frame_rejects_a_missing_required_column():
+    with pytest.raises(ValueError, match="missing required column"):
+        Annotation(transcripts=pl.DataFrame({"transcript_id": ["t"]}), digest="d", source="s")
+
+
+def test_from_frame_rejects_a_wrong_dtype():
+    frame = pl.DataFrame(
+        {
+            "transcript_id": ["t"],
+            "gene_id": ["g"],
+            "contig": ["chr1"],
+            "start": [0.5],  # Float64 where Int64 is required
+            "end": [100.0],
+            "strand": ["+"],
+            "coord_source": ["provided"],
+        }
+    )
+    with pytest.raises(ValueError, match="expected"):
+        Annotation(transcripts=frame, digest="d", source="s")
+
+
+def test_contigs_property_is_sorted():
+    ann = annotation([("a", "chr2", 0, 100, "+"), ("b", "chr1", 0, 100, "+")])
+    assert ann.contigs == ["chr1", "chr2"]

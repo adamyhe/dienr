@@ -397,3 +397,31 @@ def test_default_initialization_avoids_the_collapse(design):
     result = nb.fit_locus(design, observed, dispersion=1e-6)
     assert result.status is FitStatus.OK
     assert np.all(result.abundance > 0)
+
+
+def test_penalized_nb_fit_runs_through_the_fused_path(design):
+    """Coverage found this: the penalty branch of the NB fused closure was dead.
+
+    `nb.gradient` was exercised with a penalty, but no test ever reached
+    `fit_locus` with an active one, so the fused closure's penalty arm never
+    ran. Ridge must shrink here exactly as it does for Poisson.
+    """
+    observed = simulate_nb(design, np.array([100.0, 100.0]), 0.2, seed=60)
+    unpenalized = nb.fit_locus(design, observed, dispersion=0.2)
+    shrunk = nb.fit_locus(design, observed, dispersion=0.2, penalty=penalties.ridge(1.0))
+    assert shrunk.status is FitStatus.OK
+    assert shrunk.abundance.sum() < unpenalized.abundance.sum()
+    # And the reported objective includes the penalty.
+    assert shrunk.objective > nb.negative_log_likelihood(shrunk.abundance, design, observed, 0.2)
+
+
+def test_nb_rejects_a_design_with_no_models(design):
+    result = nb.fit_locus(np.zeros((10, 0)), np.ones(10), dispersion=0.2)
+    assert result.status is FitStatus.INSUFFICIENT_BINS
+    assert result.abundance.size == 0
+
+
+def test_nb_validates_the_inactive_shape(design):
+    observed = simulate_poisson(design, np.array([5.0, 5.0]), seed=61)
+    with pytest.raises(ValueError, match="inactive must have shape"):
+        nb.fit_locus(design, observed, dispersion=0.2, inactive=np.array([True]))

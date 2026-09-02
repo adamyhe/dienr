@@ -77,6 +77,23 @@ Both the 3× wall-time and 2× memory targets are met. RSS is measured externall
 
 **JIT: evaluated twice, declined twice, for different reasons** (plan §14.1 and §14.3). Now that the scaffolding is gone the fused closures are 61–68% of each fitting stage, and numba would give **2.1× Poisson / 2.2× NB / 1.9× legacy** at the realistic 329×3 locus — but **0.3× (three times slower) at 4000×30**, where a hand loop can't beat BLAS. Declined because it needs size dispatch plus a second bit-identical implementation of every likelihood, for ~1.2× end-to-end on a pipeline already 14.5× faster than R. The free part was taken: fused closures fold the usable mask into precomputed vectors and preallocate all temporaries (~1.18× on Poisson/NB stages, no regression at any size). Don't add a JIT kernel without re-reading §14.3.
 
+## How the suite is structured
+
+395 tests, 99% line coverage, 10 skips (all `absent_contig`, which R cannot produce a golden for). `uv run pytest -q --cov=dienr --cov-report=term-missing` for the breakdown.
+
+The layers, roughly in order of how much they buy:
+
+1. **Cross-implementation parity (106 tests).** Eight comparison dimensions × 13 scenarios against frozen R DENR goldens. An independent implementation as oracle is the strongest evidence available here.
+2. **Meta-tests that the parity checks can fail (19).** `test_parity_harness.py` corrupts goldens deliberately — shifts bins by one, transposes the matrix, blanks the masks, splits equivalence classes — and asserts each comparison catches it. Without these a green parity suite could be vacuous.
+3. **Fast-path ≡ reference-path equivalence.** The lean L-BFGS-B driver is bit-identical to `scipy.optimize.minimize`; each fused closure equals its readable `objective`/`gradient` pair; the single-model fast path equals the general optimizer. This is what makes aggressive optimization safe without risking parity.
+4. **Analytic gradients vs finite differences**, for all three likelihoods × penalty combinations.
+5. **Known-truth recovery**, plus "error must fall as depth rises".
+6. **Every `FitStatus` reached deliberately**, asserting NaN-not-zero — §10 encoded as tests.
+7. **Findings pinned as regressions.** Every bug and surprise in the log has a test: the `ALL_ZERO` short-circuit, mask anchoring order, the uncached `mask()`, NB's naive formula, the pinning collapse, the ridge scaling law, `legacy_log`'s low-count misspecification.
+8. **Derived rather than magic constants** — e.g. shrinkage ≈ `2λa/n_bins` is asserted against its prediction, so the thresholds in neighbouring tests are interpretable.
+
+**Known gaps, deliberately.** No property-based testing (all example-based); no mutation testing, so coverage ≠ assertion quality; no real biological data — everything is synthetic or the R package's synthetic fixtures; no concurrency tests since there is no parallelism yet. The parity goldens also come from newer Bioconductor than the container, so parity is against a near-neighbour of the frozen reference, not the frozen reference itself.
+
 ## Likelihood guidance (Gate B evidence)
 
 `scripts/validate_likelihoods.py` compares the objectives on prespecified regimes with contiguous held-out blocks and paired per-fold scoring (plan §17, Gate B). Stable across seeds:

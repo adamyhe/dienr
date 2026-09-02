@@ -10,7 +10,7 @@ import pytest
 
 from dienr.annotation import Annotation
 from dienr.counts import SampleCounts
-from dienr.design import build_design
+from dienr.design import DesignConfig, build_design
 from dienr.pipeline import all_statuses_accounted_for, fit
 from dienr.results import (
     LOCUS_QC_SCHEMA,
@@ -22,6 +22,65 @@ from dienr.results import (
 )
 from dienr.solvers.legacy import fit_locus
 from dienr.status import FitStatus
+
+
+class _StubDesign:
+    """A one-locus Design carrying a caller-supplied matrix.
+
+    Needed because an ill-conditioned but full-rank design cannot arise from a
+    real annotation: `bin_operation` rounds occupancies to integers, so two
+    columns are either identical or differ by a whole bin. Constructing the
+    matrix directly is the only way to reach the conditioning branch.
+    """
+
+    def __init__(self, models: np.ndarray) -> None:
+        n_bins = models.shape[0]
+        self.models = [models]
+        self.masks = [np.zeros(n_bins, dtype=bool)]
+        self.bin_lengths = [np.full(n_bins, 250.0)]
+        self.digest = "stub-design"
+        self.annotation_digest = "stub-annotation"
+        self.n_loci = 1
+        self.config = DesignConfig()
+        self.loci = pl.DataFrame(
+            {
+                "locus_id": pl.Series([0], dtype=pl.UInt32),
+                "locus_name": ["chr1:+:0-100"],
+                "contig": ["chr1"],
+                "strand": ["+"],
+                "start": [0],
+                "end": [100],
+                "n_transcripts": pl.Series([models.shape[1]], dtype=pl.UInt32),
+            }
+        )
+        self.model_table = pl.DataFrame(
+            {
+                "locus_id": pl.Series([0] * models.shape[1], dtype=pl.UInt32),
+                "model_index": pl.Series(range(models.shape[1]), dtype=pl.UInt32),
+                "model_id": [f"stub{i}" for i in range(models.shape[1])],
+                "equivalence_class_size": pl.Series([1] * models.shape[1], dtype=pl.UInt32),
+                "has_support": [True] * models.shape[1],
+            }
+        )
+        self.transcript_map = self.model_table.select(
+            pl.lit("tx").alias("transcript_id"),
+            pl.lit("g").alias("gene_id"),
+            "locus_id",
+            "model_index",
+            "model_id",
+            "equivalence_class_size",
+            pl.lit(True).alias("exactly_identifiable"),
+            "has_support",
+        )
+
+    def bin_count(self, locus_id: int) -> int:
+        return self.models[locus_id].shape[0]
+
+    def mask(self, locus_id: int) -> np.ndarray:
+        return self.masks[locus_id]
+
+    def masked_fraction(self, locus_id: int) -> float:
+        return 0.0
 
 
 @pytest.fixture
@@ -451,3 +510,41 @@ def test_dispersion_estimated_from_a_poisson_fit_feeds_the_nb_fit(design):
     estimate = nbmod.estimate_dispersion(triples)
     # Poisson-simulated data: little or no overdispersion, so Poisson stands.
     assert estimate.dispersion < 0.05
+
+
+def test_ill_conditioned_locus_is_escalated_from_ok():
+    """The conditioning escalation for near-collinear, full-rank designs.
+
+    Distinct from rank deficiency: the matrix has full numerical rank, so the
+    solution is unique, but the allocation is unstable. Reporting plain 'ok'
+    would overstate what was learned.
+    """
+    n_bins = 60
+    models = np.ones((n_bins, 2))
+    models[0, 1] = 1.0 + 1e-11  # full rank, appallingly conditioned
+    design = _StubDesign(models)
+
+    counts = SampleCounts(
+        sample_id="s1",
+        values=[models @ np.array([3.0, 4.0])],
+        locus_status=[FitStatus.OK],
+        design_digest=design.digest,
+        totals_all_bins=[0.0],
+    )
+    fits = [fit_locus(models, counts.values[0], transform="identity")]
+    result = collect_results(design, [(counts, fits)])
+    assert result.locus_qc["solver_status"][0] == "ill_conditioned"
+    assert result.locus_qc["matrix_rank"][0] == 2
+
+
+def test_empty_result_has_an_empty_summary(design):
+    """`FitResult.summary` on a run with no loci must not divide by zero."""
+    empty = collect_results(design, [])
+    assert empty.summary.n_fits == 0
+    assert empty.summary.failure_fraction == 0.0
+    assert empty.summary.by_status == {}
+
+
+def test_extra_provenance_is_merged(design):
+    result = fit(design, synthetic_counts(design), provenance={"run_label": "smoke"})
+    assert result.provenance["run_label"] == "smoke"

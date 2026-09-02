@@ -108,7 +108,14 @@ def build_parser() -> argparse.ArgumentParser:
         "and optionally value_kind and exposure",
     )
     count.add_argument("--output", required=True, type=Path)
-    count.add_argument("--summary", choices=("sum", "mean"), default="sum")
+    count.add_argument(
+        "--summary",
+        choices=("sum", "mean"),
+        default="mean",
+        help="per-bin statistic. 'mean' (default) matches the R reference, "
+        "whose add_data hardcodes it, so the default pipeline reproduces it. "
+        "Count likelihoods need 'sum'; 'dienr fit' rejects the mismatch.",
+    )
 
     fit_parser = subparsers.add_parser("fit", help="estimate abundances")
     fit_parser.add_argument("--design", required=True, type=Path)
