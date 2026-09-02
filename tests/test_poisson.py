@@ -552,3 +552,55 @@ def test_non_finite_bin_exposure_is_reported(design):
     bad[3] = np.inf
     result = poisson.fit_locus(design, observed, exposure=Exposure(bin_exposure=bad))
     assert result.status is FitStatus.INVALID_EXPOSURE
+
+
+# --- why Poisson barely beats least squares here ---------------------------
+
+
+def test_poisson_and_least_squares_coincide_on_a_binary_design():
+    """On a 0/1 design column the two are the *same* estimator, not merely close.
+
+    Both estimating equations differ only in the weight ``1 / mu_b``:
+
+        Poisson:  sum_b M_bk (y_b - mu_b) / mu_b = 0
+        MSE:      sum_b M_bk (y_b - mu_b)       = 0
+
+    so when ``mu`` is constant across a model's support the weight factors out
+    and the equations are identical. For one indicator column that is exactly
+    the case: both reduce to ``a = sum(y) / n_support``.
+
+    This is the mechanism behind the Gate B result. `bin_operation` rounds
+    fractional occupancy to 0/1, which removes precisely the heterogeneity the
+    Poisson weighting would exploit.
+    """
+    from dienr.solvers import legacy
+
+    matrix = np.zeros((60, 1))
+    matrix[10:50, 0] = 1.0
+    rng = np.random.default_rng(0)
+
+    for _ in range(50):
+        observed = rng.poisson(matrix[:, 0] * 7.0).astype(np.float64)
+        poisson_estimate = poisson.fit_locus(matrix, observed).abundance[0]
+        mse_estimate = legacy.fit_locus(matrix, observed, transform="identity").abundance[0]
+        assert poisson_estimate == pytest.approx(mse_estimate, abs=1e-9)
+        # And both equal the closed form.
+        assert poisson_estimate == pytest.approx(observed.sum() / 40.0, rel=1e-6)
+
+
+def test_poisson_efficiency_gain_needs_a_graded_design():
+    """The gain is bounded by ``sum(M^3) sum(M) / sum(M^2)^2``, tight in practice.
+
+    Cauchy-Schwarz puts that ratio at or above 1, with equality iff ``M`` is
+    constant. Even a fiftyfold range in occupancy gives only about 1.12, i.e.
+    6% in standard error -- which is why the measured win rate sits near 55%
+    rather than anywhere decisive.
+    """
+
+    def variance_ratio(column: np.ndarray) -> float:
+        return float((column**3).sum() * column.sum() / ((column**2).sum() ** 2))
+
+    flat = np.ones(200)
+    graded = np.linspace(0.02, 1.0, 200)
+    assert variance_ratio(flat) == pytest.approx(1.0)
+    assert 1.05 < variance_ratio(graded) < 1.2

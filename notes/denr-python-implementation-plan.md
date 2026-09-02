@@ -1038,6 +1038,62 @@ Three conclusions.
    the default one.
 3. **No regression at high counts**, as required.
 
+#### Why Poisson barely beats least squares, and what would change that
+
+The tie against `legacy_identity` is not a numerical accident, and it has an
+exact explanation. The two estimating equations differ only in a weight:
+
+    Poisson:  sum_b M_bk (y_b - mu_b) / mu_b = 0
+    MSE:      sum_b M_bk (y_b - mu_b)        = 0
+
+So when ``mu`` is constant across a model's support, ``1 / mu`` factors out and
+the equations are **the same equation**. For a single 0/1 design column that is
+exactly the case — both reduce to ``a = sum(y) / n_support`` — and measurement
+confirms it: over 200 draws the two estimates differ by ``0.000e+00``. They are
+not similar estimators; they are one estimator.
+
+**`bin_operation` is what causes this.** Rounding fractional occupancy to 0/1
+makes every design column an indicator, which removes precisely the
+heterogeneity the Poisson weighting exists to exploit. With overlapping
+indicator columns ``mu`` takes only two distinct values across the benchmark
+locus, so the weight is nearly constant and the two estimators stay within a
+few percent — a consistent 59-60% win on abundance error at every sequencing
+depth, from 0.5 to 200 counts per bin. Depth-independent, because the
+limitation is a property of the design, not of the counts.
+
+Even a graded design has a low ceiling. For one model the variance ratio is
+
+    Var(MSE) / Var(Poisson) = sum(M^3) sum(M) / sum(M^2)^2
+
+which Cauchy-Schwarz puts at or above 1, with equality iff ``M`` is constant.
+Measured against theory:
+
+| design | predicted ratio | measured | Poisson wins |
+|---|---|---|---|
+| constant M (what rounding produces) | 1.0000 | 1.0000 | identical |
+| M in [0.5, 1] | 1.034 | 1.059 | 58% |
+| M in [0.05, 1] | 1.123 | 1.127 | 56% |
+| shape-profile-like, M in [0.02, 1] | 1.125 | 1.143 | 56% |
+
+A fiftyfold range in occupancy buys 12% in variance, about 6% in standard
+error. That is the entire prize available from switching likelihood on this
+class of design.
+
+Three actionable consequences.
+
+- **The shape profile is a prerequisite for Poisson to be worth much.** DENR's
+  non-uniform density model makes ``M`` non-binary by construction, which is
+  exactly the heterogeneity above. It is currently a v1 non-goal; if Poisson is
+  to be recommended on accuracy grounds, that ordering is wrong.
+- **Per-bin exposure is the other source of heterogeneity**, and it is already
+  implemented. Mappability and partial terminal bins vary ``e_b`` and therefore
+  ``mu``, and least squares cannot use that information at all.
+- **Rounding the design matrix is a lever, not a fixed cost.** An unrounded
+  fractional design would recover some of the gain; against that, exact
+  equivalence classes and the whole identifiability apparatus depend on
+  integer columns, so this trades one thing the plan cares about for another
+  and should not be changed casually.
+
 Poisson's justification therefore is not point accuracy. It is the exposure
 term, which no legacy objective has: across a tenfold depth spread the
 abundance estimate's relative spread is 0.16 for Poisson against 0.17-0.21 for
