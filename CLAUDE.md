@@ -13,7 +13,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-There is no Python build/test/lint tooling yet — it must be created. The plan's core dependency list is NumPy/SciPy, Polars, `pybigtools` (all BigWig access), `pysam`, and pydantic — no genomics interval/annotation library. `polars-bio`, pandas, PyTorch, JAX, and AnnData are optional extras only. `uv` is available, and `pybigtools` 0.3.0, pandas, pyranges, and pydantic are already in the miniforge env.
+Dependencies are managed with **uv**. The package lives in `src/dienr/`, tests in `tests/`.
+
+```bash
+uv sync --group dev              # create/refresh .venv from uv.lock
+uv run pytest -q                 # full suite
+uv run pytest tests/test_design.py::test_bins_are_anchored_at_locus_start   # one test
+uv run ruff check . && uv run ruff format .
+uv run mypy                      # config in pyproject; files list is set there
+```
+
+Core dependencies are NumPy/SciPy, Polars, `pybigtools` (all BigWig access) and pydantic — deliberately no genomics interval/annotation library. `pysam` (bam), `polars-bio` (intervals), PyTorch/AnnData (ml) are optional extras; pandas is not a dependency at all.
+
+Tests that need the R reference's synthetic BigWigs skip cleanly when `_reference/` is absent (see `tests/conftest.py`).
 
 The R reference package can be exercised for fixture generation and parity checks (`R` and `Rscript` are on PATH via miniforge; the Bioconductor dependency stack may not be installed — check before assuming):
 
@@ -37,6 +49,12 @@ The R package's flow, and the source files to consult for each stage:
 5. **Fitting** (`R/model_fitting.R:110`). Per locus, `stats::optim(method = "L-BFGS-B")` minimizes sum-of-squares between observed and `models %*% abundance`, under either `transform = "identity"` or the default `transform = "log"` (log of value + 1e-3). Only `opt_result$par` is retained.
 6. **Reporting** (`R/abundance_tables.R`, `R/model_fit_statistics.R`). `transcript_abundance` repeats a shared model's abundance across every transcript mapped to it.
 
+## Implementation status
+
+Phase 1 and the start of Phase 2 exist: `annotation` (GTF/GFF → pre-RNA spans), `loci` (grouping), `design` (bins, masks, model reduction), `counts` (BigWig aggregation), `solvers/legacy` (identity/log least squares), `diagnostics`, `status`. 105 tests pass.
+
+**Not yet written:** `results.py` and the Parquet writers, `cli.py`, Poisson/NB/penalized solvers, BAM counting, evidence mapping, and — most importantly — the Phase 0 frozen R fixtures. Nothing here has been checked for numerical parity against R yet; that is the Phase 1 exit gate and the tests currently assert the *specified* behavior, not agreement with the reference.
+
 ## Design decisions already made (from the plan)
 
 These are deliberate departures from the R package; do not "restore" the R behavior without discussion.
@@ -53,6 +71,8 @@ These are deliberate departures from the R package; do not "restore" the R behav
 - **All BigWig access goes through `pybigtools`** — it is faster than `polars-bio`, O(bins) in memory regardless of input density, and needed anyway for header seqinfo. `values(chrom, start, end, bins=n, summary=..., exact=True, fillna=0)` is the aggregation call, and **both non-default flags are mandatory**: without `exact=True` it reads lossy zoom levels (250bp bins on the double-strand fixture give `[62.53, 69.53, ...]` vs. a true `[63, 68, ...]`, no error raised, small windows can coincidentally agree); without `fillna=0` uncovered positions come back `NaN` and a leaked `NaN` becomes a spurious numerical failure rather than a legitimate zero. Set both in one wrapper and test at several bin widths.
 - **No genomics interval library in core.** Locus grouping is a sort + cumulative-max sweep in plain Polars (5 lines), verified bit-identical to `polars-bio.merge` at 200k transcripts / 52k loci for `min_dist` 0/250/5000. GTF parsing is `scan_csv(separator="\t", comment_prefix="#")` + two `str.extract` calls — faster than `scan_gtf` (32ms vs 53ms/50k rows) and coordinate-identical. Masking is bin-index arithmetic, not interval joins. Reconsider `polars-bio` only for Phase 4 TSS-evidence overlap joins if `join_where` is too slow.
 - **A second, independent binning implementation exists as the test oracle**: `pybigtools.records()` streamed into a Polars fan-out, exact by construction. It agreed with the primary path to `max|diff| = 0.0`. If you ever collect that fanned frame eagerly, use `collect(engine="streaming")` — dense per-base input amplified 8k bins into 2M rows and 384MB RSS eagerly, ~0MB streamed. Long RLE runs are *not* the hazard (~1 row per bin).
+- **Single-model loci take a fast path**, because profiling showed ~91% of a median realistic locus (64 bins, 1 model) was L-BFGS-B scaffolding, not arithmetic. Identity has a closed form; log uses a bounded scalar search. Any change there must keep `test_single_model_fast_path_matches_general_optimizer` passing.
+- **Numba was evaluated and rejected** — see plan §14.1. It cannot beat BLAS on large loci (1.09×) and the small-loci win it does offer (2.5–3.3×) addresses the 9% of runtime that is arithmetic, not the 91% that was optimizer overhead.
 - **Non-goals for v1:** Gviz plotting, TxDb download/caching, the legacy TSS CNN, de novo transcript discovery.
 
 Target module layout, phase breakdown, output schemas (`model_abundance.parquet`, `transcript_model_map.parquet`, `locus_qc.parquet`, `normalization_factors.parquet`), and decision gates are all specified in the plan — follow it rather than re-deriving.

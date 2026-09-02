@@ -238,10 +238,12 @@ The earlier draft named PyRanges/NCLS as a placeholder, and `polars-bio` looked 
 The locus-grouping idiom is worth stating, since it is the one genuinely graph-flavored operation in the pipeline and it needs no interval tree — DENR's `group_transcripts(distance = d)` is a sort plus a cumulative maximum:
 
 ```python
-(tx.sort("chrom", "start")
-   .with_columns(pm=pl.col("end").cum_max().shift(1).over("chrom"))
-   .with_columns(new=pl.col("pm").is_null() | (pl.col("start") > pl.col("pm") + d))
-   .with_columns(locus=pl.col("new").cum_sum().over("chrom")))
+(
+    tx.sort("chrom", "start")
+    .with_columns(pm=pl.col("end").cum_max().shift(1).over("chrom"))
+    .with_columns(new=pl.col("pm").is_null() | (pl.col("start") > pl.col("pm") + d))
+    .with_columns(locus=pl.col("new").cum_sum().over("chrom"))
+)
 ```
 
 Run per strand, this is the strand-specific connected-component grouping of section 7. Masking is bin-index arithmetic, not interval joins, and the BigWig binning in "BigWig aggregation" below uses no interval-library operation at all.
@@ -629,6 +631,61 @@ Planned improvements:
 - Batch loci of similar dimensions when a solver benefits from vectorization.
 - Keep data in NumPy/SciPy form through fitting; avoid repeated DataFrame conversion.
 - Profile before considering Numba, Cython, Rust, or GPU kernels.
+
+### 14.1 Profiling results and the Numba question
+
+Numba was evaluated against the initial implementation. The finding is that it
+would optimize the wrong 9%.
+
+Profiling the full pipeline put 88% of runtime in the solver and 12% in design
+construction, with `objective` and `gradient` together accounting for about 70%
+of total time. Two algorithmic fixes came first and cost nothing:
+
+1. **Fuse the objective and gradient.** The optimizer evaluated them
+   separately, computing `M @ a` twice per iteration.
+2. **Hoist `log(observed + eps)` out of the loop.** It does not depend on the
+   abundance, yet was recomputed on every call, at roughly a quarter of the
+   cost of each one.
+
+Together these cut the fit stage by 25%. Only then does the Numba comparison
+become meaningful, and locus size decides it:
+
+| Locus shape | Fused NumPy | Numba | Speedup |
+|---|---|---|---|
+| 10141 x 128 | 92.6 us | 84.7 us | 1.09x |
+| 2000 x 20 | 18.5 us | 15.2 us | 1.22x |
+| 200 x 4 | 3.1 us | 1.3 us | 2.48x |
+| 40 x 3 | 2.4 us | 0.7 us | 3.28x |
+
+Numba loses its advantage exactly where the matrices are large, because that
+regime is BLAS-bound and Numba cannot beat OpenBLAS on a matrix-vector product.
+It wins on small loci, where NumPy's per-call overhead and temporaries dominate
+— and small loci are the realistic case. On a GENCODE-like transcript density
+the median locus has **64 bins and 1 model**, with 100% of matrix-vector work in
+loci under 500 bins.
+
+That size distribution, though, also revealed the real bottleneck, which Numba
+does not address at all. On a median 64-bin single-model locus, `fit_locus`
+took 338 us of which only 30 us was objective evaluation: **91% was L-BFGS-B
+scaffolding.** The remedy is to stop calling a general optimizer for problems
+that do not need one. Single-model loci have a closed-form nonnegative
+least-squares solution under the identity transform, and a cheap bounded scalar
+search under the log transform; that path measured 1.07 us against 80.8 us and
+agreed exactly. Adding it halved fit time on realistic density (6.03 s to
+3.00 s over 18,756 loci).
+
+**Decision: no Numba for now.** It targets the arithmetic, which is 9% of the
+realistic hot locus, and costs a 38 MB `llvmlite` dependency. Revisit only after
+the remaining scaffolding work is done, and only with a fresh profile:
+
+- extend the batching idea in section 14 to small multi-model loci, whose
+  per-call overhead is the same problem the single-model path just solved;
+- consider calling L-BFGS-B below `scipy.optimize.minimize`, bypassing the
+  `_differentiable_functions` wrappers that dominate small fits;
+- drop rows where no model has support, which shrinks every matrix-vector
+  product. Note these rows contribute a constant to the objective and zero to
+  the gradient, so dropping them changes the reported objective value but not
+  the argmin — the constant must be added back for R parity.
 
 Provisional performance targets, to be finalized after Phase 0:
 

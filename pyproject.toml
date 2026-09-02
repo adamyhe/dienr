@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dienr"
+version = "0.1.0.dev0"
+description = "Deconvolution of Isoform Expression from Nascent RNAs"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "Adam Youlin He", email = "ayhe@stanford.edu" }]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "polars>=1.30",
+    "pybigtools>=0.3",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+bam = ["pysam>=0.22"]
+# polars-bio is a compiled plugin pinned to a minimum polars; see plan section 7.
+intervals = ["polars-bio>=0.35"]
+ml = ["torch", "anndata"]
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6", "pytest-cov>=5", "mypy>=1.11"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dienr"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+files = ["src/dienr"]
+# python_version is deliberately unset: pinning it to our 3.11 floor makes mypy
+# reject numpy's own stubs, which use 3.12 `type` statements. It therefore
+# checks against the interpreter in use.
+# numpy and polars both expose broad union return types, so strict mode mostly
+# produces noise on array and DataFrame code. This setting catches the errors
+# that matter -- unguarded None, wrong argument types, uncallable values --
+# without demanding annotations that the numeric stack cannot express.
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unreachable = true
+no_implicit_optional = true
+
+[[tool.mypy.overrides]]
+module = ["pybigtools.*", "scipy.*"]
+ignore_missing_imports = true
