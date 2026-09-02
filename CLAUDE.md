@@ -29,6 +29,8 @@ Tests that need the R reference's synthetic BigWigs skip cleanly when `_referenc
 
 The R reference package can be exercised for fixture generation and parity checks (`R` and `Rscript` are on PATH via miniforge; the Bioconductor dependency stack may not be installed — check before assuming):
 
+`scripts/probe_r_shape_profile.R` regenerates every number in plan §18 (the shape-profile defects) against the reference; `SHAPE_PROBE_TRIALS` raises the `apply_shape_profile` fuzz, which dominates its runtime.
+
 ```bash
 # From _reference/DENR/
 Rscript -e 'devtools::test()'                                   # full testthat suite
@@ -51,7 +53,9 @@ The R package's flow, and the source files to consult for each stage:
 
 ## Implementation status
 
-The legacy path is complete end to end: `annotation` (GTF/GFF → pre-RNA spans) → `loci` → `design` (bins, masks, model reduction) → `counts` (BigWig aggregation) → `solvers/legacy` → `pipeline.fit` → `results` (versioned Parquet + manifest), with `cli` exposing `build-design` / `count` / `fit` / `validate`. 155 tests pass, 88 skip.
+The legacy path is complete end to end: `annotation` (GTF/GFF → pre-RNA spans) → `loci` → `design` (bins, masks, model reduction) → `counts` (BigWig aggregation) → `solvers/legacy` → `pipeline.fit` → `results` (versioned Parquet + manifest), with `cli` exposing `build-design` / `count` / `fit` / `shape-profile` / `validate`.
+
+`shape.py` implements empirical shape profiles (plan §18): `fit_shape_profile` measures relative polymerase density from isolated, expressed genes and `apply_shape_profile` reweights a `Design`'s model columns by it, which is what makes `M` non-binary. This was a v1 non-goal until Gate B and Gate D both reduced to needing it.
 
 Three likelihoods: `solvers/legacy` (default, the only one with R parity), `solvers/poisson`, `solvers/negative_binomial`, plus `solvers/penalties` (ridge/lasso/elastic net) and the shared `solvers/_glm` exposure machinery. Selected via `fit(likelihood=...)` or `dienr fit --likelihood`.
 
@@ -79,7 +83,7 @@ Both the 3× wall-time and 2× memory targets are met. RSS is measured externall
 
 ## How the suite is structured
 
-395 tests, 99% line coverage, 10 skips (all `absent_contig`, which R cannot produce a golden for). `uv run pytest -q --cov=dienr --cov-report=term-missing` for the breakdown.
+704 tests, 99% line coverage, 10 skips (all `absent_contig`, which R cannot produce a golden for). `uv run pytest -q --cov=dienr --cov-report=term-missing` for the breakdown.
 
 The layers, roughly in order of how much they buy:
 
@@ -99,8 +103,22 @@ The layers, roughly in order of how much they buy:
 `scripts/validate_likelihoods.py` compares the objectives on prespecified regimes with contiguous held-out blocks and paired per-fold scoring (plan §17, Gate B). Stable across seeds:
 
 - **`transform="log"` — the reference's default — is badly misspecified once zeros are common.** At mean 0.5 counts/bin its held-out deviance is ~3.1 vs ~1.2 for everything else. A `y = 0` bin contributes `[log(1e-3) − log(μ+1e-3)]²` ≈ 38 at μ=0.5, so empty bins dominate and drag the fit toward zero. Prefer `transform="identity"` for sparse data.
-- **Poisson's edge over `legacy_identity` is small, and there is an exact reason.** The two estimating equations differ only by a weight `1/μ_b`, so when `μ` is constant on a model's support they are *the same equation*. For a single 0/1 column they are literally the same estimator (measured difference `0.000e+00`). **`bin_operation` rounding to 0/1 is what destroys the advantage** — with overlapping indicator columns `μ` takes just two values across a locus. The ceiling on a graded design is `Var(MSE)/Var(Poisson) = ΣM³ΣM/(ΣM²)² ≤ ~1.12` even for a 50× occupancy range (~6% in SE). So: **implementing shape profiles is a prerequisite for Poisson to pay off on accuracy**; until then its justification is the exposure term (depth-independent abundance) and inference, not point estimates.
+- **Poisson's edge over `legacy_identity` is small, and there is an exact reason.** The two estimating equations differ only by a weight `1/μ_b`, so when `μ` is constant on a model's support they are *the same equation*. For a single 0/1 column they are literally the same estimator (measured difference `0.000e+00`). **`bin_operation` rounding to 0/1 is what destroys the advantage** — with overlapping indicator columns `μ` takes just two values across a locus. So: **a graded design is a prerequisite for Poisson to pay off on accuracy**, and `shape.py` now supplies one.
+- **The old "≤1.12× ceiling, ~6% in SE" figure was wrong — see plan §17 (Gate B).** `Var(MSE)/Var(Poisson) = ΣM³ΣM/(ΣM²)²` is driven by **kurtosis, not range**: for a *uniform* `M` it is ~1.12 whether the range is 39× or 50×. A real pausing profile is the outlier case (one bin far above a flat remainder), where it is much larger. Measured on a reshaped design over 200 Poisson resamplings: binary → SE ratio **1.000** (identical estimators); reshaped, 14.3× range → **1.516**, against 1.526 predicted from that `M`. **The prize is ~50% in SE, not 6%** — but only on a graded design.
 - **Never ship a fixed penalty weight.** Relative shrinkage follows **`2λa/n_bins`** (verified within 25%), so `ridge(0.01)` is negligible at abundance ~1 and catastrophic at ~200 — held-out deviance 68.7 vs 1.06, winning 1% of folds. `λ ∝ 1/a` cancels the dependence. `--lambda2` has no nonzero default on purpose.
+
+## Shape profiles (plan §18)
+
+User-facing documentation is `docs/shape-profiles.md`. The reference's shape profile crashes *and*, when it doesn't, does nothing. Both were reproduced against DENR 1.0.0 at `09d6cde`; §18 has the reproductions. The short version:
+
+- **`grep("+", names)` is a regex**, and `+` matches every string, so the reference's "plus-strand groups" is *all* groups. It then reads the minus groups from `bigwig_plus` too, so **`bigwig_minus` never contributes signal to the profile at all**. Every minus gene enters the smoother twice, both times antisense, once backwards. On 255 simulated genes: **116 of 174 training curves identically zero, fitted dynamic range 1.25× against a true 14.63×.** The profile multiplies the design by ~1.0 — it is inert, not broken. Untestable in the reference by construction: every one of its shape-profile tests passes the same BigWig for both strands.
+- **Two hard crashes.** `rescale_fixed_width_position` assigns a zero-length `seq` to `rescaled_pos[1:0]` ("replacement has length zero") whenever the tail is longer than the head and the gene is short; and `model_agreement` indexes a group table by `names(unlist(tx_grps))`, which is `"100_+.g227"` not `"100_+"`, so **any named input `GRanges` fails immediately** ("subscript contains invalid names"). It works only because `GenomicFeatures::transcripts()` happens to return unnamed ranges.
+- **`apply_shape_profile` was the prime suspect and is fine.** 700 fuzzed annotations found no crash and no misalignment. Don't spend time there. We still don't copy it: collapsing to equivalence classes first means a column has one geometry, so `Design.model_spans` (the **pre-mask** span, recorded at build time because masking destroys it) makes the mapping direct instead of needing the reference's averaged "expected range" plus `omit` bookkeeping.
+- **`span=0.4` is wrong even after the bugs are fixed.** A pausing peak maps to under 1/100 of the axis; span 0.4 gives bandwidth ~0.2. Measured against the unsmoothed cloud (empirical 9.29×): 0.4 → 2.38×, 0.05 → 5.59×, 0.02 → 8.47×. `ShapeConfig.span` defaults to **0.05**, with `min_bandwidth` floored at two head bins.
+- **A shape profile and TSS masking compete for the same bins.** Masking the first 10 kb of a 40 kb gene removes **89%** of the grading (14.30× → 1.60×). Report `shape.applied_dynamic_range(design)`, **not** `ShapeProfile.dynamic_range` — `build-design` prints it and warns below 1.2×.
+- Per-gene normalization is the **mean**, not min–max: min–max maps a silent gene to a constant 1.0 (the reference's `- 1e-6` guard) and lets the pause spike set the scale for the body. Silent genes are dropped and counted in `ShapeProfile.rejected`.
+- `min_length` defaults to `head_bases + tail_bases` and is validated against it. The reference defaults `min_transcript_length=8e3` below `head+tail=15e3`, so with *its* defaults every 8–15 kb gene contributes no body positions at all.
+- Reshaping yields a new design digest and sets `Design.shape_digest`; applying twice raises.
 
 ## R parity workflow
 
@@ -149,6 +167,7 @@ These are deliberate departures from the R package; do not "restore" the R behav
 - **The reference's "counts" are mean per-base coverage, not counts.** R's `add_data` hardcodes `summary_operation <- "mean"`, so DENR abundances are polymerase *density*. `count_sample` therefore defaults to `summary="mean"`; a `sum` summary gave exactly `bin_size` times R's values. Poisson/NB will need `"sum"`, and `require_count_equivalent` rejects the `mean` + count-likelihood combination.
 - **R aborts on an unknown contig; we do not.** `assert_chromosome_exists` kills an entire DENR run over one bad contig name. We record `missing_contig` for that locus and continue. The `absent_contig` scenario documents this and is excluded from parity coverage since R cannot produce a golden for it.
 - **Two verified `pybigtools` *writer* quirks**, worked around in `tests/fixtures/scenarios.py`: a BigWig written with zero intervals is unreadable (`BBIReadError`), and contigs passed in the size map but carrying no interval are **dropped from the header**. Since the header is what separates `missing_contig` from `all_zero`, a fixture needs an explicit zero-valued placeholder base on every declared contig.
+- **Shape profiles are implemented, not a non-goal.** `Design.model_spans` holds the **pre-mask** occupied span per model, because masking destroys it and the profile needs a position along the transcript. Any new per-locus accessor must index, never scan (`model_span` follows `mask`).
 - **Non-goals for v1:** Gviz plotting, TxDb download/caching, the legacy TSS CNN, de novo transcript discovery.
 
 Target module layout, phase breakdown, output schemas (`model_abundance.parquet`, `transcript_model_map.parquet`, `locus_qc.parquet`, `normalization_factors.parquet`), and decision gates are all specified in the plan — follow it rather than re-deriving.

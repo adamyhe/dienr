@@ -1079,12 +1079,39 @@ A fiftyfold range in occupancy buys 12% in variance, about 6% in standard
 error. That is the entire prize available from switching likelihood on this
 class of design.
 
+**That last sentence was wrong.** Every row
+above draws ``M`` roughly *uniformly* over its range, and for a uniform ``M``
+the ratio is insensitive to how wide the range is -- 38.8x gives 1.122 and
+50x gives 1.125. The ratio `sum(M^3) sum(M) / sum(M^2)^2` is a kurtosis-like
+quantity: it is driven by **outliers, not by range**. A real pausing profile is
+exactly the outlier case, one bin far above a nearly flat remainder:
+
+| M distribution | range | Var ratio | SE ratio |
+|---|---|---|---|
+| uniform on [0.02, 1] | 38.8x | 1.122 | 1.059 |
+| uniform on [0.02, 1], evenly spaced | 50.0x | 1.125 | 1.061 |
+| **actual fitted shape profile** | 14.3x | **2.329** | **1.526** |
+| one bin at 14x, rest at 1 | 14.3x | 4.044 | 2.011 |
+
+Measured on a reshaped design from `dienr.shape` over 200 Poisson resamplings,
+against `legacy` identity least squares on the same data:
+
+| design | occupancy range | Poisson RMSE | MSE RMSE | SE ratio |
+|---|---|---|---|---|
+| binary | 1.00x | 0.2367 | 0.2367 | **1.000** |
+| shape-reshaped | 14.30x | 0.1882 | 0.2854 | **1.516** |
+
+Predicted 1.526 against measured 1.516, so the theory is right and only the
+assumed ``M`` distribution was wrong. The prize is about **50% in standard
+error**, not 6%, and on a binary design it remains exactly zero.
+
 Three actionable consequences.
 
-- **The shape profile is a prerequisite for Poisson to be worth much.** DENR's
-  non-uniform density model makes ``M`` non-binary by construction, which is
-  exactly the heterogeneity above. It is currently a v1 non-goal; if Poisson is
-  to be recommended on accuracy grounds, that ordering is wrong.
+- **The shape profile is a prerequisite for Poisson to be worth anything at
+  all**, and it is now implemented in `dienr/shape.py`. On a binary design the
+  two estimators are the same to `0.000e+00`; on a reshaped one Poisson is
+  1.5x better in standard error. This reverses the earlier reading that the
+  gain would be marginal even with a graded design.
 - **Per-bin exposure is the other source of heterogeneity**, and it is already
   implemented. Mappability and partial terminal bins vary ``e_b`` and therefore
   ``mu``, and least squares cannot use that information at all.
@@ -1213,7 +1240,221 @@ enough across a locus that the full variance function matters for the estimate
 too, which on a rounded binary design it does not, and which brings this back
 to the shape-profile prerequisite recorded under Gate B.
 
-## 18. Definition of done for version 1.0
+## 18. Shape profiles: what the reference gets wrong
+
+The shape profile was a v1 non-goal until Gate B and Gate D independently
+converged on it: with a rounded binary `M`, `mu` is constant across a model's
+support, so least squares, Poisson and NB2 are the *same estimating equation*
+and no choice of likelihood can move a point estimate. A graded design is the
+only thing that breaks that degeneracy. It is now implemented in
+`dienr/shape.py`.
+
+It was also reported to crash frequently in the reference. It does, and it does
+something worse. Everything below was reproduced against DENR 1.0.0 at commit
+`09d6cde` in the `dienr-rref` conda environment. `scripts/probe_r_shape_profile.R`
+regenerates every number in this section:
+
+```bash
+/Users/adamhe/miniforge3/envs/dienr-rref/bin/Rscript scripts/probe_r_shape_profile.R
+SHAPE_PROBE_TRIALS=700 ... # raise the 18.4 fuzz, which dominates runtime
+```
+
+It lives outside pytest because it needs the reference environment. The Python
+side of the same findings is pinned as regressions in `tests/test_shape.py`,
+which needs no R.
+
+### 18.1 It crashes
+
+**`rescale_fixed_width_position` assigns a zero-length sequence.** When the
+gene is shorter than head plus tail it splits the available bins in the
+head:tail ratio, and `round(prop_head * length_out)` can be 0. It then does
+`rescaled_pos[1:0] <- seq(0, head_percent, length.out = 0)`, and `1:0` in R is
+the two-element vector `c(1, 0)`:
+
+```
+len=2 head=1000 tail=5000 bs=250  -> ERROR: replacement has length zero
+len=3 head=1000 tail=5000 bs=250  -> ERROR: replacement has length zero
+len=5 head=1000 tail=9000 bs=250  -> ERROR: replacement has length zero
+```
+
+Reachable straight from the documented API whenever the tail region is longer
+than the head and `min_transcript_length` is small:
+
+```
+min_tx_len=1e3 head=2e3 tail=6e4  -> ERROR: replacement has length zero
+```
+
+`length_out = 0` gives a different opaque failure,
+`'length.out' must be a non-negative number`.
+
+**`model_agreement` indexes a group table by transcript names.** It computes
+`percent_err <- total_err / width(group_ranges[names(tx)])`, where `tx <-
+unlist(tx_grps)`. `unlist` on a `GRangesList` concatenates the group name with
+the inner name, so `names(tx)` is `"100_+.g227"` where `group_ranges` is keyed
+`"100_+"`:
+
+```
+names(gr) <- gr$tx_name  -> ERROR: subscript contains invalid names
+names(gr) NULL           -> ok
+```
+
+The function works *only* when the input `GRanges` has no names, which is an
+accident of `GenomicFeatures::transcripts()` returning unnamed ranges.
+`names(gr) <- gr$tx_name` is an ordinary idiom and kills the run.
+
+**The documented defaults `bigwig_plus = NULL, bigwig_minus = NULL` crash** with
+an rtracklayer error about `'filename' must be a single string`.
+
+### 18.2 Worse, it is silently inert
+
+Two independent defects in the signal-extraction step.
+
+`plus_grps <- grep("+", names(final_bins))` uses `+` as a **regex**, where it is
+a quantifier that matches every string:
+
+```
+names:  1_+  2_+  3_-  4_-
+grep("+", names)             -> 1,2,3,4      # all of them
+grep("+", names, fixed=TRUE) -> 1,2          # what was meant
+grep("-", names)             -> 3,4
+```
+
+And the minus branch reads the **plus** file regardless:
+
+```r
+minus_counts <- lapply(summarize_bigwig(bigwig_file = bigwig_plus,
+                                        final_bins[minus_grps]), rev)
+```
+
+So `bigwig_minus` never contributes signal to the profile at all; it is used
+only in the filtering step. Every minus-strand gene is fed to the smoother
+*twice* -- once unreversed via the regex bug, once reversed -- and both copies
+carry antisense signal. Confirmed by the gene count on the two-strand fixture:
+2 genes selected, "Fitting profile model using **3** genes".
+
+On 255 simulated genes with a 14x pausing peak and correct stranded BigWigs:
+
+| | curves fed to loess | all-zero curves | fitted dynamic range |
+|---|---|---|---|
+| DENR as written | 174 (from 116 genes) | 116 (67%) | **1.25x** |
+| strand handling fixed | 116 | 0 | **14.63x** |
+
+Two thirds of the training data is identically zero, and the profile that comes
+out multiplies the design by about 1.0 everywhere. **This does not fail; it
+produces a shape profile that does nothing.**
+
+It cannot be caught by the reference's tests, because every shape-profile test
+in `test-shape_profile.R` passes the same BigWig for both strands
+(`bigwig_plus = bw_1000, bigwig_minus = bw_1000`), which makes a plus/minus
+swap undetectable by construction. `test-shape_profile.R` also computes a
+reference vector `ref_1` for the rescaler and never asserts it -- and it is
+wrong, ending `0.1` where the function returns `1`.
+
+### 18.3 Three further defects, not crashes
+
+**Per-gene min-max rescaling manufactures data.** `(x - (min(x) - 1e-6)) /
+(max(x) - (min(x) - 1e-6))` maps an all-zero gene to a constant 1.0 instead of
+dividing by zero, so absent signal becomes evidence for a flat profile -- which
+is precisely the state the strand bug puts most genes in. It also makes the
+single largest bin, normally the pausing spike, set the scale for the whole
+gene. `dienr` divides by the gene's own mean and *drops* silent genes, counting
+them in `ShapeProfile.rejected`.
+
+**`predict.loess` returns NA outside its training hull**, and
+`apply_shape_profile` evaluates it on `seq(0, 1, by = 1e-5)` and writes the
+result straight into the model matrix. With the reference's own defaults the
+training positions happen to span exactly 0 and 1 so no NA appears, but nothing
+enforces that. Confined to `[0.3, 0.7]`, **60,005 of the 100,001 grid points
+come back NA**, and a NaN weight makes the objective non-finite so L-BFGS-B
+rejects the locus. `dienr` fits at fixed grid nodes spanning `[0, 1]`, so the
+case is unreachable rather than guarded.
+
+**The defaults are internally inconsistent.** `min_transcript_length = 8e3` sits
+below `linear_head_length + linear_tail_length = 15e3`, so with defaults every
+gene between 8 and 15 kb takes the squeeze branch and contributes *no body
+positions at all* -- only `[0, 0.2]` and `[0.8, 1]`. `ShapeConfig.min_length`
+defaults to head plus tail and validates against it.
+
+The R fit also emits `Warning: stack imbalance in '<-', 18 then 20` at scale, a
+C-level symptom with no clear cause. `loess` itself scales fine (2M points in
+0.82 s with `trace.hat = "approximate"`), so the smoother was never the
+bottleneck the stripping and caching in the reference suggests.
+
+### 18.4 What `apply_shape_profile` gets right
+
+Worth recording, since it was the prime suspect. The reference's application
+step averages member transcripts' coordinates into an "expected" bin range and
+then deletes the entries that rounding or masking removed, keeping two index
+spaces aligned by hand:
+
+```r
+omit <- -which(models[expected_range[1]:expected_range[2], m] == 0)
+models[non_z, m] <- pre_profile[lookup_ind][omit]
+```
+
+That looks fragile and is not. 700 fuzzed annotations -- dense isoform
+clusters, both strands, all three `bin_operation` values, start and end masking
+-- produced no crash and no misalignment, checked against a monotone profile.
+`ceiling((d+1)/b) == floor(d/b)+1` makes the expected start exactly the bin
+containing the transcript start, and columns only collapse together when their
+rounded patterns already agree, which bounds the averaging error to the bins
+that `omit` then removes.
+
+`dienr` still does not copy the approach, because it does not need it:
+collapsing to equivalence classes first means a model column *has* one geometry,
+so `Design.model_spans` records the pre-mask span and the mapping is direct.
+
+### 18.5 Two findings of our own
+
+**The reference's `span = 0.4` over-smooths the feature the profile exists to
+measure.** A pausing peak is a few hundred bases wide, which the head rescaling
+maps to well under a hundredth of the axis; a span of 0.4 gives a bandwidth
+around 0.2. Against the unsmoothed training cloud on the simulated data
+(empirical range 9.29x):
+
+| span | fitted range | value at position 0 |
+|---|---|---|
+| 0.4 (reference default) | 2.38x | 1.95 |
+| 0.2 | 3.00x | 2.49 |
+| 0.1 | 4.00x | 3.33 |
+| 0.05 (`dienr` default) | 5.59x | 4.66 |
+| 0.02 | 8.47x | 7.08 |
+| empirical, unsmoothed | 9.29x | 7.74 |
+
+The default therefore discards about three quarters of the signal even once
+every bug above is fixed. `ShapeConfig.span` defaults to 0.05, with
+`min_bandwidth` flooring the neighbourhood at two head bins so a sparse
+training set cannot be fitted more finely than the bins the profile multiplies.
+Local linear regression can also undershoot below zero at the peak;
+`PROFILE_FLOOR` clamps it and `ShapeProfile.n_floored` reports it.
+
+**The prize from a count likelihood is larger than Gate B estimated.** The
+correction is recorded under Gate B above: the earlier ceiling assumed a
+uniform ``M``, and the relevant statistic is driven by outliers rather than by
+range. A fitted pausing profile gives Poisson a ~1.5x standard-error advantage
+over least squares, where a binary design gives it exactly none.
+
+**A shape profile and TSS masking compete for the same bins**, and applying
+both largely cancels the profile. Masking calls the pausing peak untrustworthy;
+the profile calls it predictable and supplies its magnitude. On 40 kb simulated
+genes with a profile fitted at 14.3x:
+
+| masking | applied range |
+|---|---|
+| none | 14.30x |
+| `mask_tss=(0, 10000)` | 1.60x |
+| `mask_tss=(0, 20000)` | 1.40x |
+| `mask_tss=(0, 20000)` + `mask_pas=(10000, 0)` | 1.16x |
+
+Masking the first 10 kb of a 40 kb gene removes 89% of the grading. That is not
+an argument against either feature, but a run that enables both and expects the
+profile to do work is mistaken, and it looks identical from the outside to one
+that works. `shape.applied_dynamic_range` reports the range surviving in the
+reshaped design, `build-design` prints it, and it warns below 1.2x. **The
+number to look at is the applied range, not `ShapeProfile.dynamic_range`.**
+
+
+## 19. Definition of done for version 1.0
 
 Version 1.0 is complete when:
 
@@ -1228,7 +1469,7 @@ Version 1.0 is complete when:
 9. A complete simulation and real-data validation report is published.
 10. Python API, CLI, container, and one workflow example are available.
 
-## 19. Immediate next actions
+## 20. Immediate next actions
 
 1. Select and record the DENR reference commit and execution environment.
 2. Export golden intermediate objects from the bundled synthetic tests.

@@ -5,10 +5,18 @@ from __future__ import annotations
 import polars as pl
 import pytest
 
-from dienr.cli import COUNTS_FILENAME, DESIGN_FILENAME, main
+from dienr.cli import COUNTS_FILENAME, DESIGN_FILENAME, SHAPE_FILENAME, main
 from dienr.results import FitResult
 
 from .conftest import write_gtf
+
+
+def _read_design(directory):
+    """Load the pickled `Design` a build-design run wrote."""
+    import pickle
+
+    with (directory / DESIGN_FILENAME).open("rb") as handle:
+        return pickle.load(handle)
 
 
 @pytest.fixture
@@ -458,3 +466,332 @@ def test_mean_summary_is_rejected_for_poisson_via_the_cli(annotation_gtf, sample
                 "poisson",
             ]
         )
+
+
+# --------------------------------------------------------------------------
+# shape-profile
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def shape_cli_inputs(tmp_path):
+    """A GTF plus stranded BigWigs carrying a known 5'-peaked density."""
+    from .test_shape import _make_genes, _write_signal
+
+    genes = _make_genes(30)
+    gtf = write_gtf(
+        tmp_path / "shape.gtf",
+        [
+            {
+                "transcript_id": row["transcript_id"],
+                "gene_id": row["transcript_id"],
+                "contig": row["contig"],
+                "start": row["start"] + 1,
+                "end": row["end"],
+                "strand": row["strand"],
+            }
+            for row in genes.iter_rows(named=True)
+        ],
+    )
+    plus = _write_signal(tmp_path / "sp.bw", genes, "+")
+    minus = _write_signal(tmp_path / "sm.bw", genes, "-")
+    return gtf, plus, minus
+
+
+def test_shape_profile_command_writes_a_reusable_profile(shape_cli_inputs, tmp_path, capsys):
+    gtf, plus, minus = shape_cli_inputs
+    out = tmp_path / "prof"
+    code = main(
+        [
+            "shape-profile",
+            "--gtf",
+            str(gtf),
+            "--bigwig-plus",
+            str(plus),
+            "--bigwig-minus",
+            str(minus),
+            "--output",
+            str(out),
+            "--span",
+            "0.1",
+        ]
+    )
+    assert code == 0
+    assert (out / SHAPE_FILENAME).exists()
+    curve = pl.read_parquet(out / "shape_profile.parquet")
+    assert curve.columns == ["position", "relative_density"]
+    printed = capsys.readouterr().out
+    assert "training genes" in printed
+    assert "dynamic range" in printed
+
+
+def test_shape_profile_command_reports_a_flat_profile_on_stderr(tmp_path, capsys):
+    """The reference's silent failure, made loud at the command line."""
+    from .test_shape import _make_genes, _write_signal
+
+    genes = _make_genes(20, strands=("+",))
+    gtf = write_gtf(
+        tmp_path / "flat.gtf",
+        [
+            {
+                "transcript_id": row["transcript_id"],
+                "gene_id": row["transcript_id"],
+                "contig": row["contig"],
+                "start": row["start"] + 1,
+                "end": row["end"],
+                "strand": row["strand"],
+            }
+            for row in genes.iter_rows(named=True)
+        ],
+    )
+    flat = _write_signal(tmp_path / "flat.bw", genes, "+", peak=0.0, slope=0.0)
+    empty = _write_signal(tmp_path / "empty.bw", genes, "-")
+    with pytest.warns(UserWarning):
+        code = main(
+            [
+                "shape-profile",
+                "--gtf",
+                str(gtf),
+                "--bigwig-plus",
+                str(flat),
+                "--bigwig-minus",
+                str(empty),
+                "--output",
+                str(tmp_path / "p"),
+                "--span",
+                "0.1",
+            ]
+        )
+    assert code == 0
+    assert "spans only" in capsys.readouterr().err
+
+
+def test_shape_profile_command_fails_cleanly_when_no_gene_qualifies(shape_cli_inputs, tmp_path):
+    gtf, plus, minus = shape_cli_inputs
+    with pytest.raises(SystemExit, match="no gene passed"):
+        main(
+            [
+                "shape-profile",
+                "--gtf",
+                str(gtf),
+                "--bigwig-plus",
+                str(plus),
+                "--bigwig-minus",
+                str(minus),
+                "--output",
+                str(tmp_path / "p"),
+                "--min-length",
+                "500000",
+            ]
+        )
+
+
+def test_build_design_applies_a_shape_profile(shape_cli_inputs, tmp_path, capsys):
+    gtf, plus, minus = shape_cli_inputs
+    profile_dir = tmp_path / "prof"
+    main(
+        [
+            "shape-profile",
+            "--gtf",
+            str(gtf),
+            "--bigwig-plus",
+            str(plus),
+            "--bigwig-minus",
+            str(minus),
+            "--output",
+            str(profile_dir),
+            "--span",
+            "0.1",
+        ]
+    )
+    capsys.readouterr()
+
+    plain_dir = tmp_path / "plain"
+    shaped_dir = tmp_path / "shaped"
+    assert main(["build-design", "--gtf", str(gtf), "--output", str(plain_dir)]) == 0
+    plain_out = capsys.readouterr().out
+    assert (
+        main(
+            [
+                "build-design",
+                "--gtf",
+                str(gtf),
+                "--output",
+                str(shaped_dir),
+                "--shape-profile",
+                str(profile_dir),
+            ]
+        )
+        == 0
+    )
+    shaped_out = capsys.readouterr().out
+    assert "reshaped by profile" in shaped_out
+    assert "reshaped by profile" not in plain_out
+
+    plain = _read_design(plain_dir)
+    shaped = _read_design(shaped_dir)
+    assert plain.shape_digest is None
+    assert shaped.shape_digest is not None
+    assert shaped.digest != plain.digest
+
+
+def test_build_design_warns_when_masking_cancels_the_profile(shape_cli_inputs, tmp_path, capsys):
+    """The two features compete, and a run that neutralizes one must say so.
+
+    Masking calls the pausing peak untrustworthy; the profile calls it
+    predictable. Applying both leaves the design barely graded, which looks
+    exactly like a working shape profile from the outside.
+    """
+    gtf, plus, minus = shape_cli_inputs
+    profile_dir = tmp_path / "prof"
+    main(
+        [
+            "shape-profile",
+            "--gtf",
+            str(gtf),
+            "--bigwig-plus",
+            str(plus),
+            "--bigwig-minus",
+            str(minus),
+            "--output",
+            str(profile_dir),
+            "--span",
+            "0.1",
+        ]
+    )
+    capsys.readouterr()
+    main(
+        [
+            "build-design",
+            "--gtf",
+            str(gtf),
+            "--output",
+            str(tmp_path / "masked"),
+            "--shape-profile",
+            str(profile_dir),
+            "--mask-tss",
+            "0",
+            "20000",
+            "--mask-pas",
+            "10000",
+            "0",
+        ]
+    )
+    captured = capsys.readouterr()
+    assert "compete for the same" in captured.err
+
+
+def test_build_design_rejects_a_missing_profile_directory(annotation_gtf, tmp_path):
+    with pytest.raises(SystemExit, match="no shape_profile.pkl"):
+        main(
+            [
+                "build-design",
+                "--gtf",
+                str(annotation_gtf),
+                "--output",
+                str(tmp_path / "d"),
+                "--shape-profile",
+                str(tmp_path / "absent"),
+            ]
+        )
+
+
+def test_shape_profile_command_reports_dropped_genes(tmp_path, capsys):
+    """A summary that reports only surviving genes hides how selective it was."""
+    from .test_shape import _make_genes, _write_signal
+
+    genes = pl.concat(
+        [
+            _make_genes(12, strands=("+",)),
+            pl.DataFrame(
+                [
+                    {
+                        "transcript_id": "short",
+                        "contig": "chr1",
+                        "start": 3_000_000,
+                        "end": 3_004_000,
+                        "strand": "+",
+                    }
+                ]
+            ),
+        ]
+    )
+    gtf = write_gtf(
+        tmp_path / "mixed.gtf",
+        [
+            {
+                "transcript_id": row["transcript_id"],
+                "gene_id": row["transcript_id"],
+                "contig": row["contig"],
+                "start": row["start"] + 1,
+                "end": row["end"],
+                "strand": row["strand"],
+            }
+            for row in genes.iter_rows(named=True)
+        ],
+    )
+    plus = _write_signal(tmp_path / "mp.bw", genes, "+")
+    minus = _write_signal(tmp_path / "mm.bw", genes, "-")
+    code = main(
+        [
+            "shape-profile",
+            "--gtf",
+            str(gtf),
+            "--bigwig-plus",
+            str(plus),
+            "--bigwig-minus",
+            str(minus),
+            "--output",
+            str(tmp_path / "prof"),
+            "--span",
+            "0.005",
+            "--min-covered-fraction",
+            "0.2",
+        ]
+    )
+    assert code == 0
+    captured = capsys.readouterr()
+    assert "genes dropped: too_short=1" in captured.out
+
+
+def test_shape_profile_command_warns_when_the_fit_was_floored(
+    annotation_gtf, monkeypatch, tmp_path, capsys
+):
+    """A floored node is a value the smoother did not produce, so it is flagged.
+
+    Driven through a stub rather than data: local linear regression undershoots
+    below zero only on noisy input with a sub-bin peak, and `test_shape`
+    already establishes that the smoother can do it and that the floor catches
+    it. What is asserted here is that the command says so.
+    """
+    import numpy as np
+
+    from dienr import cli
+    from dienr.shape import ShapeConfig, ShapeProfile
+
+    stub = ShapeProfile(
+        grid=np.linspace(0.0, 1.0, 5),
+        values=np.array([1e-3, 1e-3, 1.0, 1.0, 1.0]),
+        config=ShapeConfig(),
+        n_genes=3,
+        n_observations=90,
+        n_floored=2,
+        rejected={},
+        digest="abcdef0123456789",
+    )
+    monkeypatch.setattr(cli, "_fit_shape_profile", lambda *a, **k: stub)
+    code = main(
+        [
+            "shape-profile",
+            "--gtf",
+            str(annotation_gtf),
+            "--bigwig-plus",
+            str(tmp_path / "p.bw"),
+            "--bigwig-minus",
+            str(tmp_path / "m.bw"),
+            "--output",
+            str(tmp_path / "prof"),
+        ]
+    )
+    assert code == 0
+    assert "clamped to the profile floor" in capsys.readouterr().err

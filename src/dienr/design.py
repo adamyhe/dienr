@@ -133,6 +133,14 @@ class Design:
             DataFrame filter, which would otherwise be paid once per locus per
             sample.
         bin_lengths: Per-locus usable bin widths, indexed by ``locus_id``.
+        model_spans: Per-locus ``(n_models, 2)`` arrays of the first and last
+            bin each model occupies *before* masking, or ``(-1, -1)`` for a
+            model with no occupied bin at all. Recorded at build time because
+            masking destroys it: a TSS mask zeroes the first bins of a column,
+            so the surviving nonzero span starts a mask-width into the
+            transcript and no longer says where the transcript began. Anything
+            that needs a position along the transcript -- the shape profile --
+            needs the pre-mask span, and it cannot be recovered afterwards.
         transcript_map: Many-to-one transcript-to-model mapping, carrying
             ``equivalence_class_size`` and ``exactly_identifiable``.
         loci: One row per locus, from `dienr.loci.locus_table`.
@@ -141,6 +149,11 @@ class Design:
             ``has_support``.
         config: The `DesignConfig` used.
         annotation_digest: Digest of the source annotation.
+        shape_digest: Digest of the `dienr.shape.ShapeProfile` applied to
+            `models`, or None while they are plain occupancies. Reshaping
+            changes what an abundance means, so it must be visible on the
+            object and in `digest` rather than inferred from whether the
+            matrices happen to hold non-integer values.
         digest: Digest over annotation, config and resulting geometry. A change
             to any input yields a new value.
     """
@@ -149,12 +162,14 @@ class Design:
     models: list[np.ndarray]
     masks: list[np.ndarray]
     bin_lengths: list[np.ndarray]
+    model_spans: list[np.ndarray]
     transcript_map: pl.DataFrame
     loci: pl.DataFrame
     model_table: pl.DataFrame
     config: DesignConfig
     annotation_digest: str
     digest: str
+    shape_digest: str | None = None
 
     @property
     def n_loci(self) -> int:
@@ -212,6 +227,14 @@ class Design:
         """
         return self.model_table.filter(~pl.col("has_support"))
 
+    def model_span(self, locus_id: int, model_index: int) -> tuple[int, int]:
+        """Pre-mask ``(first_bin, last_bin)`` of one model, or ``(-1, -1)``.
+
+        A list index, never a scan; see `mask`.
+        """
+        first, last = self.model_spans[locus_id][model_index]
+        return int(first), int(last)
+
     def effective_lengths(self, locus_id: int) -> np.ndarray:
         """Usable width of each bin in `locus_id`, in bases."""
         return self.bin_lengths[locus_id]
@@ -265,6 +288,7 @@ def _build(annotation: Annotation, config: DesignConfig) -> Design:
     models: list[np.ndarray] = []
     masks: list[np.ndarray] = []
     bin_lengths: list[np.ndarray] = []
+    model_spans: list[np.ndarray] = []
     map_rows: list[dict] = []
     model_rows: list[dict] = []
 
@@ -296,6 +320,9 @@ def _build(annotation: Annotation, config: DesignConfig) -> Design:
         else:
             masked = _mask_bins(matrix, members["strand"].to_list(), config)
         rounded = _BIN_OPERATIONS[config.bin_operation](matrix)
+        # Read the occupied span off the rounded matrix before masking zeroes
+        # its ends, then keep only the representative columns' spans.
+        spans = _occupied_spans(rounded)
         rounded[masked, :] = 0.0
 
         representatives, class_members = _collapse(rounded)
@@ -303,6 +330,7 @@ def _build(annotation: Annotation, config: DesignConfig) -> Design:
         models.append(np.ascontiguousarray(reduced))
         masks.append(masked)
         bin_lengths.append(effective.astype(np.float64))
+        model_spans.append(spans[representatives, :])
 
         bin_rows.append(
             pl.DataFrame(
@@ -393,6 +421,7 @@ def _build(annotation: Annotation, config: DesignConfig) -> Design:
         models=models,
         masks=masks,
         bin_lengths=bin_lengths,
+        model_spans=model_spans,
         transcript_map=transcript_map,
         loci=loci,
         model_table=model_table,
@@ -400,6 +429,22 @@ def _build(annotation: Annotation, config: DesignConfig) -> Design:
         annotation_digest=annotation.digest,
         digest=_design_digest(annotation.digest, config, model_table),
     )
+
+
+def _occupied_spans(matrix: np.ndarray) -> np.ndarray:
+    """First and last occupied bin per column, as an ``(n_cols, 2)`` int array.
+
+    Columns with no occupied bin -- a transcript shorter than the rounding
+    threshold -- get ``(-1, -1)`` rather than a silently wrong range.
+    """
+    occupied = matrix != 0
+    any_occupied = occupied.any(axis=0)
+    first = np.argmax(occupied, axis=0)
+    # argmax on the reversed rows gives the distance from the end.
+    last = occupied.shape[0] - 1 - np.argmax(occupied[::-1, :], axis=0)
+    spans = np.stack([first, last], axis=1).astype(np.int64)
+    spans[~any_occupied, :] = -1
+    return spans
 
 
 def _occupancy_matrix(

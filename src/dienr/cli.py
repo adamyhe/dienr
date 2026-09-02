@@ -16,6 +16,7 @@ import pickle
 import sys
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 
 from . import __version__
@@ -24,6 +25,8 @@ from .counts import VALUE_KINDS, SignalFile, count_sample
 from .design import Design, build_design
 from .pipeline import fit, status_report
 from .results import FitResult
+from .shape import ShapeConfig, ShapeProfile, applied_dynamic_range, apply_shape_profile
+from .shape import fit_shape_profile as _fit_shape_profile
 from .solvers.penalties import Penalty
 
 #: Filename for a serialized `Design` inside a design directory.
@@ -31,6 +34,9 @@ DESIGN_FILENAME = "design.pkl"
 
 #: Filename for serialized `SampleCounts` inside a counts directory.
 COUNTS_FILENAME = "counts.pkl"
+
+#: Filename for a serialized `ShapeProfile` inside a profile directory.
+SHAPE_FILENAME = "shape_profile.pkl"
 
 
 def _add_design_options(parser: argparse.ArgumentParser) -> None:
@@ -96,6 +102,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     design.add_argument("--gtf", required=True, type=Path, help="GTF/GFF annotation")
     design.add_argument("--output", required=True, type=Path, help="output directory")
+    design.add_argument(
+        "--shape-profile",
+        type=Path,
+        default=None,
+        help=(
+            "directory from 'dienr shape-profile'. Reweights every model "
+            "column by measured relative density, which yields a new design "
+            "digest because an abundance then means something different"
+        ),
+    )
     _add_design_options(design)
 
     count = subparsers.add_parser("count", help="aggregate stranded BigWig signal into bins")
@@ -164,6 +180,64 @@ def build_parser() -> argparse.ArgumentParser:
         help="exit nonzero if more than this fraction of fits failed",
     )
 
+    shape = subparsers.add_parser(
+        "shape-profile",
+        help="fit an empirical relative-density profile from isolated genes",
+    )
+    shape.add_argument("--gtf", required=True, type=Path, help="GTF/GFF annotation")
+    shape.add_argument("--bigwig-plus", required=True, type=Path)
+    shape.add_argument(
+        "--bigwig-minus",
+        required=True,
+        type=Path,
+        help=(
+            "minus-strand BigWig. Required, and genuinely used: the R "
+            "reference reads minus-strand genes from the plus file, which "
+            "leaves most training curves empty and the profile flat"
+        ),
+    )
+    shape.add_argument("--output", required=True, type=Path, help="output directory")
+    shape.add_argument("--bin-size", type=int, default=250)
+    shape.add_argument("--head-bases", type=int, default=10_000)
+    shape.add_argument("--tail-bases", type=int, default=5_000)
+    shape.add_argument(
+        "--span",
+        type=float,
+        default=ShapeConfig().span,
+        help=(
+            "fraction of observations per smoothing neighbourhood. The "
+            "reference's 0.4 is thirty times wider than a pausing peak and "
+            "flattens it; the default here is smaller on purpose"
+        ),
+    )
+    shape.add_argument(
+        "--min-bandwidth",
+        type=float,
+        default=None,
+        help=(
+            "floor on the smoothing half-width in rescaled-position units; "
+            "defaults to two head bins, so the profile is never fitted more "
+            "finely than the bins it multiplies"
+        ),
+    )
+    shape.add_argument(
+        "--min-length",
+        type=int,
+        default=None,
+        help="shortest training gene; defaults to head + tail",
+    )
+    shape.add_argument("--min-locus-fraction", type=float, default=0.9)
+    shape.add_argument("--min-covered-fraction", type=float, default=0.5)
+    shape.add_argument("--min-mean-signal", type=float, default=0.1)
+    shape.add_argument(
+        "--normalization", choices=("body_median", "whole_mean"), default="body_median"
+    )
+    shape.add_argument(
+        "--allow-short-genes",
+        action="store_true",
+        help="accept genes shorter than head + tail, which contribute no body positions",
+    )
+
     validate = subparsers.add_parser("validate", help="check a results directory")
     validate.add_argument("--results", required=True, type=Path)
     validate.add_argument("--max-failure-fraction", type=float, default=1.0)
@@ -179,6 +253,73 @@ def _load_design(directory: Path) -> Design:
         return pickle.load(handle)
 
 
+def _load_shape_profile(directory: Path) -> ShapeProfile:
+    path = directory / SHAPE_FILENAME
+    if not path.exists():
+        raise SystemExit(f"{directory}: no {SHAPE_FILENAME}; run 'dienr shape-profile' first")
+    with path.open("rb") as handle:
+        profile: ShapeProfile = pickle.load(handle)
+    return profile
+
+
+def cmd_shape_profile(args: argparse.Namespace) -> int:
+    annotation = read_annotation(args.gtf)
+    config = ShapeConfig(
+        bin_size=args.bin_size,
+        head_bases=args.head_bases,
+        tail_bases=args.tail_bases,
+        span=args.span,
+        min_bandwidth=args.min_bandwidth,
+        min_length=args.min_length,
+        min_locus_fraction=args.min_locus_fraction,
+        min_covered_fraction=args.min_covered_fraction,
+        min_mean_signal=args.min_mean_signal,
+        normalization=args.normalization,
+        allow_short_genes=args.allow_short_genes,
+    )
+    signal = (
+        SignalFile(path=args.bigwig_plus, strand="+"),
+        SignalFile(path=args.bigwig_minus, strand="-"),
+    )
+    try:
+        profile = _fit_shape_profile(annotation, signal, config=config)
+    except ValueError as error:
+        raise SystemExit(f"error: {error}") from error
+
+    args.output.mkdir(parents=True, exist_ok=True)
+    with (args.output / SHAPE_FILENAME).open("wb") as handle:
+        pickle.dump(profile, handle)
+    profile.table().write_parquet(args.output / "shape_profile.parquet")
+
+    print(
+        f"shape profile {profile.digest}: {profile.n_genes} training genes, "
+        f"{profile.n_observations} bins, dynamic range {profile.dynamic_range:.2f}x"
+    )
+    dropped = ", ".join(f"{reason}={count}" for reason, count in profile.rejected.items() if count)
+    if dropped:
+        print(f"  genes dropped: {dropped}")
+    # Print the curve so a flat or inverted profile is visible without plotting.
+    sample = profile.evaluate(np.array([0.0, 0.02, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0]))
+    print("  position  0.00  0.02  0.05  0.10  0.25  0.50  0.75  1.00")
+    print("  density  " + " ".join(f"{value:5.2f}" for value in sample))
+    if profile.n_floored:
+        print(
+            f"warning: {profile.n_floored} of {len(profile.grid)} grid nodes were "
+            "clamped to the profile floor, meaning the smoother undershot below "
+            "zero there. Raise --span",
+            file=sys.stderr,
+        )
+    if profile.dynamic_range < 1.2:
+        print(
+            f"warning: the profile spans only {profile.dynamic_range:.3f}x, so "
+            "reshaping a design with it will barely change the fit. Check that "
+            "--bigwig-plus and --bigwig-minus are the right way round and that "
+            "the training genes are expressed",
+            file=sys.stderr,
+        )
+    return 0
+
+
 def cmd_build_design(args: argparse.Namespace) -> int:
     annotation = read_annotation(args.gtf)
     design = build_design(
@@ -191,6 +332,10 @@ def cmd_build_design(args: argparse.Namespace) -> int:
         mask_pas=tuple(args.mask_pas) if args.mask_pas else None,
         bin_operation=args.bin_operation,
     )
+    if args.shape_profile is not None:
+        profile = _load_shape_profile(args.shape_profile)
+        design = apply_shape_profile(design, profile)
+
     args.output.mkdir(parents=True, exist_ok=True)
     with (args.output / DESIGN_FILENAME).open("wb") as handle:
         pickle.dump(design, handle)
@@ -202,6 +347,18 @@ def cmd_build_design(args: argparse.Namespace) -> int:
         f"design {design.digest}: {len(annotation)} transcripts, {design.n_loci} loci, "
         f"{design.model_table.height} models"
     )
+    if design.shape_digest is not None:
+        applied = applied_dynamic_range(design)
+        print(f"  reshaped by profile {design.shape_digest}; applied range {applied:.2f}x")
+        if applied < 1.2:
+            print(
+                f"warning: only {applied:.3f}x of the profile's grading survives in "
+                "this design. A shape profile and TSS masking compete for the same "
+                "bins -- the pausing peak is the biggest thing the profile measures "
+                "and the first thing a mask removes. Reduce --mask-tss/"
+                "--mask-start-bins if the profile is meant to do work",
+                file=sys.stderr,
+            )
     heavy = design.heavily_masked_loci(threshold=0.5)
     if heavy.height:
         worst = heavy.row(0, named=True)
@@ -323,6 +480,7 @@ def main(argv: list[str] | None = None) -> int:
         "build-design": cmd_build_design,
         "count": cmd_count,
         "fit": cmd_fit,
+        "shape-profile": cmd_shape_profile,
         "validate": cmd_validate,
     }
     return handlers[args.command](args)

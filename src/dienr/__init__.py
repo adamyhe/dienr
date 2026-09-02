@@ -37,6 +37,14 @@ from .diagnostics import LocusConditioning, assess
 from .loci import assign_loci, locus_table
 from .pipeline import fit, status_report
 from .results import SCHEMA_VERSION, FitResult, RunSummary, collect_results
+from .shape import (
+    ShapeConfig,
+    ShapeProfile,
+    applied_dynamic_range,
+    apply_shape_profile,
+    fit_shape_profile,
+    rescale_position,
+)
 from .solvers import inference, negative_binomial, penalties, poisson
 from .solvers._glm import Exposure
 from .solvers.legacy import LocusFit, fit_locus
@@ -60,7 +68,11 @@ __all__ = [
     "RunSummary",
     "SampleCounts",
     "SignalFile",
+    "ShapeConfig",
+    "ShapeProfile",
     "__version__",
+    "applied_dynamic_range",
+    "apply_shape_profile",
     "assess",
     "assign_loci",
     "build_design",
@@ -69,6 +81,7 @@ __all__ = [
     "declared_contigs",
     "fit",
     "fit_locus",
+    "fit_shape_profile",
     "is_failure",
     "inference",
     "locus_table",
@@ -77,5 +90,6 @@ __all__ = [
     "poisson",
     "read_annotation",
     "read_binned",
+    "rescale_position",
     "status_report",
 ]
