@@ -27,6 +27,7 @@ import numpy as np
 from scipy import optimize
 
 from ..status import FitStatus, is_failure
+from ._lbfgsb import minimize_bounded
 
 Transform = Literal["identity", "log"]
 
@@ -295,22 +296,24 @@ def fit_locus(
     upper = np.where(pinned, _INACTIVE_UPPER, _FREE_UPPER)
 
     try:
-        result = optimize.minimize(
+        # The lean driver, not scipy.optimize.minimize: same Fortran routine
+        # and same defaults, without the per-call Python scaffolding that made
+        # us slower than R on many small loci (plan section 14.2). Verified
+        # bit-identical in test_lean_driver_matches_scipy_minimize.
+        abundance, value, final_gradient, iterations, converged, message = minimize_bounded(
             _value_and_grad(models, observed, transform),
             start,
-            jac=True,
-            method="L-BFGS-B",
-            bounds=list(zip(np.zeros(n_models), upper, strict=True)),
-            options={"maxiter": max_iterations},
+            np.zeros(n_models),
+            upper,
+            maxiter=max_iterations,
         )
     except (ValueError, FloatingPointError) as error:  # pragma: no cover - defensive
         return _short_circuit(n_models, FitStatus.NUMERICAL_ERROR, str(error))
 
-    abundance = np.asarray(result.x, dtype=np.float64)
     # Pinned models may drift by the tiny bound; snap them back.
     abundance[pinned] = 0.0
-
-    final_gradient = gradient(abundance, models, observed, transform)
+    if pinned.any():
+        final_gradient = gradient(abundance, models, observed, transform)
     gradient_norm = float(np.abs(final_gradient).max()) if n_models else 0.0
 
     if not np.all(np.isfinite(abundance)):
@@ -318,16 +321,15 @@ def fit_locus(
             n_models, FitStatus.INVALID_MEAN, "optimizer returned non-finite abundance"
         )
 
-    status = FitStatus.OK if result.success else FitStatus.NONCONVERGED
     return LocusFit(
         abundance=abundance,
-        status=status,
-        objective=float(result.fun),
+        status=FitStatus.OK if converged else FitStatus.NONCONVERGED,
+        objective=value,
         gradient_norm=gradient_norm,
-        iterations=int(result.nit),
-        converged=bool(result.success),
-        message=str(result.message),
-        failure_reason=None if result.success else str(result.message),
+        iterations=iterations,
+        converged=converged,
+        message=message,
+        failure_reason=None if converged else message,
     )
 
 

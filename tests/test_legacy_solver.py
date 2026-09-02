@@ -234,3 +234,94 @@ def test_single_model_respects_inactive_pinning():
     column = np.ones((10, 1))
     result = fit_locus(column, np.full(10, 5.0), inactive=np.array([True]))
     assert result.abundance[0] == 0.0
+
+
+# --- lean L-BFGS-B driver ---------------------------------------------------
+
+
+@pytest.mark.parametrize("transform", ["identity", "log"])
+@pytest.mark.parametrize("shape", [(64, 3), (120, 4), (300, 8), (600, 12)])
+def test_lean_driver_matches_scipy_minimize(transform, shape):
+    """The lean driver must be bit-identical to scipy.optimize.minimize.
+
+    `fit_locus` uses a hand-written `setulb` loop instead of
+    `scipy.optimize.minimize` to avoid per-call Python scaffolding. That is only
+    safe if it is the same algorithm producing the same numbers, since R parity
+    is already established against the scipy path.
+    """
+    from scipy import optimize
+
+    from dienr.solvers._lbfgsb import minimize_bounded
+    from dienr.solvers.legacy import _FREE_UPPER, _value_and_grad
+
+    n_bins, n_models = shape
+    rng = np.random.default_rng(abs(hash(shape)) % 2**32)
+    models = (rng.random(shape) < 0.5).astype(float)
+    models[:, 0] = 1.0  # guarantee support
+    observed = models @ rng.exponential(4.0, n_models) + rng.exponential(0.4, n_bins)
+
+    fused = _value_and_grad(models, observed, transform)
+    lower = np.zeros(n_models)
+    upper = np.full(n_models, _FREE_UPPER)
+
+    reference = optimize.minimize(
+        fused,
+        np.zeros(n_models),
+        jac=True,
+        method="L-BFGS-B",
+        bounds=list(zip(lower, upper, strict=True)),
+        options={"maxiter": 15_000},
+    )
+    x, value, _, iterations, converged, _ = minimize_bounded(
+        fused, np.zeros(n_models), lower, upper
+    )
+
+    np.testing.assert_array_equal(x, reference.x)
+    assert value == reference.fun
+    assert iterations == reference.nit
+    assert converged == reference.success
+
+
+def test_lean_driver_workspace_reuse_is_not_stateful():
+    """Cached workspaces must be cleared between problems of the same size.
+
+    `setulb` reads its own state back out of the integer and double workspaces,
+    so a leftover Hessian approximation from a previous locus would corrupt the
+    next one. Fitting two different problems of identical shape must give the
+    same answers as fitting each alone.
+    """
+    from dienr.solvers._lbfgsb import minimize_bounded
+    from dienr.solvers.legacy import _FREE_UPPER, _value_and_grad
+
+    rng = np.random.default_rng(7)
+    problems = []
+    for _ in range(2):
+        models = (rng.random((100, 4)) < 0.6).astype(float)
+        models[:, 0] = 1.0
+        observed = models @ rng.exponential(5.0, 4) + rng.exponential(0.3, 100)
+        problems.append((models, observed))
+
+    lower, upper = np.zeros(4), np.full(4, _FREE_UPPER)
+    alone = [
+        minimize_bounded(_value_and_grad(m, y, "log"), np.zeros(4), lower, upper)[0]
+        for m, y in problems
+    ]
+    # Same problems, now run back to back through the shared workspace.
+    sequential = [
+        minimize_bounded(_value_and_grad(m, y, "log"), np.zeros(4), lower, upper)[0]
+        for m, y in problems
+    ]
+    for first, second in zip(alone, sequential, strict=True):
+        np.testing.assert_array_equal(first, second)
+
+
+def test_pinned_model_gradient_is_recomputed():
+    """Snapping a pinned model to zero invalidates the optimizer's gradient."""
+    models = np.zeros((8, 2))
+    models[0:6, 0] = 1.0
+    models[2:8, 1] = 1.0
+    observed = models @ np.array([3.0, 5.0])
+    result = fit_locus(models, observed, inactive=np.array([True, False]))
+    assert result.abundance[0] == 0.0
+    expected = gradient(result.abundance, models, observed, "log")
+    assert result.gradient_norm == pytest.approx(float(np.abs(expected).max()))

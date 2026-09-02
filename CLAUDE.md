@@ -59,14 +59,19 @@ The legacy path is complete end to end: `annotation` (GTF/GFF → pre-RNA spans)
 
 ## Performance status
 
-Measured against R DENR on identical data (`scripts/benchmark_*`, plan §14.2), with model counts agreeing exactly:
+Measured against R DENR on identical data (`scripts/benchmark_*`, plan §14.2), model counts agreeing exactly:
 
-| regime | total speedup | fitting |
-|---|---|---|
-| dense (124 loci, ~18 tx/locus) | **11.2×** | 5.9× |
-| sparse (955 loci, ~3 models/locus) | **1.3×** | **0.4× — slower than R** |
+| regime | total | fitting | aggregation | design |
+|---|---|---|---|---|
+| dense (124 loci, ~18 tx/locus) | **14.9×** | 9.3× | 24× | 27× |
+| sparse (955 loci, ~3 models/locus) | **14.5×** | 3.8× | 38× | 14× |
 
-Annotation parsing (60×) and design construction (14–32×) are solid in both. But we are **slower than R at fitting many small loci**, because `scipy.optimize.minimize` adds Python wrapper layers per call where R's `optim` is a thin C shim — the same scaffolding overhead §14.1 measured at 91% of a median locus. Per-locus BigWig reads also stop scaling (2.2× vs 17×). Don't quote the 11× figure as the headline; realistic geometry is 1.3×.
+Peak RSS on dense: 301 MB vs R's 2417 MB (8×). The plan's 3× target is met in both regimes.
+
+**Two performance traps this codebase has already fallen into**, both recorded in §14.2:
+
+1. `Design.mask()` once filtered the `bins` DataFrame instead of indexing a cached list. It runs once per locus per sample from both `count_sample` and `collect_results`, and cost 5.57 s of a 5.92 s fitting stage — it alone was responsible for sparse fitting being *slower than R*. `Design` now caches `masks` and `bin_lengths` as lists; **any new per-locus accessor must index, never scan.**
+2. Profiling a component instead of a stage sent the first fix at the wrong target. The `scipy.optimize.minimize` overhead was real (the lean `solvers/_lbfgsb` driver is 2.8× faster per call and bit-identical) but moved end-to-end sparse time by only 12%.
 
 ## R parity workflow
 
