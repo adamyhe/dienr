@@ -36,6 +36,14 @@ Summary = Literal["sum", "mean", "min", "max", "std"]
 #: How values in a signal file should be interpreted, per plan section 8.
 ValueKind = Literal["raw", "spike_in_scaled", "library_normalized", "other_transformed"]
 
+#: Every permitted `ValueKind`, for validating untyped external input.
+VALUE_KINDS: tuple[str, ...] = (
+    "raw",
+    "spike_in_scaled",
+    "library_normalized",
+    "other_transformed",
+)
+
 #: Likelihoods that require count-equivalent input.
 _COUNT_LIKELIHOODS = frozenset({"poisson", "negative_binomial"})
 
@@ -54,6 +62,17 @@ class SignalFile:
     path: str | Path
     strand: Literal["+", "-"]
     value_kind: ValueKind = "raw"
+
+    def __post_init__(self) -> None:
+        # External input (a samples CSV) is untyped, and a typo here would
+        # silently defeat the count-equivalence check below rather than
+        # failing, so validate rather than trusting the annotation.
+        if self.value_kind not in VALUE_KINDS:
+            raise ValueError(
+                f"{self.path}: value_kind {self.value_kind!r} is not one of {list(VALUE_KINDS)}"
+            )
+        if self.strand not in ("+", "-"):
+            raise ValueError(f"{self.path}: strand must be '+' or '-', got {self.strand!r}")
 
     def require_count_equivalent(self, likelihood: str) -> None:
         """Raise if `likelihood` needs counts but this file is transformed."""
