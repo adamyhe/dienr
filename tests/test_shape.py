@@ -1068,3 +1068,111 @@ def test_fill_gaps_refuses_an_all_non_finite_fit():
     assert filled.tolist() == [1.0, 2.0, 3.0]
     with pytest.raises(ValueError, match="no finite value anywhere"):
         _fill_gaps(np.full(5, np.nan))
+
+
+# --------------------------------------------------------------------------
+# The minus-strand sign convention
+# --------------------------------------------------------------------------
+
+
+def _write_signed_signal(path, genes: pl.DataFrame, strand: str, *, sign: float):
+    """Write a BigWig whose values carry `sign`, as real minus-strand files do."""
+    import pybigtools
+
+    intervals: list[tuple[str, int, int, float]] = [(CONTIG, 0, 1, 0.0)]
+    for gene in genes.iter_rows(named=True):
+        if gene["strand"] != strand:
+            continue
+        width = gene["end"] - gene["start"]
+        offsets = np.arange(0, width, 250)
+        values = _true_shape(offsets / width)
+        if strand == "-":
+            values = values[::-1]
+        for offset, value in zip(offsets, values, strict=True):
+            begin = gene["start"] + int(offset)
+            intervals.append((CONTIG, begin, min(begin + 250, gene["end"]), sign * float(value)))
+    writer = pybigtools.open(str(path), "w")
+    writer.write({CONTIG: CONTIG_SIZE}, iter(sorted(intervals)))
+    writer.close()
+    return path
+
+
+def test_fit_handles_conventionally_negative_minus_strand(tmp_path, small_config):
+    """Minus-strand BigWigs are written negative, and that must not drop them.
+
+    The convention exists so a browser draws the minus strand below the axis;
+    magnitude is the signal. `dienr.counts.count_sample` always took the
+    absolute value, but `fit_shape_profile` read through the raw primitive and
+    did not, so every minus-strand gene had a negative mean, failed the
+    expression filter, and the profile was silently fitted from plus-strand
+    genes alone. Caught only on real data from the reference's own simulator,
+    because every fixture here wrote positive values on both strands -- the
+    exact blind spot that hides the reference's strand bugs from its tests.
+
+    Asserted as invariance: flipping the sign of the minus-strand file must not
+    change the profile at all.
+    """
+    genes = _make_genes(24)
+    annotation = dienr.Annotation.from_frame(genes, source="s")
+    plus = dienr.SignalFile(
+        path=_write_signed_signal(tmp_path / "p.bw", genes, "+", sign=1.0), strand="+"
+    )
+    positive = dienr.SignalFile(
+        path=_write_signed_signal(tmp_path / "mp.bw", genes, "-", sign=1.0), strand="-"
+    )
+    negative = dienr.SignalFile(
+        path=_write_signed_signal(tmp_path / "mn.bw", genes, "-", sign=-1.0), strand="-"
+    )
+
+    from_positive = fit_shape_profile(annotation, (plus, positive), config=small_config)
+    from_negative = fit_shape_profile(annotation, (plus, negative), config=small_config)
+
+    assert from_positive.n_genes == 24
+    assert from_negative.n_genes == from_positive.n_genes
+    assert np.allclose(from_negative.values, from_positive.values, rtol=1e-12)
+    assert from_negative.digest == from_positive.digest
+
+
+def test_read_binned_returns_magnitude_not_sign(tmp_path):
+    """The convention is normalized at the I/O boundary, not by each caller.
+
+    Strand is carried as data on `SignalFile` and never inferred from the sign,
+    so a signed value has no downstream meaning -- only a way to get a wrong
+    answer. Putting the correction in the one reader is what keeps the counting
+    path and the shape path from drifting apart, which is how the bug above
+    arose.
+    """
+    from dienr.counts import read_binned
+
+    genes = _make_genes(4, strands=("-",))
+    negative = _write_signed_signal(tmp_path / "neg.bw", genes, "-", sign=-1.0)
+    positive = _write_signed_signal(tmp_path / "pos.bw", genes, "-", sign=1.0)
+    gene = genes.row(0, named=True)
+    n_bins = (gene["end"] - gene["start"]) // 250
+    window = (CONTIG, gene["start"], gene["start"] + n_bins * 250, n_bins)
+
+    from_negative = read_binned(negative, *window)
+    from_positive = read_binned(positive, *window)
+    assert from_negative.min() >= 0
+    assert np.allclose(from_negative, from_positive)
+    assert from_negative.max() > 0
+
+
+def test_read_binned_returns_n_bins_past_a_contig_end(tmp_path):
+    """A window running past the contig end still returns exactly n_bins.
+
+    The length contract, which the caller relies on to align the result to
+    design geometry. `pybigtools` with ``oob=0.0`` satisfies it already, so
+    this pins the behavior we depend on rather than exercising the pad that
+    guards it.
+    """
+    from dienr.counts import read_binned
+
+    genes = _make_genes(2, strands=("+",))
+    path = _write_signed_signal(tmp_path / "pad.bw", genes, "+", sign=1.0)
+    n_bins = 40
+    start = CONTIG_SIZE - 10 * 250
+    values = read_binned(path, CONTIG, start, start + n_bins * 250, n_bins)
+    assert values.shape == (n_bins,)
+    assert np.all(np.isfinite(values))
+    assert np.all(values >= 0)

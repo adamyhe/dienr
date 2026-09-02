@@ -5,6 +5,7 @@ reweights the design matrix by it, replacing the uniform-density assumption
 behind a 0/1 model column.
 
 - [Why](#why)
+- [Does it work?](#does-it-work)
 - [Using it](#using-it)
 - [What was wrong in DENR](#what-was-wrong-in-denr)
 - [Improvements beyond the fixes](#improvements-beyond-the-fixes)
@@ -36,6 +37,84 @@ How much it is worth, measured over 200 Poisson resamplings against
 |---|---|---|---|---|
 | binary | 1.00× | 0.2367 | 0.2367 | **1.000** |
 | shape-reshaped | 14.30× | 0.1882 | 0.2854 | **1.516** |
+
+## Does it work?
+
+Measured against known truth on **`nascentRNASim`, the DENR authors' own
+simulator** — the one the paper used for every accuracy claim it makes, since
+section 3.2 states plainly that they lacked a real-data gold standard. It
+resamples read-counts from 62 manually curated PRO-seq archetypes (real signal,
+Dukler et al. 2017) onto simulated loci drawn from Ensembl GRCh37, with
+abundances from a GTEx skeletal-muscle kernel, so per-isoform truth is known
+while the shape stays real.
+
+Two independent 1500-locus simulations (seeds 5 and 17; ~6600 transcripts,
+~2600 expressed), the paper's masking (1 bin at the TSS, 4 at the PAS), profile
+fitted on half the contigs and scored on the other half. Abundance units are
+arbitrary and differ between objectives, so one global calibration constant is
+removed before any error is computed — applied identically to every arm.
+Reproduce with `scripts/simulate_nascentrnasim.R` then
+`scripts/benchmark_shape_accuracy.py`.
+
+| arm | isoform \|log2\| err | isoform rho | dominant isoform | zero estimates |
+|---|---|---|---|---|
+| binary / legacy_log (DENR default) | 0.344 / 0.271 | 0.669 / 0.555 | 0.708 / 0.585 | 0.186 / 0.166 |
+| binary / legacy_identity | 0.338 / 0.332 | 0.611 / 0.514 | 0.653 / 0.512 | 0.221 / 0.190 |
+| binary / poisson | 0.320 / 0.328 | 0.613 / 0.492 | 0.653 / 0.512 | 0.205 / 0.202 |
+| shape / legacy_log | 0.399 / 0.287 | **0.700 / 0.634** | 0.750 / 0.561 | 0.156 / 0.135 |
+| shape / legacy_identity | 0.562 / 0.384 | 0.650 / 0.566 | 0.694 / 0.610 | 0.199 / 0.178 |
+| **shape / poisson** | **0.328 / 0.283** | 0.656 / 0.573 | 0.708 / 0.537 | 0.186 / 0.160 |
+
+(seed 5 / seed 17.)
+
+**Yes for ranking isoforms, no for calibrating their magnitudes.** Isoform-level
+rank correlation improves with a shape profile in every objective and both
+seeds, by 0.03–0.08 — and ordering isoforms within a locus is the deconvolution
+problem. The fraction of models estimated as exactly zero drops as well
+(0.186 → 0.156, 0.166 → 0.135). But the magnitude error gets *worse*,
+consistently, and badly so under least squares.
+
+**The magnitude regression has a mechanism, and it is the answer to the second
+question.** A fitted profile puts a 4–5× weight on the first bin, and
+unweighted least squares is dominated by the largest entries of the design, so
+a gene whose own pausing peak departs from the shared average profile is fitted
+mostly on the bins where that departure is largest. Poisson weights each bin by
+`1/μ`, which is exactly the right correction, and the difference is stark:
+
+| | Poisson vs identity least squares |
+|---|---|
+| binary design | **−1% to −5%** isoform error |
+| shape-reshaped design | **−26% to −42%** isoform error |
+
+So **a graded design is what makes the choice of likelihood matter**, by roughly
+an order of magnitude — measured on the authors' own benchmark, and predicted in
+advance by Gate B from the estimating equations. On a binary design the two are
+nearly the same estimator; on a shaped one they are not close.
+
+**The practical recommendation follows: use a shape profile with `poisson`, not
+with least squares.** `shape/poisson` is the only arm that improves ranking
+without paying for it in magnitude — its error matches the best binary arm to
+within 2.4% while gaining 0.04 in rank correlation. The paper could not reach
+this conclusion because least squares was its only option.
+
+**And the reference's `span = 0.4` is actively harmful here**, not merely
+wasteful. At 0.4 the fitted profile spans 2.0× instead of 4.5×, and isoform rank
+correlation falls to 0.625 — *below* the 0.673 of no shape profile at all. The
+`dienr` default of 0.05 raises it to 0.700. Over-smoothing does not merely
+discard the benefit; it inverts it.
+
+**Limits of this evidence.** Two seeds, one simulator, one archetype set, one
+masking scheme. Dominant-isoform accuracy moves too erratically between seeds
+(+9.8 points on one, −2.4 on the other) to support any claim; the rank
+correlation and the Poisson-versus-least-squares gap are the findings that
+replicate. Nothing here is real data: `nascentRNASim` resamples real archetype
+signal, which makes the shape realistic but still assumes each simulated
+isoform inherits an archetype's profile — the very assumption a shape
+correction encodes, so this benchmark is friendlier to shape modeling than
+biology will be. The paper's own orthogonal comparison (matched PRO-seq and
+RNA-seq, entropy decomposition) rests on dbGaP `phs002146.v1.p1`, which is
+controlled access; the public K562 (`GSE96869`) and CD4+ T-cell (`GSE85337`)
+PRO-seq libraries would support a real-data check but have not been run.
 
 ## Using it
 
@@ -90,9 +169,9 @@ signal = (
 profile = dienr.fit_shape_profile(annotation, signal)
 design = dienr.apply_shape_profile(dienr.build_design(annotation), profile)
 
-profile.table()      # position / relative_density, for plotting
-profile.describe()   # provenance for a manifest
-profile.rejected     # why each candidate gene was excluded
+profile.table()  # position / relative_density, for plotting
+profile.describe()  # provenance for a manifest
+profile.rejected  # why each candidate gene was excluded
 dienr.applied_dynamic_range(design)
 ```
 
@@ -115,9 +194,27 @@ ordinary inputs, and when it does not crash it silently does nothing.
 | the same function with no bins | `Error: 'length.out' must be a non-negative number` | `length_out == 0` |
 | `model_agreement` indexes a group table by `names(unlist(tx_grps))`, which is `"1_+.t1.1"` where the table is keyed `"1_+"` | `Error: subscript contains invalid names` | **any input `GRanges` carrying names**, e.g. after `names(gr) <- gr$tx_name` |
 | documented defaults `bigwig_plus = NULL, bigwig_minus = NULL` | opaque rtracklayer error about `'filename'` | omitting either BigWig |
+| **`min_percent_transcribed = 0.8` is unsatisfiable on count data** | `Error: No transcripts passed filters to be used for model fitting` | **the documented defaults, on any PRO-seq count BigWig** |
 
-The third is the one most likely to have been encountered: it works *only*
-when the annotation has no names, which is an accident of
+The last one is the one to know about, because it is not an edge case — it is
+the default path on real data. `percent_transcribed` is the fraction of a
+transcript's **bases** carrying at least one read, with the threshold
+hardcoded at 1 (`transcribed_thresh <- 1`, whose own comment concedes "control
+of this is not accessible to user for now"). PRO-seq 3′-end counts are sparse
+per base: on the authors' own simulated dataset, **1.07% of bases have a
+non-zero value** (213,377 of 20 Mb), and `percent_transcribed` peaks at 0.487
+with a median of 0.069. Nothing can reach 0.8.
+
+So `transcript_shape_profile` **fails outright on the output of the DENR
+authors' own simulator, at its own default settings.** Their archetype
+curation criterion — "the transcript averages one read per 20 bp" — is itself
+about 5% base coverage, an order of magnitude below the filter. Lowering the
+threshold walks into the next problem rather than out of it: at 0.4 exactly
+**one** gene survives and a loess profile is fitted, without complaint, from a
+single gene.
+
+The names bug is the other likely one: `model_agreement` works *only* when the
+annotation has no names, which is an accident of
 `GenomicFeatures::transcripts()` returning unnamed ranges.
 
 ### It is silently inert
@@ -159,9 +256,44 @@ swap undetectable by construction. That file also computes a reference vector
 for the rescaler and never asserts it — and it is wrong, ending `0.1` where the
 function returns `1`.
 
+### The "U shape" is largely an artifact
+
+There is a third strand defect, and together the three manufacture the shape
+the paper reports. **Minus-strand BigWigs are conventionally negative** so a
+browser draws them below the axis — the authors' own simulator writes them that
+way (min −1122, max 0). `add_data`, the counting path, applies `abs()`.
+`transcript_shape_profile` does not. Min–max rescaling of an all-negative
+vector maps the *largest-magnitude* value — the 5′ pausing peak — to ≈0 and the
+background to ≈1, inverting every minus-strand gene.
+
+Two of the bugs hide each other: because the minus groups are read from
+`bigwig_plus`, the minus file is never opened for signal, so the missing
+`abs()` never fires — until someone fixes the strand dispatch, at which point
+it does.
+
+Decomposed on the authors' simulated data, same 57 genes throughout, `5'/3'` =
+the ratio of fitted density at position 0 to position 1:
+
+| variant | range | 5′/3′ | shape |
+|---|---|---|---|
+| DENR as written | 4.3× | 1.33 | **symmetric U** |
+| strand fixed, still min–max | 2.6× | 1.66 | weakly 5′ |
+| strand fixed, no `abs()` | 1.2× | 1.01 | flat |
+| bug kept, mean-normalized | 10.2× | 1.24 | **U, exaggerated** |
+| **all three fixed** | 2.4× | **2.13** | **5′-peaked, mild 3′ plateau** |
+
+The corrected profile is 5′-dominant by a factor of two with a small 3′
+plateau, which is what PRO-seq looks like. DENR's is near-symmetric, with a 3′
+arm about as tall as its 5′ peak. The paper is careful to say that "while we
+sometimes refer to a 'U-shape correction', the 'U' shape is not assumed but is
+derived from the data" — but on stranded input the 3′ arm of that U is
+substantially the 5′ peak of every minus-strand gene, mirrored by the
+unreversed duplicate and inverted by min–max on negative values. A genuine
+PAS-proximal rise exists; it is much smaller than the published profile shows.
+
 ### Three further defects, not crashes
 
-**Min–max rescaling manufactures data.** Per gene, the reference computes
+**Min–max rescaling manufactures data**, beyond the inversion above. Per gene, the reference computes
 `(x - (min(x) - 1e-6)) / (max(x) - (min(x) - 1e-6))`. The `- 1e-6` guard maps a
 gene with *no signal* to a constant 1.0 instead of dividing by zero, so absent
 data becomes evidence for a flat profile — precisely the state the strand bug

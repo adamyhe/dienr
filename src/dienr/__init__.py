@@ -31,7 +31,13 @@ single conversion point.
 """
 
 from .annotation import Annotation, read_annotation
-from .counts import SampleCounts, SignalFile, count_sample, declared_contigs, read_binned
+from .counts import (
+    SampleCounts,
+    SignalFile,
+    count_sample,
+    declared_contigs,
+    read_binned,
+)
 from .design import Design, DesignConfig, build_design
 from .diagnostics import LocusConditioning, assess
 from .loci import assign_loci, locus_table

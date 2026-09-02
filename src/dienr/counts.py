@@ -146,7 +146,31 @@ def read_binned(
     summary: Summary = "sum",
     reader: pybigtools.BBIReader | None = None,
 ) -> np.ndarray:
-    """Read `n_bins` exact binned summaries from a BigWig.
+    """Read `n_bins` exact, non-negative binned summaries from a BigWig.
+
+    The single BigWig read path for the whole package. Both normalizations that
+    every caller needs are applied *here*, at the I/O boundary, rather than by
+    each caller:
+
+    - **Magnitude.** Minus-strand BigWigs are conventionally written with
+      negative values so a browser draws them below the axis; the signal is the
+      magnitude. Strand is carried as data on `SignalFile`, never inferred from
+      the sign, so a signed value has no meaning downstream and is only a way
+      to get a wrong answer.
+    - **Length.** The result has to align to `n_bins` of design geometry.
+      Measured, `pybigtools` with ``oob=0.0`` already returns exactly `n_bins`
+      for every window we can construct, including one clipped at or past a
+      contig end, so the pad below is a guard on that behavior rather than a
+      code path in use.
+
+    Both used to live in `count_sample`, so when `dienr.shape` was added it read
+    through this function and got neither. On a conventionally signed
+    minus-strand file that made every minus-strand gene's mean negative, so all
+    of them failed the shape profile's expression filter and the profile was
+    silently fitted from plus-strand genes alone. No test caught it because
+    every fixture wrote positive values on both strands -- the same blind spot
+    that hides the reference implementation's strand bugs from its own tests.
+    The fix is structural: one reader, and the corrections are not optional.
 
     Args:
         path: BigWig path. Ignored when `reader` is supplied.
@@ -162,8 +186,8 @@ def read_binned(
         reader: An open reader to reuse across calls.
 
     Returns:
-        A float64 array of length `n_bins`, with uncovered positions counted as
-        zero.
+        A non-negative float64 array of exactly `n_bins` values, with
+        uncovered positions and positions past a contig end counted as zero.
 
     Raises:
         KeyError: If `contig` is absent from the file header.
@@ -179,7 +203,10 @@ def read_binned(
         fillna=0.0,  # uncovered means zero polymerase, not missing
         oob=0.0,  # reads past a contig end are zero, not an error
     )
-    return np.asarray(values, dtype=np.float64)
+    binned = np.asarray(values, dtype=np.float64)
+    if binned.size < n_bins:  # pragma: no cover - unreachable with oob=0.0
+        binned = np.concatenate([binned, np.zeros(n_bins - binned.size)])
+    return np.abs(binned, out=binned)
 
 
 def declared_contigs(path: str | Path) -> dict[str, int]:
@@ -273,13 +300,6 @@ def count_sample(
             summary=summary,
             reader=readers[strand],
         )
-        # A window clipped at the contig end returns fewer bins than requested;
-        # pad with zeros so the vector still aligns to the design.
-        if raw.size < n_bins:
-            raw = np.concatenate([raw, np.zeros(n_bins - raw.size)])
-
-        # Minus-strand BigWigs are conventionally negative; magnitude is the count.
-        np.abs(raw, out=raw)
         # Record the total before masking; after this the masked bins are gone.
         totals[locus_id] = float(raw.sum())
         raw[design.mask(locus_id)] = 0.0

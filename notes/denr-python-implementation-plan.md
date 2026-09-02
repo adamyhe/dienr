@@ -1454,6 +1454,114 @@ reshaped design, `build-design` prints it, and it warns below 1.2x. **The
 number to look at is the applied range, not `ShapeProfile.dynamic_range`.**
 
 
+### 18.6 Validated on the authors' own simulator
+
+The paper has **no real-data gold standard**: section 3.2 says so directly --
+"Lacking an appropriate 'gold-standard' in the form of real biological data, we
+chose to benchmark the software using simulated data" -- and built
+`nascentRNASim` (MIT, `CshlSiepelLab/nascentRNASim`) for the purpose. It
+resamples read-counts from 62 curated PRO-seq archetypes onto simulated loci
+drawn from a real annotation, with abundances from a GTEx skeletal-muscle
+kernel, so per-isoform truth is known while the shape stays real. Both are
+bundled with the package, so the paper's benchmark is reproducible:
+`scripts/simulate_nascentrnasim.R` then `scripts/benchmark_shape_accuracy.py`.
+
+Two 1500-locus simulations (seeds 5, 17), the paper's masking (1 bin TSS, 4
+bins PAS), profile fitted on half the contigs and scored on the other half, one
+global calibration constant removed per arm. Results, seed 5 / seed 17:
+
+| arm | isoform abs log2 err | isoform rho | zero estimates |
+|---|---|---|---|
+| binary / legacy_log (DENR default) | 0.344 / 0.271 | 0.669 / 0.555 | 0.186 / 0.166 |
+| binary / legacy_identity | 0.338 / 0.332 | 0.611 / 0.514 | 0.221 / 0.190 |
+| binary / poisson | 0.320 / 0.328 | 0.613 / 0.492 | 0.205 / 0.202 |
+| shape / legacy_log | 0.399 / 0.287 | 0.700 / 0.634 | 0.156 / 0.135 |
+| shape / legacy_identity | 0.562 / 0.384 | 0.650 / 0.566 | 0.199 / 0.178 |
+| shape / poisson | 0.328 / 0.283 | 0.656 / 0.573 | 0.186 / 0.160 |
+
+**Shape modeling improves isoform ranking and not isoform magnitude.** Rank
+correlation rises by 0.03-0.08 in every objective and both seeds, and the
+fraction of models estimated as exactly zero falls. Magnitude error rises,
+consistently, and sharply under least squares. Dominant-isoform accuracy swings
+between +9.8 and -2.4 points across seeds and supports no claim either way.
+
+**And a graded design is what makes the likelihood matter**, which settles the
+Gate B question on the authors' own benchmark rather than by simulation of our
+own design:
+
+| | Poisson vs identity least squares |
+|---|---|
+| binary design | -1% to -5% isoform error |
+| shape-reshaped design | **-26% to -42%** isoform error |
+
+The mechanism is the one Gate B derived. A fitted profile puts a 4-5x weight on
+the first bin; unweighted least squares is dominated by the largest design
+entries, so a gene whose own peak departs from the shared profile is fitted
+mostly where that departure is worst. Poisson's `1/mu` weighting is exactly the
+correction. So the recommendation is **shape profile with `poisson`, not with
+least squares** -- `shape/poisson` is the only arm that buys ranking without
+paying in magnitude. The paper could not reach this, having only least squares.
+
+**The reference's `span = 0.4` is harmful, not merely wasteful.** At 0.4 the
+profile spans 2.0x and isoform rho falls to 0.625, *below* the 0.673 of no
+profile at all; at the `dienr` default of 0.05 it rises to 0.700.
+Over-smoothing inverts the benefit rather than reducing it.
+
+Caveats. Two seeds, one simulator, one archetype set. `nascentRNASim` gives
+every simulated isoform an archetype's profile, which is the assumption a shape
+correction encodes, so this benchmark is friendlier to shape modeling than
+biology will be. No real data: the paper's orthogonal comparison (matched
+PRO-seq/RNA-seq, entropy decomposition) rests on dbGaP `phs002146.v1.p1`
+(controlled access); public K562 `GSE96869` and CD4+ T `GSE85337` PRO-seq would
+support a real-data check and have not been run.
+
+### 18.7 Two further reference defects, and one of ours
+
+**`min_percent_transcribed = 0.8` is unsatisfiable on count data.**
+`percent_transcribed` is the fraction of a transcript's *bases* with at least
+one read, threshold hardcoded at 1. PRO-seq 3'-end counts are sparse per base:
+on nascentRNASim output, 1.07% of bases are non-zero (213,377 of 20 Mb) and
+`percent_transcribed` peaks at 0.487, median 0.069. So
+`transcript_shape_profile` **fails outright on the DENR authors' own simulator
+at their own defaults**: `Error: No transcripts passed filters to be used for
+model fitting`. This is the default path on real data, not an edge case, and is
+the most likely crash a user hits. Lowering the threshold is not an escape --
+at 0.4 exactly one gene survives and a loess profile is fitted from it without
+complaint.
+
+**The published "U shape" is largely an artifact.** A third strand defect:
+minus-strand BigWigs are conventionally negative (their own simulator writes
+min -1122, max 0); `add_data` applies `abs()` and
+`transcript_shape_profile` does not, so min-max rescaling of an all-negative
+vector maps the 5' pausing peak to ~0 and the background to ~1, inverting every
+minus-strand gene. Two bugs hide each other: the minus file is never opened for
+signal, so the missing `abs()` only fires once the strand dispatch is fixed.
+Decomposed on the same 57 genes:
+
+| variant | range | 5'/3' | shape |
+|---|---|---|---|
+| DENR as written | 4.3x | 1.33 | symmetric U |
+| strand fixed, still min-max | 2.6x | 1.66 | weakly 5' |
+| strand fixed, no `abs()` | 1.2x | 1.01 | flat |
+| bug kept, mean-normalized | 10.2x | 1.24 | U, exaggerated |
+| all three fixed | 2.4x | **2.13** | 5'-peaked, mild 3' plateau |
+
+A real PAS-proximal rise exists but is far smaller than the published profile.
+
+**And the same class of bug was in our code.** `count_sample` applied `abs()`;
+`dienr.shape` read through `read_binned` and did not, so on a conventionally
+signed minus-strand file every minus-strand gene had a negative mean, failed
+the expression filter, and the profile was fitted from plus-strand genes alone
+(487 of 487 minus candidates dropped). No test caught it because **every
+fixture wrote positive values on both strands** -- precisely the blind spot
+that hides the reference's strand bugs from its own tests, reproduced in our
+suite. Found only by running real-convention data through it. The fix is
+structural rather than a second `abs()` call: both the sign and the
+short-window padding now live in `read_binned`, at the I/O boundary, so there
+is one reader and the corrections are not optional. Two readers, one of which
+forgets a correction, is the shape of the defect.
+
+
 ## 19. Definition of done for version 1.0
 
 Version 1.0 is complete when:
