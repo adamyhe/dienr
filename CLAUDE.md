@@ -1,0 +1,190 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this repository is
+
+`dienr` — "Deconvolution of Isoform Expression from Nascent RNAs" — is a **greenfield Python reimplementation** of the R/Bioconductor package [DENR](https://github.com/CshlSiepelLab/DENR) (Zhao & Dukler, *Bioinformatics* 2021). The method deconvolves nascent RNA sequencing signal (PRO-seq, GRO-seq, etc., processed so each read is a single 3'-end count) into abundances of annotated pre-RNA isoform models.
+
+**Current state: no source code exists yet.** The tracked repo is `README.md`, `LICENSE`, `.gitattributes` only. Everything substantive lives in two untracked directories:
+
+- `notes/denr-python-implementation-plan.md` — the 600-line design document. **Read this before writing any code**; it is the binding spec for architecture, schemas, phases, and policy.
+- `_reference/DENR/` — a full clone of the R reference implementation, pinned at commit `09d6cde` (`master`, 2025-04-18). This is the behavioral reference for parity testing. It is a nested git repo; never commit into it or stage it.
+
+## Commands
+
+Dependencies are managed with **uv**. The package lives in `src/dienr/`, tests in `tests/`.
+
+```bash
+uv sync --group dev              # create/refresh .venv from uv.lock
+uv run pytest -q                 # full suite
+uv run pytest tests/test_design.py::test_bins_are_anchored_at_locus_start   # one test
+uv run ruff check . && uv run ruff format .
+uv run mypy                      # config in pyproject; files list is set there
+```
+
+Core dependencies are NumPy/SciPy, Polars, `pybigtools` (all BigWig access) and pydantic — deliberately no genomics interval/annotation library. `pysam` (bam), `polars-bio` (intervals), PyTorch/AnnData (ml) are optional extras; pandas is not a dependency at all.
+
+Tests that need the R reference's synthetic BigWigs skip cleanly when `_reference/` is absent (see `tests/conftest.py`).
+
+The R reference package can be exercised for fixture generation and parity checks (`R` and `Rscript` are on PATH via miniforge; the Bioconductor dependency stack may not be installed — check before assuming):
+
+`scripts/probe_r_shape_profile.R` regenerates every number in plan §18 (the shape-profile defects) against the reference; `SHAPE_PROBE_TRIALS` raises the `apply_shape_profile` fuzz, which dominates its runtime.
+
+```bash
+# From _reference/DENR/
+Rscript -e 'devtools::test()'                                   # full testthat suite
+Rscript -e 'devtools::test(filter = "model_fitting")'           # one test file (tests/testthat/test-<filter>.R)
+Rscript -e 'devtools::load_all(); ...'                          # interactive use of the reference API
+```
+
+Test fixtures live in `_reference/DENR/inst/extdata/`: synthetic stranded BigWigs plus matching `.txdb` annotations (single-strand, double-strand, multichrom, transcript-filter, UPR cases). `tests/testthat/setup-model_fitting.R` shows the canonical end-to-end R invocation and is the model for what Phase 0 must export as golden fixtures.
+
+## Reference pipeline (what is being reimplemented)
+
+The R package's flow, and the source files to consult for each stage:
+
+1. **Annotation → loci → design matrices** (`R/transcript_models_build_helpers.R`, `R/transcript_quantifier-class.R`). Transcripts are grouped into strand-specific connected components (`group_transcripts`), binned at `bin_size` (default 250bp), converted to a per-locus matrix of fractional bin overlap (`create_transcript_models`), TSS/PAS-adjacent bins masked (`create_model_masks`, typically ±1kb), and then indistinguishable transcripts are collapsed to shared models (`reduce_transcript_models`). The result is the S4 `transcript_quantifier` ("tq") object: per-locus `models` matrices, `masks`, `counts`, `model_abundance`, and a `transcript_model_key` mapping transcript → locus group → model column.
+2. **Signal extraction** (`R/data_handling.R`). `add_data`/`summarize_bigwig` aggregate stranded BigWigs into per-bin count vectors.
+3. **Optional shape profile** (`R/transcript_shape_profile-class.R`). A loess fit of relative polymerase density vs. rescaled gene-body position, applied to reweight model matrices away from the uniform-density assumption.
+4. **Optional inactive-TSS filtering** (`R/tss_predictor.R`, `R/upstream_density_ratio.R`). A bundled Keras CNN predicts inactive TSSs; two heuristics (upstream polymerase ratio ≥ log2(5), and a goodness-of-fit rescue at all-inactive loci) can override the classifier. Inactive models are pinned to ~zero via optimizer upper bounds.
+5. **Fitting** (`R/model_fitting.R:110`). Per locus, `stats::optim(method = "L-BFGS-B")` minimizes sum-of-squares between observed and `models %*% abundance`, under either `transform = "identity"` or the default `transform = "log"` (log of value + 1e-3). Only `opt_result$par` is retained.
+6. **Reporting** (`R/abundance_tables.R`, `R/model_fit_statistics.R`). `transcript_abundance` repeats a shared model's abundance across every transcript mapped to it.
+
+## Implementation status
+
+The legacy path is complete end to end: `annotation` (GTF/GFF → pre-RNA spans) → `loci` → `design` (bins, masks, model reduction) → `counts` (BigWig aggregation) → `solvers/legacy` → `pipeline.fit` → `results` (versioned Parquet + manifest), with `cli` exposing `build-design` / `count` / `fit` / `shape-profile` / `validate`.
+
+`shape.py` implements empirical shape profiles (plan §18): `fit_shape_profile` measures relative polymerase density from isolated, expressed genes and `apply_shape_profile` reweights a `Design`'s model columns by it, which is what makes `M` non-binary. This was a v1 non-goal until Gate B and Gate D both reduced to needing it.
+
+Three likelihoods: `solvers/legacy` (default, the only one with R parity), `solvers/poisson`, `solvers/negative_binomial`, plus `solvers/penalties` (ridge/lasso/elastic net) and the shared `solvers/_glm` exposure machinery. Selected via `fit(likelihood=...)` or `dienr fit --likelihood`.
+
+**Not yet written:** BAM counting, TSS-evidence mapping, normalization factor computation, the multi-sample group penalty, and ML adapters beyond `FitResult.to_numpy`.
+
+**R parity is established: 10/10 comparable scenarios verified** against DENR 1.0.0 at commit `09d6cde`. Locus membership, bin boundaries, mask indices, the reduced design matrix, equivalence classes, binned signal, predicted signal, objective values and full-rank abundances all agree. Coverage is printed on every run, so a regression to zero cannot pass unnoticed.
+
+## Performance status
+
+Measured against R DENR on identical data (`scripts/benchmark_*`, plan §14.2), model counts agreeing exactly:
+
+| regime | total | fitting | aggregation | design | peak RSS |
+|---|---|---|---|---|---|
+| dense (124 loci, ~18 tx/locus) | **14.9×** | 9.3× | 24× | 27× | 301 MB vs 2417 MB (8.0×) |
+| sparse (955 loci, ~3 models/locus) | **14.5×** | 3.8× | 38× | 14× | 249 MB vs 2265 MB (9.1×) |
+
+Both the 3× wall-time and 2× memory targets are met. RSS is measured externally (`/usr/bin/time -l`) for both sides; R has no usable in-process figure since `gc()` reports heap cells, not RSS.
+
+**Two performance traps this codebase has already fallen into**, both recorded in §14.2:
+
+1. `Design.mask()` once filtered the `bins` DataFrame instead of indexing a cached list. It runs once per locus per sample from both `count_sample` and `collect_results`, and cost 5.57 s of a 5.92 s fitting stage — it alone was responsible for sparse fitting being *slower than R*. `Design` now caches `masks` and `bin_lengths` as lists; **any new per-locus accessor must index, never scan.**
+2. Profiling a component instead of a stage sent the first fix at the wrong target. The `scipy.optimize.minimize` overhead was real (the lean `solvers/_lbfgsb` driver is 2.8× faster per call and bit-identical) but moved end-to-end sparse time by only 12%.
+
+**JIT: evaluated twice, declined twice, for different reasons** (plan §14.1 and §14.3). Now that the scaffolding is gone the fused closures are 61–68% of each fitting stage, and numba would give **2.1× Poisson / 2.2× NB / 1.9× legacy** at the realistic 329×3 locus — but **0.3× (three times slower) at 4000×30**, where a hand loop can't beat BLAS. Declined because it needs size dispatch plus a second bit-identical implementation of every likelihood, for ~1.2× end-to-end on a pipeline already 14.5× faster than R. The free part was taken: fused closures fold the usable mask into precomputed vectors and preallocate all temporaries (~1.18× on Poisson/NB stages, no regression at any size). Don't add a JIT kernel without re-reading §14.3.
+
+## How the suite is structured
+
+707 tests, 99% line coverage, 10 skips (all `absent_contig`, which R cannot produce a golden for). `uv run pytest -q --cov=dienr --cov-report=term-missing` for the breakdown.
+
+The layers, roughly in order of how much they buy:
+
+1. **Cross-implementation parity (106 tests).** Eight comparison dimensions × 13 scenarios against frozen R DENR goldens. An independent implementation as oracle is the strongest evidence available here.
+2. **Meta-tests that the parity checks can fail (19).** `test_parity_harness.py` corrupts goldens deliberately — shifts bins by one, transposes the matrix, blanks the masks, splits equivalence classes — and asserts each comparison catches it. Without these a green parity suite could be vacuous.
+3. **Fast-path ≡ reference-path equivalence.** The lean L-BFGS-B driver is bit-identical to `scipy.optimize.minimize`; each fused closure equals its readable `objective`/`gradient` pair; the single-model fast path equals the general optimizer. This is what makes aggressive optimization safe without risking parity.
+4. **Analytic gradients vs finite differences**, for all three likelihoods × penalty combinations.
+5. **Known-truth recovery**, plus "error must fall as depth rises".
+6. **Every `FitStatus` reached deliberately**, asserting NaN-not-zero — §10 encoded as tests.
+7. **Findings pinned as regressions.** Every bug and surprise in the log has a test: the `ALL_ZERO` short-circuit, mask anchoring order, the uncached `mask()`, NB's naive formula, the pinning collapse, the ridge scaling law, `legacy_log`'s low-count misspecification.
+8. **Derived rather than magic constants** — e.g. shrinkage ≈ `2λa/n_bins` is asserted against its prediction, so the thresholds in neighbouring tests are interpretable.
+
+**Known gaps, deliberately.** No property-based testing (all example-based); no mutation testing, so coverage ≠ assertion quality; no real biological data — everything is synthetic or the R package's synthetic fixtures; no concurrency tests since there is no parallelism yet. The parity goldens also come from newer Bioconductor than the container, so parity is against a near-neighbour of the frozen reference, not the frozen reference itself.
+
+## Likelihood guidance (Gate B evidence)
+
+`scripts/validate_likelihoods.py` compares the objectives on prespecified regimes with contiguous held-out blocks and paired per-fold scoring (plan §17, Gate B). Stable across seeds:
+
+- **`transform="log"` — the reference's default — is badly misspecified once zeros are common.** At mean 0.5 counts/bin its held-out deviance is ~3.1 vs ~1.2 for everything else. A `y = 0` bin contributes `[log(1e-3) − log(μ+1e-3)]²` ≈ 38 at μ=0.5, so empty bins dominate and drag the fit toward zero. Prefer `transform="identity"` for sparse data.
+- **Poisson's edge over `legacy_identity` is small, and there is an exact reason.** The two estimating equations differ only by a weight `1/μ_b`, so when `μ` is constant on a model's support they are *the same equation*. For a single 0/1 column they are literally the same estimator (measured difference `0.000e+00`). **`bin_operation` rounding to 0/1 is what destroys the advantage** — with overlapping indicator columns `μ` takes just two values across a locus. So: **a graded design is a prerequisite for Poisson to pay off on accuracy**, and `shape.py` now supplies one.
+- **The old "≤1.12× ceiling, ~6% in SE" figure was wrong — see plan §17 (Gate B).** `Var(MSE)/Var(Poisson) = ΣM³ΣM/(ΣM²)²` is driven by **kurtosis, not range**: for a *uniform* `M` it is ~1.12 whether the range is 39× or 50×. A real pausing profile is the outlier case (one bin far above a flat remainder), where it is much larger. Measured on a reshaped design over 200 Poisson resamplings: binary → SE ratio **1.000** (identical estimators); reshaped, 14.3× range → **1.516**, against 1.526 predicted from that `M`. **The prize is ~50% in SE, not 6%** — but only on a graded design.
+- **Never ship a fixed penalty weight.** Relative shrinkage follows **`2λa/n_bins`** (verified within 25%), so `ridge(0.01)` is negligible at abundance ~1 and catastrophic at ~200 — held-out deviance 68.7 vs 1.06, winning 1% of folds. `λ ∝ 1/a` cancels the dependence. `--lambda2` has no nonzero default on purpose.
+
+## Shape profiles (plan §18)
+
+User-facing documentation is `docs/shape-profiles.md`. **Validated on the DENR authors' own simulator** (`nascentRNASim`, MIT, cloned into `_reference/`): `scripts/simulate_nascentrnasim.R` → `scripts/benchmark_shape_accuracy.py`. The paper has **no real-data gold standard** — §3.2 says so — so its own benchmark *is* this simulator, and it is reproducible. Two seeds, paper's masking, contig holdout, one global calibration constant removed per arm (§18.6):
+
+- **A shape profile is mostly NOT worth applying — five-seed paired result, §18.8.** Superseded an earlier two-seed "improves ranking" claim of mine. On multi-model loci, paired: dominant-isoform **wash** (0.53/0.50 share of discordant loci), magnitude **wash** (0.50), within-locus rho +0.022 but **sign-flips on 2/5 seeds**. The *only* effect replicating 5/5 is **~9% fewer models collapsing to exactly zero** (18.9%→17.1%) — and that is also what produced the apparent rho gain, since zeros are a bottom tie block (pooled rho +0.026 with zeros, +0.013 without, sign-unstable). **Best dominant-isoform accuracy of all four arms is `binary/legacy_log` — DENR's default, no profile (0.761).**
+- **The conditioning mechanism I proposed does not survive.** κ genuinely improves (7.44→4.98 median at multi-model loci) but that predicts a *within-locus* gain, and within-locus is exactly what's unstable. Better conditioning ≠ better accuracy here.
+- **What it's actually for:** fewer spurious zeros; and the profile *as a measurement* (pausing index, 5′:3′ ratio, cross-sample comparison) which needs no reweighting at all — fit it, inspect `profile.table()`, stop. That's the paper's own Supp Fig S5 and the most defensible use. **Guidance: fit and inspect; be skeptical about applying.** If applying, use `poisson` and multi-model loci only.
+- **Magnitudes don't improve, and that's not a defect — the estimand is a mean.** For `M ≡ 1`, `â = mean(y)`, unbiased for a mean-normalized truth *whatever the shape* (measured bias median **1.006**). A shared profile can only add misspecification: `â/a = ⟨g,p⟩/⟨p,p⟩`, and across-gene SD of the peak is **6.32** vs a shared `p(0)` of 4.06, while `p²` puts **26.7%** of its weight in the first 5% of the axis (uniform: 5.5%). The profile weights hardest where genes disagree most. What it buys is **conditioning** (median κ 7.44 → 4.98 at multi-model loci), which is why *ranking* improves. **At single-model loci shape is pure loss** — 4.5× worse error under LS, 2.4× under Poisson, no rho gain. Applying it only at multi-model loci is the obvious move and is **unvalidated** (a mixed design has two abundance scales, so the global calibration can't score it).
+- **A graded design is what makes the likelihood matter.** Poisson vs identity least squares: **−1 to −5%** isoform error on a binary design, **−26 to −42%** on a reshaped one. Mechanism is Gate B's: the profile puts a 4–5× weight on the first bin, unweighted least squares is dominated by the largest design entries, Poisson's `1/μ` is the correction. **So: use a shape profile with `poisson`, not least squares** — `shape/poisson` is the only arm that buys ranking without paying in magnitude.
+- **`span=0.4` is harmful, not just wasteful.** It drops isoform rho to 0.625, *below* the 0.673 of no profile at all; 0.05 raises it to 0.700.
+- Caveat: nascentRNASim gives every simulated isoform an archetype's profile — the assumption a shape correction encodes — so this benchmark flatters shape modeling. No real data yet; the paper's orthogonal PRO-seq/RNA-seq entropy comparison is dbGaP `phs002146.v1.p1` (controlled). Public K562 `GSE96869` / CD4+T `GSE85337` would work and haven't been run.
+
+The reference's shape profile crashes *and*, when it doesn't, does nothing. Both were reproduced against DENR 1.0.0 at `09d6cde`; §18 has the reproductions. The short version:
+
+- **`grep("+", names)` is a regex**, and `+` matches every string, so the reference's "plus-strand groups" is *all* groups. It then reads the minus groups from `bigwig_plus` too, so **`bigwig_minus` never contributes signal to the profile at all**. Every minus gene enters the smoother twice, both times antisense, once backwards. On 255 simulated genes: **116 of 174 training curves identically zero, fitted dynamic range 1.25× against a true 14.63×.** The profile multiplies the design by ~1.0 — it is inert, not broken. Untestable in the reference by construction: every one of its shape-profile tests passes the same BigWig for both strands.
+- **`min_percent_transcribed=0.8` is unsatisfiable on count data — this is the crash users hit.** `percent_transcribed` counts *bases* with ≥1 read (threshold hardcoded); PRO-seq 3′ counts are sparse, so on nascentRNASim output **1.07% of bases are nonzero** and the statistic peaks at 0.487. `transcript_shape_profile` therefore **fails outright on the authors' own simulator at their own defaults**. Lowering it doesn't help: at 0.4 exactly *one* gene survives and a loess profile is fitted from it silently.
+- **The published "U shape" is largely an artifact.** Third strand defect: minus BigWigs are conventionally negative (their simulator writes min −1122); `add_data` applies `abs()`, `transcript_shape_profile` doesn't, so min–max inverts every minus gene. Two bugs hide each other — the minus file is never opened, so the missing `abs()` only fires once you fix the dispatch. Same 57 genes: DENR 5′/3′ = 1.33 (symmetric U) vs **2.13 (5′-peaked)** with all three fixed.
+- **Two hard crashes.** `rescale_fixed_width_position` assigns a zero-length `seq` to `rescaled_pos[1:0]` ("replacement has length zero") whenever the tail is longer than the head and the gene is short; and `model_agreement` indexes a group table by `names(unlist(tx_grps))`, which is `"100_+.g227"` not `"100_+"`, so **any named input `GRanges` fails immediately** ("subscript contains invalid names"). It works only because `GenomicFeatures::transcripts()` happens to return unnamed ranges.
+- **`apply_shape_profile` was the prime suspect and is fine.** 700 fuzzed annotations found no crash and no misalignment. Don't spend time there. We still don't copy it: collapsing to equivalence classes first means a column has one geometry, so `Design.model_spans` (the **pre-mask** span, recorded at build time because masking destroys it) makes the mapping direct instead of needing the reference's averaged "expected range" plus `omit` bookkeeping.
+- **`span=0.4` is wrong even after the bugs are fixed.** A pausing peak maps to under 1/100 of the axis; span 0.4 gives bandwidth ~0.2. Measured against the unsmoothed cloud (empirical 9.29×): 0.4 → 2.38×, 0.05 → 5.59×, 0.02 → 8.47×. `ShapeConfig.span` defaults to **0.05**, with `min_bandwidth` floored at two head bins.
+- **A shape profile and TSS masking compete for the same bins.** Masking the first 10 kb of a 40 kb gene removes **89%** of the grading (14.30× → 1.60×). Report `shape.applied_dynamic_range(design)`, **not** `ShapeProfile.dynamic_range` — `build-design` prints it and warns below 1.2×.
+- Per-gene normalization is the **mean**, not min–max: min–max maps a silent gene to a constant 1.0 (the reference's `- 1e-6` guard) and lets the pause spike set the scale for the body. Silent genes are dropped and counted in `ShapeProfile.rejected`.
+- `min_length` defaults to `head_bases + tail_bases` and is validated against it. The reference defaults `min_transcript_length=8e3` below `head+tail=15e3`, so with *its* defaults every 8–15 kb gene contributes no body positions at all.
+- Reshaping yields a new design digest and sets `Design.shape_digest`; applying twice raises.
+
+## R parity workflow
+
+Golden values are frozen R output committed under `tests/fixtures/parity/`. Inputs are **generated by us** from `tests/fixtures/scenarios.py` and never copied from the R package, because its `LICENSE.md` (MIT) and `DESCRIPTION` (GPL ≥2) disagree about redistribution. R program output is not a derivative work, so committing it is fine; committing their `inst/extdata` fixtures would not be.
+
+```bash
+uv run python -m tests.fixtures.generate --output build/parity-inputs
+# then, inside the DENR container (the frozen reference environment):
+singularity exec denr_latest.sif Rscript scripts/export_r_golden.R     --inputs build/parity-inputs --output tests/fixtures/parity     --commit 09d6cde5ef7ad1a6eb140c6e25dbae91e2a9a819
+```
+
+A local R needs GenomicRanges, GenomicFeatures, rtracklayer and AnnotationDbi, none of which are installed on this machine — hence the container. See `tests/fixtures/parity/README.md`.
+
+`tests/test_parity_harness.py` exercises the comparison machinery against a golden generated from *our own* output. That validates the plumbing (column-major reshape, locus matching by geometry, 0-based mask indices) and proves the comparisons can actually fail; it says nothing about R agreement, and `test_synthetic_goldens_are_never_committed` stops such a fixture from ever masquerading as parity.
+
+## Design decisions already made (from the plan)
+
+These are deliberate departures from the R package; do not "restore" the R behavior without discussion.
+
+- **Reimplementation, not a translation.** Compatibility with the *published method* is required; legacy output conventions and silent-failure behavior are not.
+- **Identifiability is a first-class output.** Unique pre-RNA models, not annotation transcripts, are the primary estimands. Exactly duplicate design columns are collapsed before fitting, with a many-to-one transcript→model map preserved and `equivalence_class_size` reported. Never split an equivalence class's abundance across its transcripts in primary output.
+- **Failures never become zeros.** Every sample×locus fit returns an explicit status (`ok`, `all_zero`, `insufficient_bins`, `rank_deficient`, `nonconverged`, `numerical_error`, …). Invalid loci get `NaN` plus a reason. Solver convergence info, iteration count, gradient norm, and objective are retained — the R version discards them.
+- **Coordinates:** 0-based half-open internally and in BED-like output; GTF/GFF converted exactly once at the parser boundary; strand must be `+`/`-`; contig renaming explicit and recorded, never guessed.
+- **Separation of stages:** `build-design` / `count` / `fit` are distinct CLI commands so annotation geometry is computed once and reused across samples and cohorts. Any change to annotation, bin size, masking, TSS evidence, or shape profile must yield a new design digest.
+- **Multi-sample by construction:** one reusable `Design` against many `SampleCounts`; the R object holds one sample at a time.
+- **Fitting and normalization are separate operations.** `abundance_raw` always survives. Do not call a trimmed mean of fitted abundances "TMM" (the R package does; the plan explicitly forbids it).
+- **Likelihoods, staged:** legacy identity/log least-squares parity first, then nonnegative Poisson, then ridge/lasso/elastic-net/group penalties, then NB2 only if overdispersion validation justifies it. Poisson requires count-equivalent input — reject normalized/smoothed BigWigs for count likelihoods by default.
+- **Tabular layer is Polars, not pandas.** DataFrames live only at the boundaries (annotation parsing, result writing); data stays in NumPy/SciPy through fitting. Polars writes the Parquet outputs directly with `write_parquet(metadata=...)` for `schema_version`/digests. Pandas enters only via the optional AnnData adapter.
+- **`read_binned` is the single BigWig read path, and it normalizes sign and length itself.** Minus-strand BigWigs are conventionally negative; strand is carried on `SignalFile` and never inferred from sign, so a signed value is only a way to get a wrong answer. This lived in `count_sample` alone until `shape.py` read through `read_binned` directly and got neither correction — **487 of 487 minus-strand genes silently dropped**, invisible because every fixture wrote positive values on both strands (the same blind spot that hides the reference's strand bugs from *its* tests). Don't add a second reader.
+- **All BigWig access goes through `pybigtools`** — it is faster than `polars-bio`, O(bins) in memory regardless of input density, and needed anyway for header seqinfo. `values(chrom, start, end, bins=n, summary=..., exact=True, fillna=0)` is the aggregation call, and **both non-default flags are mandatory**: without `exact=True` it reads lossy zoom levels (250bp bins on the double-strand fixture give `[62.53, 69.53, ...]` vs. a true `[63, 68, ...]`, no error raised, small windows can coincidentally agree); without `fillna=0` uncovered positions come back `NaN` and a leaked `NaN` becomes a spurious numerical failure rather than a legitimate zero. Set both in one wrapper and test at several bin widths.
+- **No genomics interval library in core.** Locus grouping is a sort + cumulative-max sweep in plain Polars (5 lines), verified bit-identical to `polars-bio.merge` at 200k transcripts / 52k loci for `min_dist` 0/250/5000. GTF parsing is `scan_csv(separator="\t", comment_prefix="#")` + two `str.extract` calls — faster than `scan_gtf` (32ms vs 53ms/50k rows) and coordinate-identical. Masking is bin-index arithmetic, not interval joins. Reconsider `polars-bio` only for Phase 4 TSS-evidence overlap joins if `join_where` is too slow.
+- **A second, independent binning implementation exists as the test oracle**: `pybigtools.records()` streamed into a Polars fan-out, exact by construction. It agreed with the primary path to `max|diff| = 0.0`. If you ever collect that fanned frame eagerly, use `collect(engine="streaming")` — dense per-base input amplified 8k bins into 2M rows and 384MB RSS eagerly, ~0MB streamed. Long RLE runs are *not* the hazard (~1 row per bin).
+- **Single-model loci take a fast path**, because profiling showed ~91% of a median realistic locus (64 bins, 1 model) was L-BFGS-B scaffolding, not arithmetic. Identity has a closed form; log uses a bounded scalar search. Any change there must keep `test_single_model_fast_path_matches_general_optimizer` passing.
+- **Numba was evaluated and rejected** — see plan §14.1. It cannot beat BLAS on large loci (1.09×) and the small-loci win it does offer (2.5–3.3×) addresses the 9% of runtime that is arithmetic, not the 91% that was optimizer overhead.
+- **Count likelihoods need `summary="sum"`, but the parity default is `"mean"`.** `fit` raises rather than fitting a per-base density with a count likelihood — this is the most likely way to misuse the Poisson solver, since counts built with defaults look fine.
+- **The μ floor (`_glm.MU_FLOOR`) cannot move an interior optimum but does bound a boundary gradient that is truly infinite.** Consequence: **an L1 penalty cannot drive a model to exactly zero without a background**, because no finite penalty outweighs a divergent likelihood. Set `Exposure(background=...)` when sparsity is the goal.
+- **`inactive` models must be excluded from the support test, not just bounded.** Pinning a model leaves bins only it reached with no free model; treating them as usable drove μ→0 against nonzero counts and failed the whole locus. `usable_bins` takes `pinned` for this.
+- **Use `likelihood="quasi_poisson"` for overdispersed counts.** Same abundances as `"poisson"`, errors scaled by `sqrt(φ)` with φ pooled over every locus of every sample (a second pass after fitting). `abundance_standard_error` is **NaN where a Wald error is undefined** — a model at the nonnegativity boundary, or a singular information matrix — because a large finite number would invite an interval that does not exist. Legacy reports null: a sum of squares implies no variance model.
+- **`DispersionEstimate.is_overdispersed()` needs `z` standard errors of headroom**, not a bare `> 1`. The Pearson statistic's SE is `sqrt(2/df)` under the null, so a knife-edge test fires on ~half of Poisson datasets — it did, at 1.0215.
+- **NB2 is deprioritized.** It cannot change the point estimate on a binary design, at any dispersion. The identity-link score weights residuals by `1/V(μ)`; constant `μ` on the support makes that constant, so MSE, Poisson and NB2 agree to `0.000e+00` even at φ=3. Its value is *uncertainty*: Poisson SEs understate the true spread by 23–64% for φ = 0.1–1.0. But **we emit no standard errors**, so NB is currently unrealized — and **quasi-Poisson (one scalar, `sqrt(Pearson χ²/df)`) matches NB2 to within 1–4%** without a second likelihood. See plan Gate D before investing further in NB.
+- **NB2 is not an outlier-robust estimator.** Its score is the GLM form `Σ M(μ−y)/V(μ)` — the residual enters linearly and drives the fit, but the weight `1/V(μ)` depends only on the fitted mean, so influence is unbounded and one spike pulls NB about as hard as Poisson. Weighting *by* the residual is not available in ML: the weight is fixed by the variance function, and any `y`-dependent weight breaks `E[w(y)(y−μ)] = 0`. Bounded influence means M-estimation, a different estimator. Adopt NB for calibrated uncertainty, not point estimates.
+- **NB2 with the identity link is not globally convex** — zero-count bins are always concave (`f''= −r/(μ+r)²`), so it does *not* inherit Poisson's guarantee. Both count solvers carry a mean-collapse guard (`MU_FLOOR_CHECK`); NB needs it more, and lacked it until a pathological start returned zeros as a converged fit.
+- **NB dispersion is never fitted per locus** (plan §4.3). `estimate_dispersion` pools across loci from a completed Poisson fit; `fit(likelihood="negative_binomial")` demands an explicit value.
+- **Masking has two forms.** `mask_tss`/`mask_pas` take **bases** along the direction of transcription and are preferred; `mask_start_bins`/`mask_end_bins` take bin counts and exist for R parity. Mutually exclusive. Bin counts make the masked span depend on `bin_size` — 4 bins is 400bp at 100 and 2000bp at 500.
+- **The mask is a union over every transcript in a locus, and has to be.** Masking says "signal in this bin is untrustworthy", a property of the bin not of a model; an initiation spike contaminates the bin for every transcript through it. Cost is real and now reported: the reference's ±4 bins discards **22.7% of all bins** on the benchmark. See `Design.masked_fraction`, `heavily_masked_loci`, and `locus_qc.masked_bin_fraction`.
+- **`locus_qc.total_observed` is fit-bin signal, not coverage.** Masked bins are zeroed in place, so `total_observed_all_bins` (recorded pre-mask in `SampleCounts.totals_all_bins`) is the one to use for coverage.
+- **The reference's "counts" are mean per-base coverage, not counts.** R's `add_data` hardcodes `summary_operation <- "mean"`, so DENR abundances are polymerase *density*. `count_sample` therefore defaults to `summary="mean"`; a `sum` summary gave exactly `bin_size` times R's values. Poisson/NB will need `"sum"`, and `require_count_equivalent` rejects the `mean` + count-likelihood combination.
+- **R aborts on an unknown contig; we do not.** `assert_chromosome_exists` kills an entire DENR run over one bad contig name. We record `missing_contig` for that locus and continue. The `absent_contig` scenario documents this and is excluded from parity coverage since R cannot produce a golden for it.
+- **Two verified `pybigtools` *writer* quirks**, worked around in `tests/fixtures/scenarios.py`: a BigWig written with zero intervals is unreadable (`BBIReadError`), and contigs passed in the size map but carrying no interval are **dropped from the header**. Since the header is what separates `missing_contig` from `all_zero`, a fixture needs an explicit zero-valued placeholder base on every declared contig.
+- **Shape profiles are implemented, not a non-goal.** `Design.model_spans` holds the **pre-mask** occupied span per model, because masking destroys it and the profile needs a position along the transcript. Any new per-locus accessor must index, never scan (`model_span` follows `mask`).
+- **Non-goals for v1:** Gviz plotting, TxDb download/caching, the legacy TSS CNN, de novo transcript discovery.
+
+Target module layout, phase breakdown, output schemas (`model_abundance.parquet`, `transcript_model_map.parquet`, `locus_qc.parquet`, `normalization_factors.parquet`), and decision gates are all specified in the plan — follow it rather than re-deriving.
+
+## Licensing caveat
+
+`dienr` is MIT (© 2026 Adam Youlin He). The R reference has **conflicting** metadata: `_reference/DENR/LICENSE.md` says MIT, `_reference/DENR/DESCRIPTION` says GPL (≥2). Until that is resolved with the upstream maintainers, implement from the paper, the README methodology section, and observed fixture behavior — do not copy or line-by-line adapt R source into this repository.

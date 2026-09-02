@@ -1,0 +1,84 @@
+# --- dienr-specific --------------------------------------------------------
+
+# Frozen R reference implementation: a nested git clone, kept locally as the
+# behavioral reference. Not vendored because its LICENSE.md (MIT) and
+# DESCRIPTION (GPL >=2) disagree; see plan Phase 0.
+_reference/
+
+# Scratch notebooks and profiling output
+*.prof
+scratch/
+
+# --- Python ----------------------------------------------------------------
+
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+sdist/
+wheels/
+share/python-wheels/
+*.egg
+*.egg-info/
+.installed.cfg
+MANIFEST
+
+# Environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Test and coverage
+.pytest_cache/
+.tox/
+.nox/
+.cache
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+nosetests.xml
+
+# Type checkers and linters
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+.pyre/
+.pytype/
+
+# Notebooks
+.ipynb_checkpoints
+profile_default/
+ipython_config.py
+
+# Docs
+docs/_build/
+site/
+
+# --- Editors and OS --------------------------------------------------------
+
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Cursor: `.cursorignore` excludes files from AI features. Recommended for
+# sensitive data. https://docs.cursor.com/context/ignore-files
+.cursorignore
+.cursorindexingignore
+
+# ignore generated parity inputs
+build/
