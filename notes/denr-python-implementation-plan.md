@@ -1140,6 +1140,60 @@ Recommend a penalty only if it improves replicate or bootstrap stability and sim
 
 Ship NB as a supported model only if overdispersion is reproducible, dispersion can be estimated stably, and held-out prediction improves materially over Poisson.
 
+**Verdict on the criterion as written: no, and it cannot be met on this design.
+But the criterion is the wrong one.**
+
+NB2 cannot improve the point estimate here, and not marginally — at all. The
+identity-link score weights each residual by ``1 / V(mu)``, so when ``mu`` is
+constant across a model's support that weight factors out and the estimating
+equation reduces to the sample mean *whatever the variance function is*.
+Measured on a single 0/1 column, least squares, Poisson and NB2 agree to
+``0.000e+00`` at dispersion 0.3 and again at 3.0. Severe overdispersion changes
+nothing, because the variance function is algebraically irrelevant to the
+estimate. "Held-out prediction improves materially over Poisson" is therefore
+unachievable by construction, and holding NB to it would reject it for the
+wrong reason.
+
+**What NB2 is actually for is the uncertainty, and there the gap is large.**
+With constant ``mu`` the model-based standard error is ``sqrt(V(mu) / n)``, so
+Poisson reports ``sqrt(a/n)`` while the truth is ``sqrt(a(1 + phi a)/n)``.
+Against the observed spread of 4000 replicate estimates:
+
+| dispersion | true SD | Poisson SE | NB2 SE | Poisson error |
+|---|---|---|---|---|
+| 0.0 | 0.416 | 0.418 | 0.418 | +1% |
+| 0.1 | 0.542 | 0.419 | 0.546 | **-23%** |
+| 0.3 | 0.737 | 0.418 | 0.735 | **-43%** |
+| 1.0 | 1.175 | 0.417 | 1.178 | **-64%** |
+
+A Poisson-only pipeline is therefore not wrong about abundance but badly
+overconfident about it, by up to a factor of three in variance. Anything
+downstream that ranks or tests — differential expression, intervals, thresholds
+on effect size — inherits that overconfidence.
+
+**Two consequences, and the second undercuts NB2 specifically.**
+
+1. **NB2's value is unrealized in the current output.** We emit no standard
+   error or variance anywhere, so `fit(likelihood="negative_binomial")` today
+   returns the same abundance as Poisson with a different objective value —
+   close to useless. Adding a variance column to `model_abundance` is the
+   prerequisite for NB to be worth selecting at all, and is a smaller change
+   than NB2 itself was.
+2. **Quasi-Poisson matches NB2 here, far more cheaply.** Inflating the Poisson
+   standard error by ``sqrt(Pearson chi2 / df)`` — one scalar from a Poisson
+   fit — tracked the true spread to within 1-4% across dispersions 0.1 to 1.0,
+   indistinguishable from NB2's 1-2%. That is expected rather than lucky: for
+   constant ``mu`` the Pearson statistic estimates ``1 + phi mu``, which is
+   exactly the NB2 inflation factor.
+
+So the honest recommendation is to **report quasi-Poisson standard errors from
+the Poisson fit, and treat NB2 as optional**. QP needs no second likelihood, no
+dispersion held fixed per fit, no non-convex objective, and no mean-collapse
+guard — all of which NB2 required. NB2 earns its place only where ``mu`` varies
+enough across a locus that the full variance function matters for the estimate
+too, which on a rounded binary design it does not, and which brings this back
+to the shape-profile prerequisite recorded under Gate B.
+
 ## 18. Definition of done for version 1.0
 
 Version 1.0 is complete when:

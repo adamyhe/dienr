@@ -425,3 +425,61 @@ def test_nb_validates_the_inactive_shape(design):
     observed = simulate_poisson(design, np.array([5.0, 5.0]), seed=61)
     with pytest.raises(ValueError, match="inactive must have shape"):
         nb.fit_locus(design, observed, dispersion=0.2, inactive=np.array([True]))
+
+
+# --- what NB2 does and does not buy ----------------------------------------
+
+
+@pytest.mark.parametrize("dispersion", [0.3, 3.0])
+def test_nb_poisson_and_least_squares_coincide_on_a_binary_design(dispersion):
+    """NB2 cannot improve the point estimate on a 0/1 design, at any dispersion.
+
+    For an identity link the score weights each residual by ``1 / V(mu)``. When
+    ``mu`` is constant across a model's support that weight factors out, so the
+    estimating equation reduces to the sample mean *whatever the variance
+    function is*. Poisson and NB2 therefore give bit-identical answers to plain
+    least squares here, even under severe overdispersion.
+
+    This is the sharper form of the Gate B result: the limitation is the binary
+    design, not the choice of likelihood.
+    """
+    from dienr.solvers import legacy, poisson
+
+    matrix = np.zeros((60, 1))
+    matrix[10:50, 0] = 1.0
+    rng = np.random.default_rng(0)
+
+    for _ in range(25):
+        observed = simulate_nb(matrix, np.array([7.0]), dispersion, seed=int(rng.integers(1e6)))
+        mse = legacy.fit_locus(matrix, observed, transform="identity").abundance[0]
+        pois = poisson.fit_locus(matrix, observed).abundance[0]
+        nb2 = nb.fit_locus(matrix, observed, dispersion=dispersion).abundance[0]
+        assert pois == pytest.approx(mse, abs=1e-9)
+        assert nb2 == pytest.approx(mse, abs=1e-9)
+        assert nb2 == pytest.approx(observed.sum() / 40.0, rel=1e-6)
+
+
+def test_poisson_standard_error_understates_overdispersed_spread():
+    """What NB2 *is* for, and the reason a Poisson-only pipeline misleads.
+
+    The estimates agree, but the uncertainty does not. With identity link and
+    constant mu the model-based standard error is ``sqrt(V(mu) / n)``, so
+    Poisson reports ``sqrt(a/n)`` while the truth is ``sqrt(a(1 + phi a)/n)``.
+    At phi = 1 and a = 7 that is an understatement of about 60%.
+    """
+    n_support, truth = 40, 7.0
+    matrix = np.zeros((60, 1))
+    matrix[10:50, 0] = 1.0
+
+    for dispersion, min_understatement in ((0.3, 0.30), (1.0, 0.50)):
+        estimates = [
+            simulate_nb(matrix, np.array([truth]), dispersion, seed=s).sum() / n_support
+            for s in range(600)
+        ]
+        true_sd = float(np.std(estimates))
+        mean_estimate = float(np.mean(estimates))
+        poisson_se = np.sqrt(mean_estimate / n_support)
+        nb_se = np.sqrt(mean_estimate * (1 + dispersion * mean_estimate) / n_support)
+
+        assert 1 - poisson_se / true_sd > min_understatement
+        assert nb_se == pytest.approx(true_sd, rel=0.15)
