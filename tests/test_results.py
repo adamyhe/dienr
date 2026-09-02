@@ -334,3 +334,120 @@ def test_count_sample_records_pre_mask_totals(extdata):
     counts = count_sample(design, "s", SignalFile(extdata / "test_double_strand_plus.bw", "+"))
     # The masked bins carried signal, so the pre-mask total must be larger.
     assert counts.totals_all_bins[0] > counts.values[0].sum()
+
+
+# --- likelihood selection ---------------------------------------------------
+
+
+def count_equivalent_counts(design, sample_id="s1", truth_scale=50.0, seed=0):
+    """Counts recorded as if extracted with summary='sum'."""
+    rng = np.random.default_rng(seed)
+    values = [
+        rng.poisson(design.models[i] @ np.full(design.models[i].shape[1], truth_scale)).astype(
+            float
+        )
+        for i in range(design.n_loci)
+    ]
+    return SampleCounts(
+        sample_id=sample_id,
+        values=values,
+        locus_status=[FitStatus.OK] * design.n_loci,
+        design_digest=design.digest,
+        totals_all_bins=[float(v.sum()) for v in values],
+        provenance={
+            "summary": "sum",
+            "signal_files": [{"path": "x.bw", "strand": "+", "value_kind": "raw"}],
+        },
+    )
+
+
+def test_poisson_likelihood_runs_end_to_end(design):
+    from dienr.solvers import penalties
+
+    counts = count_equivalent_counts(design)
+    result = fit(design, counts, likelihood="poisson", penalty=penalties.ridge(0.01))
+    assert result.summary.n_failures == 0
+    assert result.provenance["likelihood"] == "poisson"
+    assert result.provenance["penalty_type"] == "ridge"
+    assert result.provenance["penalty_lambda2"] == 0.01
+
+
+def test_negative_binomial_runs_end_to_end(design):
+    counts = count_equivalent_counts(design, seed=1)
+    result = fit(design, counts, likelihood="negative_binomial", dispersion=0.2)
+    assert result.summary.n_failures == 0
+    assert result.provenance["dispersion"] == 0.2
+
+
+def test_mean_summary_is_rejected_for_count_likelihoods(design):
+    """The default extraction is a per-base mean, for R parity. Guard it.
+
+    Without this check the most likely way to misuse the Poisson solver is to
+    build counts with the default settings and hand them straight over.
+    """
+    counts = count_equivalent_counts(design)
+    counts.provenance["summary"] = "mean"
+    with pytest.raises(ValueError, match="per-base density"):
+        fit(design, counts, likelihood="poisson")
+
+
+def test_transformed_signal_is_rejected_for_count_likelihoods(design):
+    counts = count_equivalent_counts(design)
+    counts.provenance["signal_files"] = [
+        {"path": "x.bw", "strand": "+", "value_kind": "library_normalized"}
+    ]
+    with pytest.raises(ValueError, match="untransformed counts"):
+        fit(design, counts, likelihood="poisson")
+
+
+def test_nb_without_dispersion_is_rejected(design):
+    counts = count_equivalent_counts(design)
+    with pytest.raises(ValueError, match="requires an explicit dispersion"):
+        fit(design, counts, likelihood="negative_binomial")
+
+
+def test_penalty_on_the_legacy_solver_is_rejected(design):
+    """The reference rejects a nonzero lambda too; do not silently ignore one."""
+    from dienr.solvers import penalties
+
+    with pytest.raises(ValueError, match="takes no penalty"):
+        fit(design, synthetic_counts(design), penalty=penalties.ridge(0.1))
+
+
+def test_unknown_likelihood_is_rejected(design):
+    with pytest.raises(ValueError, match="likelihood must be"):
+        fit(design, synthetic_counts(design), likelihood="gaussian")
+
+
+def test_bin_exposure_is_legacy_incompatible(design):
+    with pytest.raises(ValueError, match="only to the count likelihoods"):
+        fit(design, synthetic_counts(design), use_bin_exposure=True)
+
+
+def test_bin_exposure_is_passed_through(design):
+    counts = count_equivalent_counts(design, seed=2)
+    result = fit(design, counts, likelihood="poisson", use_bin_exposure=True)
+    assert result.provenance["use_bin_exposure"] is True
+    assert result.summary.n_failures == 0
+
+
+def test_dispersion_estimated_from_a_poisson_fit_feeds_the_nb_fit(design):
+    """The two-stage procedure section 4.3 prescribes, wired end to end."""
+    from dienr.solvers import negative_binomial as nbmod
+
+    counts = count_equivalent_counts(design, seed=3)
+    poisson_result = fit(design, counts, likelihood="poisson")
+    assert poisson_result.summary.n_failures == 0
+
+    triples = []
+    for locus_id in range(design.n_loci):
+        abundance = (
+            poisson_result.model_abundance.filter(pl.col("locus_id") == locus_id)
+            .sort("model_index")["abundance_raw"]
+            .to_numpy()
+        )
+        triples.append((design.models[locus_id], counts.values[locus_id], abundance))
+
+    estimate = nbmod.estimate_dispersion(triples)
+    # Poisson-simulated data: little or no overdispersion, so Poisson stands.
+    assert estimate.dispersion < 0.05

@@ -119,6 +119,25 @@ Requirements:
 
 With fixed nonnegative design, exposure, and background, the Poisson objective with nonnegativity and L1/L2 penalties remains convex. Rank deficiency can still make individual parameters non-identifiable, so model collapsing and diagnostics remain necessary.
 
+Three implementation findings from building this, all with tests:
+
+- **An L1 penalty cannot drive a model to exactly zero without a background.**
+  A bin with nonzero counts reachable only by model ``k`` makes the negative log
+  likelihood diverge as ``a_k -> 0``, so no finite penalty outweighs it. This is
+  correct Poisson behavior, not a solver limitation; sparsity requires a
+  background term that keeps ``mu > 0`` without the model. The numerical mean
+  floor bounds that otherwise-infinite boundary gradient, so the penalty weight
+  at which L1 *appears* to win without a background is an artifact of the
+  constant and must not be read as a modeling statement.
+- **Pinning a model inactive requires excluding the bins only it reached.**
+  Otherwise those bins carry ``mu = 0`` against nonzero counts and abort the
+  locus, which made inactive-transcript filtering unusable with a count
+  likelihood until support was judged on the free columns alone.
+- **Nonnegativity makes lasso smooth.** Since ``a >= 0``, the L1 term is
+  ``lambda_1 sum a_k``, which is linear and differentiable in the feasible
+  region. Ridge, lasso and elastic net therefore all run through the same
+  L-BFGS-B driver with no proximal operator.
+
 ### 4.3 Negative-binomial objective
 
 Add an NB2 model only after the Poisson implementation is validated:
@@ -128,6 +147,30 @@ Add an NB2 model only after the Poisson implementation is validated:
 \]
 
 Initial versions should estimate dispersion across many loci or borrow it across replicates. Do not estimate an unconstrained dispersion separately for every small locus. Compare Poisson, quasi-Poisson, and NB predictive performance before making NB the default.
+
+Implemented as the two-stage procedure this describes: `estimate_dispersion`
+pools the moment relation ``E[(y - mu)^2 - mu] = phi mu^2`` across every locus
+of a completed Poisson fit and returns one shared value, which `fit_locus` then
+holds fixed. It refuses to run without an explicit dispersion, so per-locus
+estimation cannot happen by accident. `compare_dispersion_models` reports the
+pooled NB2 dispersion beside the quasi-Poisson Pearson statistic, which is the
+comparison Gate D needs.
+
+Two findings that bear on Gate D, and both argue for keeping NB low priority:
+
+- **NB2 is not an outlier-robust estimator, and should not be presented as one.**
+  Its score weights bin ``b`` by ``r / (mu_b (r + mu_b))``, which depends on the
+  fitted mean and not on how far the observation lies from it. Bins sharing a
+  fitted mean share a weight, so a single large excursion pulls an NB2 fit
+  essentially as hard as it pulls a Poisson fit. What NB2 changes is the
+  variance function and therefore inference. Where fitted means differ across a
+  locus it does reallocate abundance materially; where they are flat, Poisson
+  and NB2 agree to within a few percent.
+- **The textbook NB2 likelihood is numerically unusable at small dispersion.**
+  ``(y + r) log(r + mu) - r log r`` cancels two large numbers once ``r`` is
+  large, and the naive form fails to reproduce the Poisson limit at all. The
+  implementation uses the algebraically identical
+  ``r log1p(mu/r) + y log1p(r/mu)``, which is stable and does reproduce it.
 
 ### 4.4 Regularization
 

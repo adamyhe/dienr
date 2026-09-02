@@ -13,6 +13,12 @@ Typical use::
     result = dienr.fit(design, counts)
     result.write("results/")
 
+Three likelihoods are available through `fit`. ``"legacy"`` is the default and
+the only one checked against R DENR. ``"poisson"`` and ``"negative_binomial"``
+require count-equivalent input, so counts must be extracted with
+``summary="sum"`` rather than the parity default of ``"mean"``; `fit` rejects
+the mismatch rather than quietly fitting a density.
+
 Coordinates are 0-based half-open throughout; see `dienr.annotation` for the
 single conversion point.
 """
@@ -24,7 +30,10 @@ from .diagnostics import LocusConditioning, assess
 from .loci import assign_loci, locus_table
 from .pipeline import fit, status_report
 from .results import SCHEMA_VERSION, FitResult, RunSummary, collect_results
+from .solvers import negative_binomial, penalties, poisson
+from .solvers._glm import Exposure
 from .solvers.legacy import LocusFit, fit_locus
+from .solvers.penalties import NO_PENALTY, Penalty
 from .status import FitStatus, is_failure
 
 __version__ = "0.1.0.dev0"
@@ -34,10 +43,13 @@ __all__ = [
     "Annotation",
     "Design",
     "DesignConfig",
+    "NO_PENALTY",
+    "Exposure",
     "FitResult",
     "FitStatus",
     "LocusConditioning",
     "LocusFit",
+    "Penalty",
     "RunSummary",
     "SampleCounts",
     "SignalFile",
@@ -52,6 +64,9 @@ __all__ = [
     "fit_locus",
     "is_failure",
     "locus_table",
+    "negative_binomial",
+    "penalties",
+    "poisson",
     "read_annotation",
     "read_binned",
     "status_report",

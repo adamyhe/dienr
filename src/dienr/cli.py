@@ -24,6 +24,7 @@ from .counts import VALUE_KINDS, SignalFile, count_sample
 from .design import Design, build_design
 from .pipeline import fit, status_report
 from .results import FitResult
+from .solvers.penalties import Penalty
 
 #: Filename for a serialized `Design` inside a design directory.
 DESIGN_FILENAME = "design.pkl"
@@ -113,7 +114,33 @@ def build_parser() -> argparse.ArgumentParser:
     fit_parser.add_argument("--design", required=True, type=Path)
     fit_parser.add_argument("--counts", required=True, type=Path)
     fit_parser.add_argument("--output", required=True, type=Path)
+    fit_parser.add_argument(
+        "--likelihood",
+        choices=("legacy", "poisson", "negative_binomial"),
+        default="legacy",
+        help="legacy least squares (default, the only one with R parity), "
+        "Poisson, or NB2 at a fixed dispersion",
+    )
     fit_parser.add_argument("--transform", choices=("log", "identity"), default="log")
+    fit_parser.add_argument(
+        "--penalty",
+        choices=("none", "ridge", "lasso", "elastic_net"),
+        default="none",
+        help="count likelihoods only; recorded in the output",
+    )
+    fit_parser.add_argument("--lambda1", type=float, default=0.0, help="L1 weight")
+    fit_parser.add_argument("--lambda2", type=float, default=0.0, help="L2 weight")
+    fit_parser.add_argument(
+        "--dispersion",
+        type=float,
+        default=None,
+        help="shared NB2 dispersion; required for --likelihood negative_binomial",
+    )
+    fit_parser.add_argument(
+        "--use-bin-exposure",
+        action="store_true",
+        help="treat effective bin length as exposure (count likelihoods only)",
+    )
     fit_parser.add_argument(
         "--inactive-transcripts",
         type=Path,
@@ -240,7 +267,16 @@ def cmd_fit(args: argparse.Namespace) -> int:
             if line.strip()
         }
 
-    result = fit(design, samples, transform=args.transform, inactive_transcripts=inactive)
+    result = fit(
+        design,
+        samples,
+        likelihood=args.likelihood,
+        transform=args.transform,
+        penalty=Penalty(kind=args.penalty, lambda1=args.lambda1, lambda2=args.lambda2),
+        dispersion=args.dispersion,
+        use_bin_exposure=args.use_bin_exposure,
+        inactive_transcripts=inactive,
+    )
     result.write(args.output)
     return _report(result, args.max_failure_fraction)
 
