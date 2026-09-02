@@ -324,3 +324,114 @@ def test_subbin_start_does_not_shift_the_mask_on_minus_strand():
     # On the minus strand the 5' end is the high coordinate. 'early' ends at
     # 4790, which is 40 bases into bin 19, so it anchors there rather than 18.
     assert n_bins - 1 in masked
+
+
+# --- base-specified masking -------------------------------------------------
+
+
+def test_base_window_masks_by_genomic_overlap():
+    """A bin is masked when it overlaps the base window around the TSS."""
+    design = build_design(
+        annotation([("tx", "chr1", 1000, 6000, "+")]),
+        bin_size=250,
+        mask_tss=(0, 500),
+    )
+    # Locus starts at 1000, so bins are [1000,1250), [1250,1500), [1500,1750)...
+    # The window is [1000, 1501), overlapping bins 0, 1 and 2.
+    assert np.flatnonzero(design.mask(0)).tolist() == [0, 1, 2]
+
+
+def test_base_window_is_symmetric_on_both_strands():
+    """`(u, d)` runs along transcription, so equal values mask equally."""
+    plus = build_design(
+        annotation([("tx", "chr1", 2000, 8000, "+")]), bin_size=250, mask_tss=(500, 500)
+    )
+    minus = build_design(
+        annotation([("tx", "chr1", 2000, 8000, "-")]), bin_size=250, mask_tss=(500, 500)
+    )
+    assert plus.mask(0).sum() == minus.mask(0).sum()
+    # Mirrored: the plus TSS is at the low end, the minus TSS at the high end.
+    assert plus.mask(0).tolist() == minus.mask(0)[::-1].tolist()
+
+
+@pytest.mark.parametrize("bin_size", [100, 125, 250, 500])
+def test_base_window_masks_a_consistent_span_across_bin_sizes(bin_size):
+    """The point of base units: the masked span does not drift with bin_size.
+
+    A bin-count mask of 4 bins means 400bp at bin_size 100 and 2000bp at 500.
+    A base window covers the same genomic extent either way, up to at most one
+    bin of overhang at each end.
+
+    A flanking transcript is included so the locus extends upstream of the TSS
+    under test; without it the upstream half of the window would fall outside
+    the locus, where there are no bins to mask.
+    """
+    design = build_design(
+        annotation([("flank", "chr1", 0, 40_000, "+"), ("tx", "chr1", 10_000, 40_000, "+")]),
+        bin_size=bin_size,
+        mask_tss=(1000, 1000),
+    )
+    bins = design.bins.filter(pl.col("masked") & (pl.col("start") > 5_000)).sort("start")
+    span = int(bins["end"].max() - bins["start"].min())
+    # The requested window is 2001bp; overhang is bounded by one bin per side.
+    assert 2001 <= span <= 2001 + 2 * bin_size
+
+
+def test_base_window_is_clipped_to_the_locus():
+    """Bins exist only within the locus, so a window can extend past them.
+
+    An isolated transcript's locus begins at its own TSS, so an upstream mask
+    has nothing to act on. That is not a silent loss: there is no data outside
+    the locus to discard. It does mean an upstream window only bites when some
+    other transcript extends the locus further back.
+    """
+    isolated = build_design(
+        annotation([("tx", "chr1", 10_000, 20_000, "+")]),
+        bin_size=250,
+        mask_tss=(5_000, 0),
+    )
+    # Window [5000, 10001) covers only bin 0, the one containing the TSS.
+    assert np.flatnonzero(isolated.mask(0)).tolist() == [0]
+
+    extended = build_design(
+        annotation([("upstream", "chr1", 4_000, 20_000, "+"), ("tx", "chr1", 10_000, 20_000, "+")]),
+        bin_size=250,
+        mask_tss=(5_000, 0),
+    )
+    # Now the locus starts at 4000, so the same window reaches real bins.
+    assert extended.mask(0).sum() > 1
+
+
+def test_base_window_union_across_isoforms():
+    """Masking is a per-bin decision, so windows union across transcripts."""
+    design = build_design(
+        annotation([("early", "chr1", 0, 5000, "+"), ("late", "chr1", 2000, 5000, "+")]),
+        bin_size=250,
+        mask_tss=(0, 250),
+    )
+    masked = np.flatnonzero(design.mask(0)).tolist()
+    # 'early' TSS at 0 masks bins 0-1; 'late' TSS at 2000 masks bins 8-9.
+    assert masked == [0, 1, 8, 9]
+
+
+def test_masked_fraction_and_heavy_locus_reporting():
+    design = build_design(
+        annotation([("tx", "chr1", 0, 1000, "+")]), bin_size=250, mask_tss=(0, 500)
+    )
+    # 3 of 4 bins masked.
+    assert design.masked_fraction(0) == pytest.approx(0.75)
+    assert design.heavily_masked_loci(threshold=0.5).height == 1
+    assert design.heavily_masked_loci(threshold=0.9).height == 0
+
+
+def test_mixing_base_and_bin_masking_is_rejected():
+    """Two ways to say the same thing must not be combined silently."""
+    with pytest.raises(ValueError, match="cannot be combined"):
+        DesignConfig(mask_start_bins=(2, 0), mask_tss=(1000, 1000))
+
+
+def test_base_masking_changes_the_design_digest():
+    rows = [("tx", "chr1", 0, 5000, "+")]
+    base = build_design(annotation(rows), bin_size=250)
+    assert build_design(annotation(rows), bin_size=250, mask_tss=(500, 500)).digest != (base.digest)
+    assert build_design(annotation(rows), bin_size=250, mask_pas=(500, 500)).digest != (base.digest)

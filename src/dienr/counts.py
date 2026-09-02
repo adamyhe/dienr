@@ -111,6 +111,11 @@ class SampleCounts:
         locus_status: Per-locus status assigned during extraction. Only
             `FitStatus.MISSING_CONTIG` and `FitStatus.ALL_ZERO` originate here;
             everything else is decided by the solver.
+        totals_all_bins: Per-locus signal summed over *all* bins, before
+            masking zeroed any of them. Kept because `values` is masked in
+            place, so the unmasked total is otherwise unrecoverable, and
+            reporting only the masked total would understate observed coverage
+            at loci where masking removed a lot.
         design_digest: Digest of the `Design` these counts were built against.
         provenance: Free-form record of inputs and reader settings.
         exposure: Optional known scaling factor for the sample, such as a
@@ -122,6 +127,7 @@ class SampleCounts:
     values: list[np.ndarray]
     locus_status: list[FitStatus]
     design_digest: str
+    totals_all_bins: list[float] = field(default_factory=list)
     provenance: dict = field(default_factory=dict)
     exposure: float = 1.0
 
@@ -234,6 +240,7 @@ def count_sample(
 
     values: list[np.ndarray] = [np.empty(0) for _ in range(design.n_loci)]
     statuses: list[FitStatus] = [FitStatus.OK] * design.n_loci
+    totals: list[float] = [float("nan")] * design.n_loci
 
     for locus in design.loci.iter_rows(named=True):
         locus_id = locus["locus_id"]
@@ -267,9 +274,11 @@ def count_sample(
         if raw.size < n_bins:
             raw = np.concatenate([raw, np.zeros(n_bins - raw.size)])
 
-        raw[design.mask(locus_id)] = 0.0
         # Minus-strand BigWigs are conventionally negative; magnitude is the count.
         np.abs(raw, out=raw)
+        # Record the total before masking; after this the masked bins are gone.
+        totals[locus_id] = float(raw.sum())
+        raw[design.mask(locus_id)] = 0.0
         values[locus_id] = raw
         if not raw.any():
             statuses[locus_id] = FitStatus.ALL_ZERO
@@ -279,6 +288,7 @@ def count_sample(
         values=values,
         locus_status=statuses,
         design_digest=design.digest,
+        totals_all_bins=totals,
         provenance={
             "signal_files": [
                 {"path": str(f.path), "strand": f.strand, "value_kind": f.value_kind} for f in files

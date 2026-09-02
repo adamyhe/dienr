@@ -52,6 +52,14 @@ class DesignConfig:
             occupied bin and run into the transcript; "outside" bins run away
             from it.
         mask_end_bins: The same at the 3' end.
+        mask_tss: ``(upstream, downstream)`` bases masked around each
+            transcript's TSS, measured along the direction of transcription. A
+            bin is masked when it overlaps that genomic window. Preferred over
+            `mask_start_bins`: the masked span is then a fixed number of bases
+            rather than a count of bins, so it does not change meaning when
+            `bin_size` changes and does not jitter by up to a bin depending on
+            where the TSS happens to fall inside one.
+        mask_pas: The same around the PAS.
         bin_operation: How fractional bin occupancies are rounded before
             equivalence testing.
     """
@@ -60,6 +68,8 @@ class DesignConfig:
     distance: int | None = None
     mask_start_bins: tuple[int, int] = (0, 0)
     mask_end_bins: tuple[int, int] = (0, 0)
+    mask_tss: tuple[int, int] | None = None
+    mask_pas: tuple[int, int] | None = None
     bin_operation: BinOperation = "round"
 
     def __post_init__(self) -> None:
@@ -74,8 +84,31 @@ class DesignConfig:
             value = getattr(self, name)
             if len(value) != 2 or any(v < 0 for v in value):
                 raise ValueError(f"{name} must be two non-negative integers, got {value!r}")
+        for name in ("mask_tss", "mask_pas"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if len(value) != 2 or any(v < 0 for v in value):
+                raise ValueError(f"{name} must be two non-negative integers, got {value!r}")
+        if self.uses_base_windows and self.uses_bin_counts:
+            raise ValueError(
+                "mask_tss/mask_pas (bases) and mask_start_bins/mask_end_bins "
+                "(bin counts) are alternative ways to specify the same masking "
+                "and cannot be combined. Use the base form unless you need "
+                "parity with the R reference."
+            )
         if self.distance is not None and self.distance < 0:
             raise ValueError(f"distance must be non-negative, got {self.distance}")
+
+    @property
+    def uses_bin_counts(self) -> bool:
+        """True when masking is specified as bin counts, the legacy form."""
+        return any(self.mask_start_bins) or any(self.mask_end_bins)
+
+    @property
+    def uses_base_windows(self) -> bool:
+        """True when masking is specified as base windows."""
+        return self.mask_tss is not None or self.mask_pas is not None
 
     @property
     def effective_distance(self) -> int:
@@ -137,6 +170,32 @@ class Design:
         """
         return self.masks[locus_id]
 
+    def masked_fraction(self, locus_id: int) -> float:
+        """Fraction of `locus_id`'s bins removed by masking.
+
+        Worth watching: masking is a union across every transcript in the
+        locus, so a short locus with several isoforms can lose most of its
+        bins. On the benchmark annotation, the reference's recommended
+        ±4 bins discarded 22.7% of all bins and 46% at the worst locus.
+        `Design.heavily_masked_loci` lists the offenders.
+        """
+        mask = self.masks[locus_id]
+        return float(mask.sum()) / mask.size if mask.size else 0.0
+
+    def heavily_masked_loci(self, threshold: float = 0.5) -> pl.DataFrame:
+        """Loci where masking removed more than `threshold` of the bins.
+
+        Such loci are still fitted, but on much less data than their bin count
+        suggests, so the estimate leans harder on the model. Reported rather
+        than silently accepted.
+        """
+        fractions = [self.masked_fraction(i) for i in range(self.n_loci)]
+        return (
+            self.loci.with_columns(masked_fraction=pl.Series(fractions, dtype=pl.Float64))
+            .filter(pl.col("masked_fraction") > threshold)
+            .sort("masked_fraction", descending=True)
+        )
+
     @property
     def unsupported_models(self) -> pl.DataFrame:
         """Models with no nonzero bin, which no data can constrain.
@@ -162,6 +221,8 @@ def build_design(
     distance: int | None = None,
     mask_start_bins: tuple[int, int] = (0, 0),
     mask_end_bins: tuple[int, int] = (0, 0),
+    mask_tss: tuple[int, int] | None = None,
+    mask_pas: tuple[int, int] | None = None,
     bin_operation: BinOperation = "round",
 ) -> Design:
     """Build a reusable `Design` from an `Annotation`.
@@ -172,6 +233,9 @@ def build_design(
         distance: Locus-grouping gap threshold; defaults to `bin_size`.
         mask_start_bins: ``(inside, outside)`` bins masked at the 5' end.
         mask_end_bins: ``(inside, outside)`` bins masked at the 3' end.
+        mask_tss: ``(upstream, downstream)`` **bases** masked around each TSS.
+            Preferred over `mask_start_bins`; mutually exclusive with it.
+        mask_pas: ``(upstream, downstream)`` bases masked around each PAS.
         bin_operation: Rounding applied to fractional bin occupancies.
 
     Returns:
@@ -182,6 +246,8 @@ def build_design(
         distance=distance,
         mask_start_bins=mask_start_bins,
         mask_end_bins=mask_end_bins,
+        mask_tss=mask_tss,
+        mask_pas=mask_pas,
         bin_operation=bin_operation,
     )
     return _build(annotation, config)
@@ -222,7 +288,10 @@ def _build(annotation: Annotation, config: DesignConfig) -> Design:
         # in and shift every masked bin with it. That silently changed which
         # models collapsed together on 12 of 124 loci in the benchmark, in both
         # directions, while every small fixture still passed.
-        masked = _mask_bins(matrix, members["strand"].to_list(), config)
+        if config.uses_base_windows:
+            masked = _mask_bins_by_bases(members, bin_starts, bin_ends, config)
+        else:
+            masked = _mask_bins(matrix, members["strand"].to_list(), config)
         rounded = _BIN_OPERATIONS[config.bin_operation](matrix)
         rounded[masked, :] = 0.0
 
@@ -393,6 +462,71 @@ def _mask_bins(
     return masked
 
 
+def _mask_bins_by_bases(
+    members: pl.DataFrame,
+    bin_starts: np.ndarray,
+    bin_ends: np.ndarray,
+    config: DesignConfig,
+) -> np.ndarray:
+    """Union of masked bins from base-specified TSS and PAS windows.
+
+    A bin is masked when it overlaps the genomic window around any
+    transcript's TSS or PAS. Windows are given in the direction of
+    transcription, so ``mask_tss=(1000, 1000)`` masks 1 kb either side of the
+    TSS on both strands, with the genomic orientation flipped for minus-strand
+    transcripts.
+
+    Windows are clipped to the locus, because bins exist only inside it. An
+    isolated transcript's locus starts at its own TSS, so an upstream window
+    has nothing to act on there; it bites only where another transcript
+    extends the locus further back. Nothing is silently lost -- there is no
+    data outside the locus to discard -- but a caller comparing masked spans
+    between loci should expect that asymmetry.
+
+    The union across transcripts is deliberate and not a limitation. Masking
+    encodes "the observed signal in this bin is untrustworthy", which is a
+    property of the bin, not of a model: an initiation spike from one
+    transcript's TSS contaminates that bin for every transcript running
+    through it. Masking per model while leaving the shared count vector intact
+    would ask the surviving models to explain signal they did not generate.
+    The cost is real -- see `Design.masked_fraction` -- but it is the correct
+    treatment, and the way to reduce it is to mask a narrower window or to
+    exclude transcripts known to be inactive, not to narrow the union.
+
+    Returns a boolean array over bins; True means masked.
+    """
+    masked = np.zeros(bin_starts.size, dtype=bool)
+    starts = members["start"].to_numpy()
+    ends = members["end"].to_numpy()
+    strands = members["strand"].to_list()
+
+    for index, strand in enumerate(strands):
+        span_start, span_end = int(starts[index]), int(ends[index])
+        # Half-open spans: the first transcribed base is `start`, the last is
+        # `end - 1`. Which of those is the TSS depends on strand.
+        if strand == "+":
+            tss, pas = span_start, span_end - 1
+        else:
+            tss, pas = span_end - 1, span_start
+
+        for window, anchor in ((config.mask_tss, tss), (config.mask_pas, pas)):
+            if window is None:
+                continue
+            upstream, downstream = window
+            if strand == "+":
+                lo, hi = anchor - upstream, anchor + downstream
+            else:
+                # Upstream is the higher coordinate on the minus strand.
+                lo, hi = anchor - downstream, anchor + upstream
+            # Half-open window centred so that (u, d) is symmetric when u == d.
+            hi += 1
+            if hi <= lo:
+                continue
+            masked |= (bin_starts < hi) & (bin_ends > lo)
+
+    return masked
+
+
 def _mark(masked: np.ndarray, origin: int, count: int, step: int) -> None:
     """Mask `count` bins from `origin` in direction `step`, clipped to range."""
     if count <= 0:
@@ -448,6 +582,8 @@ def _design_digest(annotation_digest: str, config: DesignConfig, model_table: pl
                 config.effective_distance,
                 config.mask_start_bins,
                 config.mask_end_bins,
+                config.mask_tss,
+                config.mask_pas,
                 config.bin_operation,
             )
         ).encode()

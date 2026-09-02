@@ -74,6 +74,8 @@ LOCUS_QC_SCHEMA: Schema = {
     "matrix_rank": pl.UInt32,
     "condition_number": pl.Float64,
     "total_observed": pl.Float64,
+    "total_observed_all_bins": pl.Float64,
+    "masked_bin_fraction": pl.Float64,
     "total_fitted": pl.Float64,
     "residual_sum_of_squares": pl.Float64,
     "gradient_norm": pl.Float64,
@@ -131,7 +133,9 @@ class FitResult:
     Attributes:
         model_abundance: One row per sample and identifiable model.
         transcript_model_map: Many-to-one transcript-to-model mapping.
-        locus_qc: One row per sample and locus.
+        locus_qc: One row per sample and locus. ``total_observed`` covers only
+            the bins the fit used; ``total_observed_all_bins`` is coverage
+            before masking, and ``masked_bin_fraction`` the share removed.
         normalization_factors: Between-sample factors, empty until computed.
         provenance: Digests, versions and configuration.
     """
@@ -338,6 +342,9 @@ def collect_results(
             else:
                 total_fitted = float((models @ fit.abundance).sum())
                 rss = residual_sum_of_squares(models, fit.abundance, observed)
+                # Signal in the bins the fit actually used. Masked bins are
+                # already zeroed in `observed`, so this is not locus coverage;
+                # `total_observed_all_bins` alongside it is.
                 total_observed = float(observed.sum())
 
             qc_rows.append(
@@ -352,6 +359,12 @@ def collect_results(
                     "matrix_rank": conditioning.matrix_rank,
                     "condition_number": conditioning.condition_number,
                     "total_observed": total_observed,
+                    "total_observed_all_bins": (
+                        counts.totals_all_bins[locus_id]
+                        if locus_id < len(counts.totals_all_bins)
+                        else float("nan")
+                    ),
+                    "masked_bin_fraction": design.masked_fraction(locus_id),
                     "total_fitted": total_fitted,
                     "residual_sum_of_squares": rss,
                     "gradient_norm": fit.gradient_norm,

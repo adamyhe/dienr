@@ -170,6 +170,58 @@ Use one explicit internal coordinate convention:
 
 Required boundary tests include one-base transcripts, terminal partial bins, transcripts touching but not overlapping, minus-strand TSS/PAS orientation, chromosome ends, missing contigs, and mixed `chr1`/`1` naming.
 
+### 6.1 Masking is specified in bases, not bin counts
+
+The reference specifies masking as a number of *bins* at each end of a
+transcript, which makes the masked genomic span depend on `bin_size` and jitter
+by up to a bin depending on where the TSS falls inside one. `mask_start_bins`
+of 4 means 400 bp at `bin_size` 100 and 2000 bp at 500 — the same configuration
+describing different biology.
+
+`mask_tss` and `mask_pas` take `(upstream, downstream)` **bases** along the
+direction of transcription, and mask any bin overlapping that genomic window.
+The span is then reproducible across bin sizes, which is what section 6 asks
+for everywhere else. The bin-count form is retained for R parity and the two
+are mutually exclusive; mixing them raises.
+
+Two properties to expect rather than treat as defects:
+
+- **Windows are clipped to the locus,** because bins exist only inside it. An
+  isolated transcript's locus begins at its own TSS, so an upstream window has
+  nothing to act on; it bites only where another transcript extends the locus
+  further back. No data is lost, since there are no bins outside the locus, but
+  masked spans are not comparable between isolated and crowded loci.
+- **The mask is a union across every transcript in the locus, and must be.**
+  Masking encodes "the observed signal in this bin is untrustworthy", which is a
+  property of the bin and not of a model: an initiation spike from one TSS
+  contaminates that bin for every transcript running through it. Masking per
+  model while leaving the shared count vector intact would ask the surviving
+  models to explain signal they did not generate.
+
+The union is correct but not free, and its cost was previously invisible. On the
+benchmark annotation:
+
+| masking | bins masked | loci losing >50% |
+|---|---|---|
+| legacy, ±4 bins | 22.7% | 0 |
+| `mask_tss/pas = (1000, 1000)` | 24.9% | 1 |
+| `mask_tss/pas = (500, 500)` | 15.8% | 0 |
+| `mask_tss = (0, 1000)` only | 8.4% | 0 |
+
+So the reference's recommended masking discards roughly a fifth of all bins.
+That is a defensible trade against noisy initiation and termination, but it
+should be a visible choice. `Design.masked_fraction` and
+`Design.heavily_masked_loci` report it, `dienr build-design` warns when any
+locus loses more than half its bins, and `locus_qc` now carries
+`masked_bin_fraction` and `total_observed_all_bins` alongside `total_observed`
+— which covers only the bins the fit used, and would otherwise make a heavily
+masked locus look quiet rather than mostly discarded.
+
+The way to reduce the cost is a narrower window, or excluding transcripts known
+to be inactive so their TSS regions are not masked at all. The latter needs
+activity estimates that do not exist at design time, so it implies a two-pass
+fit and is deferred past Phase 4.
+
 ## 7. Proposed software architecture
 
 ```text

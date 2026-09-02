@@ -277,3 +277,60 @@ def test_one_active_member_keeps_a_shared_model_active():
 
     both = fit(design, counts, inactive_transcripts={"a", "b"})
     assert both.model_abundance["abundance_raw"][0] == 0.0
+
+
+# --- masking cost reporting -------------------------------------------------
+
+
+def test_qc_reports_both_observed_totals_and_masked_fraction():
+    """`total_observed` is fit-bin signal; coverage needs the pre-mask total.
+
+    Masking zeroes bins in place, so without recording the pre-mask total a
+    heavily masked locus would appear to have little signal rather than to have
+    had most of it discarded.
+    """
+    frame = pl.DataFrame(
+        {
+            "transcript_id": ["tx"],
+            "contig": ["chr1"],
+            "start": [0],
+            "end": [1000],
+            "strand": ["+"],
+        }
+    )
+    design = build_design(Annotation.from_frame(frame), bin_size=250, mask_tss=(0, 250))
+    assert design.masked_fraction(0) == pytest.approx(0.5)
+
+    observed = np.full(design.bin_count(0), 10.0)
+    counts = SampleCounts(
+        sample_id="s1",
+        values=[observed.copy()],
+        locus_status=[FitStatus.OK],
+        design_digest=design.digest,
+        totals_all_bins=[float(observed.sum())],
+    )
+    counts.values[0][design.mask(0)] = 0.0
+
+    result = collect_results(design, [(counts, [fit_locus(design.models[0], counts.values[0])])])
+    row = result.locus_qc.row(0, named=True)
+    assert row["total_observed"] == pytest.approx(20.0)  # 2 unmasked bins
+    assert row["total_observed_all_bins"] == pytest.approx(40.0)  # all 4
+    assert row["masked_bin_fraction"] == pytest.approx(0.5)
+
+
+def test_count_sample_records_pre_mask_totals(extdata):
+    frame = pl.DataFrame(
+        {
+            "transcript_id": ["tx"],
+            "contig": ["1"],
+            "start": [1_000],
+            "end": [11_000],
+            "strand": ["+"],
+        }
+    )
+    from dienr.counts import SignalFile, count_sample
+
+    design = build_design(Annotation.from_frame(frame), bin_size=250, mask_tss=(0, 1000))
+    counts = count_sample(design, "s", SignalFile(extdata / "test_double_strand_plus.bw", "+"))
+    # The masked bins carried signal, so the pre-mask total must be larger.
+    assert counts.totals_all_bins[0] > counts.values[0].sum()

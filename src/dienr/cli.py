@@ -57,6 +57,23 @@ def _add_design_options(parser: argparse.ArgumentParser) -> None:
         help="bins masked at each transcript's 3' end",
     )
     parser.add_argument(
+        "--mask-tss",
+        type=int,
+        nargs=2,
+        default=None,
+        metavar=("UPSTREAM", "DOWNSTREAM"),
+        help="bases masked around each TSS, along the direction of "
+        "transcription (preferred over --mask-start-bins)",
+    )
+    parser.add_argument(
+        "--mask-pas",
+        type=int,
+        nargs=2,
+        default=None,
+        metavar=("UPSTREAM", "DOWNSTREAM"),
+        help="bases masked around each PAS",
+    )
+    parser.add_argument(
         "--bin-operation",
         choices=("round", "floor", "ceiling"),
         default="round",
@@ -133,6 +150,8 @@ def cmd_build_design(args: argparse.Namespace) -> int:
         distance=args.distance,
         mask_start_bins=tuple(args.mask_start_bins),
         mask_end_bins=tuple(args.mask_end_bins),
+        mask_tss=tuple(args.mask_tss) if args.mask_tss else None,
+        mask_pas=tuple(args.mask_pas) if args.mask_pas else None,
         bin_operation=args.bin_operation,
     )
     args.output.mkdir(parents=True, exist_ok=True)
@@ -146,6 +165,17 @@ def cmd_build_design(args: argparse.Namespace) -> int:
         f"design {design.digest}: {len(annotation)} transcripts, {design.n_loci} loci, "
         f"{design.model_table.height} models"
     )
+    heavy = design.heavily_masked_loci(threshold=0.5)
+    if heavy.height:
+        worst = heavy.row(0, named=True)
+        print(
+            f"warning: {heavy.height} locus/loci lost more than half their bins "
+            f"to masking (worst: {worst['locus_name']} at "
+            f"{100 * worst['masked_fraction']:.0f}%). Masking is a union over "
+            "every transcript in a locus, so narrow loci with several isoforms "
+            "are fitted on much less data than their bin count suggests.",
+            file=sys.stderr,
+        )
     unsupported = design.unsupported_models.height
     if unsupported:
         print(
