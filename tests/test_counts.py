@@ -109,7 +109,12 @@ def test_count_sample_aligns_to_design(two_locus_design, plus_bw, minus_bw):
     for locus_id, values in enumerate(counts.values):
         assert values.size == two_locus_design.bin_count(locus_id)
     assert counts.design_digest == two_locus_design.digest
-    assert counts.provenance["reader_settings"]["exact"] is True
+    # The settings that make uncovered bases distinguishable from zero-valued
+    # intervals must be recorded, since every covered-base summary depends on
+    # them (figwig's default `missing=0.0` would silently change each `mean`).
+    assert counts.provenance["reader"] == "figwig"
+    assert counts.provenance["reader_settings"]["missing"] == "nan"
+    assert counts.provenance["reader_settings"]["oob"] == "nan"
 
 
 def test_signal_is_nonnegative_on_both_strands(two_locus_design, plus_bw, minus_bw):
