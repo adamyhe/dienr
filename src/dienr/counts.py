@@ -29,6 +29,7 @@ Bin edges
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -53,8 +54,11 @@ VALUE_KINDS: tuple[str, ...] = (
     "other_transformed",
 )
 
-#: Likelihoods that require count-equivalent input.
-_COUNT_LIKELIHOODS = frozenset({"poisson", "negative_binomial"})
+#: Likelihoods that require count-equivalent input. The single definition:
+#: `fit` and `SignalFile.require_count_equivalent` both go through
+#: `require_count_equivalent`. There used to be two copies, and this one lacked
+#: ``"quasi_poisson"``, so the public check let a per-base mean through for it.
+COUNT_LIKELIHOODS = frozenset({"poisson", "quasi_poisson"})
 
 #: Per-bin summaries that preserve counts. ``mean`` divides by the number of
 #: covered bases, so it is a density and cannot be fed to a count likelihood.
@@ -93,20 +97,44 @@ class SignalFile:
         Two distinct ways the input can fail to be a count: the file itself was
         transformed, or the per-bin summary divided by bin width.
         """
-        if likelihood not in _COUNT_LIKELIHOODS:
-            return
-        if self.value_kind != "raw":
-            raise ValueError(
-                f"{self.path}: likelihood {likelihood!r} requires count-equivalent "
-                f"signal, but value_kind is {self.value_kind!r}. Use an untransformed "
-                "BigWig or select a non-count likelihood explicitly."
-            )
-        if summary not in _COUNT_SUMMARIES:
-            raise ValueError(
-                f"{self.path}: likelihood {likelihood!r} requires a count-preserving "
-                f"summary, but summary is {summary!r}, which is a per-base density. "
-                f"Use one of {sorted(_COUNT_SUMMARIES)}."
-            )
+        require_count_equivalent(
+            likelihood, summary=summary, value_kinds=(self.value_kind,), source=str(self.path)
+        )
+
+
+def require_count_equivalent(
+    likelihood: str,
+    *,
+    summary: str,
+    value_kinds: Iterable[str],
+    source: str,
+) -> None:
+    """Raise if `likelihood` needs counts and the input described is not counts.
+
+    Args:
+        likelihood: Likelihood name; anything outside `COUNT_LIKELIHOODS` passes.
+        summary: Per-bin summary the signal was aggregated with.
+        value_kinds: `ValueKind` of every signal file involved.
+        source: What to name in the error -- a path or a sample.
+
+    Raises:
+        ValueError: If any file is transformed, or the summary is a density.
+    """
+    if likelihood not in COUNT_LIKELIHOODS:
+        return
+    transformed = sorted(set(value_kinds) - {"raw"})
+    if transformed:
+        raise ValueError(
+            f"{source}: likelihood {likelihood!r} requires count-equivalent, "
+            f"untransformed counts, but value_kind is {transformed}. Use an "
+            "untransformed BigWig or select a non-count likelihood explicitly."
+        )
+    if summary not in _COUNT_SUMMARIES:
+        raise ValueError(
+            f"{source}: likelihood {likelihood!r} requires a count-preserving summary, "
+            f"but summary is {summary!r}, which is a per-base density. Re-count with "
+            f"one of {sorted(_COUNT_SUMMARIES)}."
+        )
 
 
 @dataclass

@@ -1254,6 +1254,16 @@ enough across a locus that the full variance function matters for the estimate
 too, which on a rounded binary design it does not, and which brings this back
 to the shape-profile prerequisite recorded under Gate B.
 
+**Decision: NB2 removed.** Once 18.8 found that a shape profile is mostly not
+worth applying, the one setting where NB2 could matter -- a graded design --
+stopped being a recommended configuration, and nothing else justified a
+non-convex likelihood that needs an externally pooled dispersion and a
+mean-collapse guard. `solvers/negative_binomial.py` and its tests were deleted;
+`fit` and `dienr fit` accept `legacy`, `poisson` and `quasi_poisson`, and the
+`dispersion` argument went with it. The evidence above stays as the record of
+why; re-adding NB needs new evidence against this gate, most plausibly on real
+data with a design graded for reasons other than a shared shape profile.
+
 ## 18. Shape profiles: what the reference gets wrong
 
 The shape profile was a v1 non-goal until Gate B and Gate D independently

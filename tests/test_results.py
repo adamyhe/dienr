@@ -431,13 +431,6 @@ def test_poisson_likelihood_runs_end_to_end(design):
     assert result.provenance["penalty_lambda2"] == 0.01
 
 
-def test_negative_binomial_runs_end_to_end(design):
-    counts = count_equivalent_counts(design, seed=1)
-    result = fit(design, counts, likelihood="negative_binomial", dispersion=0.2)
-    assert result.summary.n_failures == 0
-    assert result.provenance["dispersion"] == 0.2
-
-
 def test_mean_summary_is_rejected_for_count_likelihoods(design):
     """The default extraction is a per-base mean, for R parity. Guard it.
 
@@ -446,8 +439,9 @@ def test_mean_summary_is_rejected_for_count_likelihoods(design):
     """
     counts = count_equivalent_counts(design)
     counts.provenance["summary"] = "mean"
-    with pytest.raises(ValueError, match="per-base density"):
-        fit(design, counts, likelihood="poisson")
+    for likelihood in ("poisson", "quasi_poisson"):
+        with pytest.raises(ValueError, match="per-base density"):
+            fit(design, counts, likelihood=likelihood)
 
 
 def test_transformed_signal_is_rejected_for_count_likelihoods(design):
@@ -459,12 +453,6 @@ def test_transformed_signal_is_rejected_for_count_likelihoods(design):
         fit(design, counts, likelihood="poisson")
 
 
-def test_nb_without_dispersion_is_rejected(design):
-    counts = count_equivalent_counts(design)
-    with pytest.raises(ValueError, match="requires an explicit dispersion"):
-        fit(design, counts, likelihood="negative_binomial")
-
-
 def test_penalty_on_the_legacy_solver_is_rejected(design):
     """The reference rejects a nonzero lambda too; do not silently ignore one."""
     from dienr.solvers import penalties
@@ -473,9 +461,11 @@ def test_penalty_on_the_legacy_solver_is_rejected(design):
         fit(design, synthetic_counts(design), penalty=penalties.ridge(0.1))
 
 
-def test_unknown_likelihood_is_rejected(design):
+@pytest.mark.parametrize("likelihood", ["gaussian", "negative_binomial"])
+def test_unknown_likelihood_is_rejected(design, likelihood):
+    """Including the removed NB solver: a stale config must fail, not fall through."""
     with pytest.raises(ValueError, match="likelihood must be"):
-        fit(design, synthetic_counts(design), likelihood="gaussian")
+        fit(design, synthetic_counts(design), likelihood=likelihood)
 
 
 def test_bin_exposure_is_legacy_incompatible(design):
@@ -488,28 +478,6 @@ def test_bin_exposure_is_passed_through(design):
     result = fit(design, counts, likelihood="poisson", use_bin_exposure=True)
     assert result.provenance["use_bin_exposure"] is True
     assert result.summary.n_failures == 0
-
-
-def test_dispersion_estimated_from_a_poisson_fit_feeds_the_nb_fit(design):
-    """The two-stage procedure section 4.3 prescribes, wired end to end."""
-    from dienr.solvers import negative_binomial as nbmod
-
-    counts = count_equivalent_counts(design, seed=3)
-    poisson_result = fit(design, counts, likelihood="poisson")
-    assert poisson_result.summary.n_failures == 0
-
-    triples = []
-    for locus_id in range(design.n_loci):
-        abundance = (
-            poisson_result.model_abundance.filter(pl.col("locus_id") == locus_id)
-            .sort("model_index")["abundance_raw"]
-            .to_numpy()
-        )
-        triples.append((design.models[locus_id], counts.values[locus_id], abundance))
-
-    estimate = nbmod.estimate_dispersion(triples)
-    # Poisson-simulated data: little or no overdispersion, so Poisson stands.
-    assert estimate.dispersion < 0.05
 
 
 def test_ill_conditioned_locus_is_escalated_from_ok():

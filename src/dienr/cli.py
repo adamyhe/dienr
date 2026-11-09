@@ -146,13 +146,12 @@ def build_parser() -> argparse.ArgumentParser:
     fit_parser.add_argument("--output", required=True, type=Path)
     fit_parser.add_argument(
         "--likelihood",
-        choices=("legacy", "poisson", "quasi_poisson", "negative_binomial"),
+        choices=("legacy", "poisson", "quasi_poisson"),
         default="legacy",
         help="legacy least squares (default, the only one with R parity); "
-        "poisson; quasi_poisson, which gives identical abundances to poisson "
+        "poisson; or quasi_poisson, which gives identical abundances to poisson "
         "with standard errors scaled by a pooled dispersion and is the "
-        "recommended choice for overdispersed counts; or negative_binomial, "
-        "which is deprioritized (see plan Gate D)",
+        "recommended choice for overdispersed counts",
     )
     fit_parser.add_argument("--transform", choices=("log", "identity"), default="log")
     fit_parser.add_argument(
@@ -163,12 +162,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     fit_parser.add_argument("--lambda1", type=float, default=0.0, help="L1 weight")
     fit_parser.add_argument("--lambda2", type=float, default=0.0, help="L2 weight")
-    fit_parser.add_argument(
-        "--dispersion",
-        type=float,
-        default=None,
-        help="shared NB2 dispersion; required for --likelihood negative_binomial",
-    )
     fit_parser.add_argument(
         "--use-bin-exposure",
         action="store_true",
@@ -459,7 +452,6 @@ def cmd_fit(args: argparse.Namespace) -> int:
         likelihood=args.likelihood,
         transform=args.transform,
         penalty=Penalty(kind=args.penalty, lambda1=args.lambda1, lambda2=args.lambda2),
-        dispersion=args.dispersion,
         use_bin_exposure=args.use_bin_exposure,
         inactive_transcripts=inactive,
     )

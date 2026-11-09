@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import typing
+
 import numpy as np
 import polars as pl
 import pytest
@@ -229,6 +231,29 @@ def test_require_count_equivalent_rejects_a_mean_summary(plus_bw):
     # unconstrained either way.
     signal.require_count_equivalent("poisson", summary="sum")
     signal.require_count_equivalent("legacy", summary="mean")
+
+
+@pytest.mark.parametrize("likelihood", ["poisson", "quasi_poisson"])
+def test_every_count_likelihood_is_guarded_by_the_public_check(likelihood):
+    """`SignalFile.require_count_equivalent` covers every count likelihood.
+
+    Its likelihood set once lived apart from `fit`'s and lacked
+    ``"quasi_poisson"``, so a per-base mean passed the public check for it.
+    `fit` was unaffected only because it carried a second, correct copy.
+    The check reads metadata only, so no file is needed and this runs without
+    the R reference fixtures.
+    """
+    path = "never-opened.bw"
+    with pytest.raises(ValueError, match="count-preserving summary"):
+        SignalFile(path, "+").require_count_equivalent(likelihood, summary="mean")
+    with pytest.raises(ValueError, match="count-equivalent"):
+        SignalFile(path, "+", value_kind="library_normalized").require_count_equivalent(likelihood)
+
+
+def test_fit_and_signal_file_share_one_set_of_count_likelihoods():
+    from dienr import pipeline
+
+    assert set(typing.get_args(pipeline.Likelihood)) - {"legacy"} == counts_module.COUNT_LIKELIHOODS
 
 
 def test_window_clipped_at_the_contig_end_is_zero_padded(plus_bw):

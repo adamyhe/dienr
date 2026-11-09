@@ -13,9 +13,9 @@ Typical use::
     result = dienr.fit(design, counts)
     result.write("results/")
 
-Four likelihoods are available through `fit`. ``"legacy"`` is the default and
-the only one checked against R DENR. The count likelihoods --- ``"poisson"``,
-``"quasi_poisson"`` and ``"negative_binomial"`` --- require count-equivalent
+Three likelihoods are available through `fit`. ``"legacy"`` is the default and
+the only one checked against R DENR. The count likelihoods --- ``"poisson"``
+and ``"quasi_poisson"`` --- require count-equivalent
 input, so counts must be extracted with ``summary="sum"`` rather than the
 parity default of ``"mean"``; `fit` rejects the mismatch rather than quietly
 fitting a density.
@@ -23,8 +23,9 @@ fitting a density.
 ``"quasi_poisson"`` returns the same abundances as ``"poisson"`` and differs
 only in the reported standard errors. It is the recommended choice for
 overdispersed counts: a Poisson standard error understates the true spread by
-23% at dispersion 0.1 and 64% at 1.0. ``"negative_binomial"`` is
-deprioritized; see the plan's Gate D.
+23% at dispersion 0.1 and 64% at 1.0, and quasi-Poisson matched a negative
+binomial's errors to within a few percent, which is why there is no NB solver
+(plan Gate D).
 
 Coordinates are 0-based half-open throughout; see `dienr.annotation` for the
 single conversion point.
@@ -52,7 +53,7 @@ from .shape import (
     fit_shape_profile,
     rescale_position,
 )
-from .solvers import inference, negative_binomial, penalties, poisson
+from .solvers import inference, penalties, poisson
 from .solvers._glm import Exposure
 from .solvers.legacy import LocusFit, fit_locus
 from .solvers.penalties import NO_PENALTY, Penalty
@@ -92,7 +93,6 @@ __all__ = [
     "is_failure",
     "inference",
     "locus_table",
-    "negative_binomial",
     "penalties",
     "poisson",
     "read_annotation",
