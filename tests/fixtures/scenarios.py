@@ -20,6 +20,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .bigwig import write_intervals
+
 
 @dataclass(frozen=True)
 class Transcript:
@@ -288,14 +290,7 @@ def write_inputs(scenario: Scenario, directory: Path) -> dict[str, Path]:
 
     Returns:
         Mapping with keys ``gtf``, ``plus`` and ``minus``.
-
-    Raises:
-        ImportError: If `pybigtools` is unavailable. It is the only library in
-            the stack that can *write* BigWig; `polars-bio` has no
-            ``sink_bigwig``.
     """
-    import pybigtools
-
     directory.mkdir(parents=True, exist_ok=True)
     gtf = directory / f"{scenario.name}.gtf"
     gtf.write_text("\n".join(scenario.gtf_lines()) + "\n")
@@ -303,26 +298,13 @@ def write_inputs(scenario: Scenario, directory: Path) -> dict[str, Path]:
     paths = {"gtf": gtf}
     for strand, key in ((_PLUS, "plus"), (_MINUS, "minus")):
         path = directory / f"{scenario.name}_{key}.bw"
-        writer = pybigtools.open(str(path), "w")
-        intervals = [(c, s, e, float(v)) for c, s, e, v in scenario.signal.get(strand, ())]
-        covered = {interval[0] for interval in intervals}
-
-        # Two writer behaviors have to be worked around here, both verified:
-        #
-        # 1. A BigWig written with zero intervals is not a readable file.
-        #    pybigtools reports "Input bedGraph is empty" on write and then
-        #    fails to open it with BBIReadError.
-        # 2. Contigs passed in the size map but carrying no interval are
-        #    *dropped from the header*. Asking for {chr1, chr2} and writing only
-        #    to chr1 yields a file declaring chr1 alone.
-        #
-        # Since the header is what distinguishes MISSING_CONTIG from ALL_ZERO,
-        # a fixture cannot express "declared but quiet" without an explicit
-        # zero-valued placeholder base on every declared contig.
-        placeholders = [
-            (contig, 0, 1, 0.0) for contig in scenario.contig_sizes if contig not in covered
-        ]
-        writer.write(dict(scenario.contig_sizes), iter(sorted(placeholders + intervals)))
-        writer.close()
+        # Every contig in `contig_sizes` is declared in the header even when it
+        # carries no interval; the header is what distinguishes MISSING_CONTIG
+        # from ALL_ZERO, so a "declared but quiet" contig must survive the write.
+        write_intervals(
+            path,
+            dict(scenario.contig_sizes),
+            [(c, s, e, float(v)) for c, s, e, v in scenario.signal.get(strand, ())],
+        )
         paths[key] = path
     return paths

@@ -14,7 +14,7 @@ dependencies = [
     "numpy>=1.24",
     "scipy>=1.11",
     "polars>=1.30",
-    "pybigtools>=0.3",
+    "figwig>=0.3",
     "pydantic>=2.0",
 ]
 
@@ -58,5 +58,5 @@ warn_unreachable = true
 no_implicit_optional = true
 
 [[tool.mypy.overrides]]
-module = ["pybigtools.*", "scipy.*"]
+module = ["scipy.*"]
 ignore_missing_imports = true

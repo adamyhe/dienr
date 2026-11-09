@@ -323,7 +323,7 @@ The design must be serializable and reusable across samples. A change to annotat
 
 - NumPy and SciPy for arrays, sparse matrices, numerical optimization, and special functions.
 - **Polars** as the tabular layer and as the annotation parser, interval-grouping engine, and Parquet writer. See "Tabular layer" and "Why not a genomics interval library" below.
-- **`pybigtools`** for all BigWig access: header seqinfo, interval streaming via `records()`, and writing.
+- **`figwig`** for all BigWig access: header seqinfo, exact per-base reads, and writing. (Replaced `pybigtools`; see "BigWig aggregation".)
 - `pysam` for BAM/CRAM input.
 - Pydantic or equivalent schema validation for configuration and result metadata.
 
@@ -352,7 +352,7 @@ The earlier draft named PyRanges/NCLS as a placeholder, and `polars-bio` looked 
 |---|---|---|---|
 | GTF parse, 50k transcript rows | `scan_csv(separator="\t", comment_prefix="#")` + two `str.extract` calls, 32 ms | `scan_gtf(attr_fields=[...])`, 53 ms | Identical coordinates; plain is faster |
 | Locus grouping, 200k transcripts to 52k loci | cumulative-max sweep, 5 lines, 13–18 ms | `merge(min_dist=...)`, 8–10 ms | **Bit-identical at `min_dist` 0, 250, 5000**; both negligible |
-| BigWig interval streaming | not supported | `scan_bigwig` | Use `pybigtools.records()`, which returns byte-identical tuples and is already a required dependency |
+| BigWig interval streaming | not supported | `scan_bigwig` | Not needed: `figwig` reads exact per-base values, and binning is NumPy |
 
 The locus-grouping idiom is worth stating, since it is the one genuinely graph-flavored operation in the pipeline and it needs no interval tree — DENR's `group_transcripts(distance = d)` is a sort plus a cumulative maximum:
 
@@ -373,25 +373,39 @@ Reconsider `polars-bio` at one specific point: Phase 4 TSS-evidence mapping need
 
 #### BigWig aggregation
 
-Use `pybigtools` for all BigWig access. It is faster than the alternatives, bounded in memory by construction, and already required for header seqinfo, so it carries the signal path with no additional dependency.
-
-The primary aggregation call is:
+Use `figwig` for all BigWig access, through the single wrapper `dienr.counts.read_binned`. figwig reads exact per-base float32 values into NumPy and has **no zoom-level path at all**, so the lossy-summary hazard below cannot arise; binning is a reshape (or `reduceat` for a window that is not a whole number of bins) in our own code, where every semantic choice is visible and tested. It depends only on NumPy and numba.
 
 ```python
-bw.values(chrom, start, end, bins=n, summary="sum", exact=True, fillna=0)
+reader.read([chrom], [start], end - start, n_jobs=1, missing=np.nan, oob=np.nan)
 ```
 
-**Both non-default arguments are mandatory, and each is silently wrong if omitted.**
+`missing=nan` keeps an uncovered base distinguishable from an interval whose value is `0`, which matters because `mean`/`min`/`max`/`std` are taken over **covered bases only**, a zero-valued interval counting as covered; an empty bin summarizes to `0` (count semantics — an absent interval is zero polymerase, not a missing observation). `oob=nan` makes bases past a contig end uncovered. `std` is the sample standard deviation, `0` below two bases. Bin `i` of `[start, end)` is `[start + ⌊i·w/n⌋, start + ⌊(i+1)·w/n⌋)`. figwig only *warns* on a contig absent from the header and returns zeros, so the wrapper checks `chrom_sizes` and raises `KeyError` itself: that conflation is exactly `MISSING_CONTIG` vs `ALL_ZERO`.
 
-`exact=True` is the more dangerous of the two. Without it, `values(..., bins=N)` reads precomputed zoom levels, which are lossy. On `test_double_strand_plus.bw`, 250 bp bins over `1:0-2000` have a true per-base sum of `[63, 68, 72, 77]`; the default binned call returns `[62.53, 69.53, 71.47, 76.76]`. No error is raised, and every fitted abundance is biased. Small windows can coincidentally agree — 50 bp bins over `1:0-200` return exact integers — so a small unit test will not necessarily catch it. Fix the flag in a single wrapper and test it at several bin widths against per-base ground truth.
+These are the semantics the package had under `pybigtools` (`values(..., exact=True, fillna=0, oob=0)`), measured base by base before the switch. On 5,000 random windows (sparse, signed, zero-valued intervals; divisible, non-divisible, clipped and past-end) the figwig path agrees exactly with an independent per-base oracle built from `records()`, and with pybigtools on every whole-bin window. R parity was unchanged and abundances on the dense benchmark were identical.
 
-`fillna=0` supplies count semantics. Recent `pybigtools` returns uncovered positions and empty bins as `NaN`, but in a nascent-RNA BigWig an absent interval means zero observed polymerase, not a missing observation; a leaked `NaN` propagates into the objective as a numerical failure rather than a legitimate zero. Set `oob` for reads past a contig end and `uncovered` for whether uncovered bases enter a `mean` denominator at the same boundary, and record all four in provenance.
+**figwig is only fast when batched.** One call per locus left its thread pool idle and was *slower* than pybigtools (1.13 s vs 1.01 s, three dense samples): its speed comes from many equal-width windows in one multithreaded call. `count_sample` therefore goes through `read_loci_binned`, which cuts every in-bounds locus window into tiles of `TILE_BINS = 16` bins (a whole number of bins, so no bin straddles two tiles), reads them in calls capped at `MAX_CHUNK_BYTES = 64 MiB` of per-base output, and summarizes every bin of a chunk in one vectorized pass, split across `n_jobs` threads (NumPy releases the GIL there; single-threaded, binning cost as much as the read). A window overrunning the contig end keeps the one-window `read_binned` path, clipped as before. Measured on the dense benchmark:
 
-Because `bins=` accumulates into a fixed-size array in Rust, peak memory is O(bins) regardless of input density, and no per-locus loop overhead was measurable: 2,000 separate 5 kb locus calls over a 10 Mb file completed in under 5 ms.
+| | per sample, steady state | three samples, incl. first-call warm-up | peak RSS |
+|---|---|---|---|
+| pybigtools, one binned call per locus | ~330 ms | 1.01 s | 430 MB |
+| figwig, one call per locus | ~390 ms | 1.13 s | 454 MB |
+| figwig, batched tiles, 8 threads | **~145 ms** | **0.68 s** | 566 MB |
+
+The first call costs ~240 ms extra (numba kernels loading from cache), so the gap widens with more samples. Smaller caps were slower (16 MiB: 0.98 s, 32 MiB: 0.90 s) for ~80 MB less RSS; 16 threads did not beat 8. Equality with one-window reads is asserted for every summary, with the cap forced down to one window per call. The `isal` extra cuts figwig's inflate time a further ~40%.
+
+##### History: why not pybigtools
+
+`pybigtools` carried this path until it was replaced. It needed **two non-default arguments, each silently wrong if omitted**: without `exact=True`, `values(..., bins=N)` read precomputed zoom levels — on `test_double_strand_plus.bw`, 250 bp bins over `1:0-2000` have a true sum of `[63, 68, 72, 77]` and the default returned `[62.53, 69.53, 71.47, 76.76]`, no error, and small windows could coincidentally agree; without `fillna=0`, uncovered bins leaked `NaN`. The switch also uncovered three behaviors of its binned `values()` that the new path deliberately does **not** reproduce:
+
+- **A bin straddling the contig end is zeroed**, discarding its in-bounds signal: an all-ones contig of length 100 read as `(0, 107, bins=4)` gives `[26, 27, 27, 0]`, truth `[26, 27, 27, 20]`. Reachable only from `shape.py`, for a gene whose rounded-up last bin overruns the contig.
+- **Covered-base counts use floating-point bin edges** in non-divisible windows, so an interval clipped at a fractional edge loses a base from the `mean` denominator (26 counted, 27 true). Reachable from `count_sample`, which clips a locus window at the contig end.
+- **`std` uses a one-pass formula**: `9e-8` for a constant bin whose true value is `0`.
+
+Two *writer* quirks went with it: a file with zero intervals was unreadable, and contigs without an interval were dropped from the header, which forced zero-valued placeholder bases into every fixture. figwig keeps every declared contig and writes empty files; fixtures write with `missing=nan` so explicit zeros remain stored as data.
 
 ##### Parity oracle: independent binning in Polars
 
-Keep a second, independently derived implementation for tests. Stream intervals with `pybigtools.records(chrom, start, end)`, clip them to the window, fan each across the bins it touches, and sum `value * overlap` per bin. This is exact by construction with no opt-in flag, and it makes the section 6 requirement that partial terminal bins carry true effective lengths an explicit column. Both implementations agreed to `max|diff| = 0.0` on the RLE and dense fixtures, which makes this a genuinely informative cross-check rather than a restatement of the same code path.
+This oracle was built when `pybigtools` held the primary path, from its `records()` stream; the figwig switch was validated against a per-base oracle from the same stream. Stream intervals with `records(chrom, start, end)`, clip them to the window, fan each across the bins it touches, and sum `value * overlap` per bin. This is exact by construction with no opt-in flag, and it makes the section 6 requirement that partial terminal bins carry true effective lengths an explicit column. Both implementations agreed to `max|diff| = 0.0` on the RLE and dense fixtures, which makes this a genuinely informative cross-check rather than a restatement of the same code path.
 
 Two facts about that route, recorded because they bear on any future decision to promote it:
 
@@ -400,9 +414,9 @@ Two facts about that route, recorded because they bear on any future decision to
 | RLE, 5 kb runs over 10 Mb | 2,000 | 40,000 | 40,000 (1.0×) | 44 MB | — |
 | Dense per-base over 2 Mb | 2,000,000 | 8,000 | 2,000,000 (250×) | 384 MB | ~0 MB |
 
-First, the fan-out hazard is the opposite of what run-length encoding suggests. Long constant-value runs are harmless — BigWig intervals are non-overlapping, so interval-by-bin pairs are bounded by roughly bins plus intervals, and the RLE case produced exactly one row per bin. The amplification comes from **dense per-base signal, where intervals greatly outnumber bins**, which is exactly what a PRO-seq 3′-end BigWig is. Second, that amplification is fully mitigated by never materializing the fanned frame: aggregating lazily with `.collect(engine="streaming")` gave bit-identical results with no measurable RSS growth, and faster than eager collection (70 ms versus 200 ms). Even so, `pybigtools` did the same 2 Mb aggregation in 51 ms with bounded memory and no discipline required from the caller, which is why it holds the primary path.
+First, the fan-out hazard is the opposite of what run-length encoding suggests. Long constant-value runs are harmless — BigWig intervals are non-overlapping, so interval-by-bin pairs are bounded by roughly bins plus intervals, and the RLE case produced exactly one row per bin. The amplification comes from **dense per-base signal, where intervals greatly outnumber bins**, which is exactly what a PRO-seq 3′-end BigWig is. Second, that amplification is fully mitigated by never materializing the fanned frame: aggregating lazily with `.collect(engine="streaming")` gave bit-identical results with no measurable RSS growth, and faster than eager collection (70 ms versus 200 ms). Even so, the library reader did the same 2 Mb aggregation in 51 ms with bounded memory and no discipline required from the caller, which is why it holds the primary path.
 
-Still to settle in Phase 2: throughput on a real whole-genome sample, where the dense case extrapolates to order 10⁹ intervals per sample, and whether per-contig or per-chunk batching of `values()` calls beats one call per locus.
+Still to settle: throughput on a real whole-genome sample, where the dense case extrapolates to order 10⁹ intervals per sample. (Batching loci into memory-capped multithreaded figwig reads is settled — see "BigWig aggregation".)
 
 ## 8. Input contracts
 
@@ -442,7 +456,7 @@ consequences. Legacy-compatible extraction must use `mean`, which is why
 divided by bin width. `SignalFile.require_count_equivalent` now rejects that
 combination alongside a transformed `value_kind`.
 
-BigWig uncovered-region semantics must be pinned explicitly rather than inherited from library defaults. In nascent-RNA BigWigs an absent interval means zero observed polymerase, not a missing observation, but recent `pybigtools` returns uncovered positions and empty bins as `NaN` by default; `fillna=0` is required to obtain count semantics, and `oob` governs reads past a contig end. The `uncovered` argument additionally controls whether uncovered bases enter the denominator of a `mean` summary, which silently changes the fitted value. Set all three at the single I/O boundary, record them in provenance, and cover them with fixtures — a `NaN` leaking into a bin vector would otherwise propagate into the objective as a numerical failure rather than a legitimate zero.
+BigWig uncovered-region semantics must be pinned explicitly rather than inherited from library defaults. In nascent-RNA BigWigs an absent interval means zero observed polymerase, not a missing observation, and whether uncovered bases enter the denominator of a `mean` summary silently changes the fitted value. `read_binned` reads with `missing=nan, oob=nan` so uncovered bases are identifiable, excludes them from every summary, and returns `0` for an empty bin. Pin these at the single I/O boundary, record them in provenance, and cover them with fixtures — a `NaN` leaking into a bin vector would otherwise propagate into the objective as a numerical failure rather than a legitimate zero.
 
 ### TSS activity evidence
 

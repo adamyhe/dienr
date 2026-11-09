@@ -132,6 +132,13 @@ def build_parser() -> argparse.ArgumentParser:
         "whose add_data hardcodes it, so the default pipeline reproduces it. "
         "Count likelihoods need 'sum'; 'dienr fit' rejects the mismatch.",
     )
+    count.add_argument(
+        "--threads",
+        type=_positive_int,
+        default=8,
+        help="threads for reading and binning each BigWig (default 8). Samples "
+        "are counted one after another; this parallelizes within a sample.",
+    )
 
     fit_parser = subparsers.add_parser("fit", help="estimate abundances")
     fit_parser.add_argument("--design", required=True, type=Path)
@@ -381,6 +388,17 @@ def cmd_build_design(args: argparse.Namespace) -> int:
     return 0
 
 
+def _positive_int(text: str) -> int:
+    """argparse type for a count that must be at least 1."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer, got {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {value}")
+    return value
+
+
 def cmd_count(args: argparse.Namespace) -> int:
     design = _load_design(args.design)
     table = pl.read_csv(args.samples)
@@ -408,6 +426,7 @@ def cmd_count(args: argparse.Namespace) -> int:
                 signal,
                 summary=args.summary,
                 exposure=float(row.get("exposure") or 1.0),
+                n_jobs=args.threads,
             )
         )
 

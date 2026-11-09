@@ -37,6 +37,7 @@ from .counts import (
     count_sample,
     declared_contigs,
     read_binned,
+    read_loci_binned,
 )
 from .design import Design, DesignConfig, build_design
 from .diagnostics import LocusConditioning, assess
@@ -96,6 +97,7 @@ __all__ = [
     "poisson",
     "read_annotation",
     "read_binned",
+    "read_loci_binned",
     "rescale_position",
     "status_report",
 ]

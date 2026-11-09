@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import pickle
+
+import numpy as np
 import polars as pl
 import pytest
 
@@ -9,6 +12,7 @@ from dienr.cli import COUNTS_FILENAME, DESIGN_FILENAME, SHAPE_FILENAME, main
 from dienr.results import FitResult
 
 from .conftest import write_gtf
+from .fixtures.scenarios import SCENARIOS_BY_NAME, write_inputs
 
 
 def _read_design(directory):
@@ -795,3 +799,58 @@ def test_shape_profile_command_warns_when_the_fit_was_floored(
     )
     assert code == 0
     assert "clamped to the profile floor" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("scenario", ["multi_contig", "both_strands_separate_loci"])
+def test_count_threads_do_not_change_the_counts(tmp_path, scenario):
+    """--threads parallelizes the read; the counts must not depend on it.
+
+    Inputs come from the parity scenarios rather than the R package's extdata,
+    so this runs whether or not `_reference/` is present.
+    """
+    inputs = write_inputs(SCENARIOS_BY_NAME[scenario], tmp_path / "inputs")
+    samples = tmp_path / "samples.csv"
+    pl.DataFrame(
+        {
+            "sample_id": ["s1"],
+            "bigwig_plus": [str(inputs["plus"])],
+            "bigwig_minus": [str(inputs["minus"])],
+        }
+    ).write_csv(samples)
+    design_dir = tmp_path / "design"
+    main(["build-design", "--gtf", str(inputs["gtf"]), "--output", str(design_dir)])
+
+    outputs = {}
+    for threads in ("1", "3", "8"):
+        out = tmp_path / f"t{threads}"
+        base = ["count", "--design", str(design_dir), "--samples", str(samples)]
+        assert main([*base, "--output", str(out), "--threads", threads]) == 0
+        with (out / COUNTS_FILENAME).open("rb") as handle:
+            outputs[threads] = pickle.load(handle)[0]
+
+    reference = outputs["1"]
+    assert reference.total_signal() > 0  # a vacuous all-zero comparison proves nothing
+    for counts in outputs.values():
+        assert counts.locus_status == reference.locus_status
+        for x, y in zip(counts.values, reference.values, strict=True):
+            np.testing.assert_array_equal(x, y)
+
+
+@pytest.mark.parametrize("bad", ["0", "-1", "two"])
+def test_count_rejects_a_bad_thread_count(tmp_path, bad, capsys):
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            [
+                "count",
+                "--design",
+                str(tmp_path / "d"),
+                "--samples",
+                str(tmp_path / "s.csv"),
+                "--output",
+                str(tmp_path / "c"),
+                "--threads",
+                bad,
+            ]
+        )
+    assert excinfo.value.code == 2  # argparse usage error, before any work
+    assert "--threads" in capsys.readouterr().err

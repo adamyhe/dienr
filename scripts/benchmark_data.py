@@ -15,7 +15,7 @@ import json
 from pathlib import Path
 
 import numpy as np
-import pybigtools
+from figwig import write_bigwig
 
 #: Contig length. One contig keeps the comparison about loci and bins rather
 #: than about per-contig bookkeeping differences.
@@ -90,15 +90,18 @@ def build(
             path = output / f"sample{sample}_{key}.bw"
             positions = np.arange(0, contig_size - signal_step, signal_step)
             values = sign * rng.poisson(3.0, positions.size).astype(np.float64)
-            writer = pybigtools.open(str(path), "w")
-            writer.write(
+            # missing=nan stores the zero-count intervals as data, as the
+            # previous pybigtools writer did; a covered zero enters a mean.
+            write_bigwig(
+                str(path),
                 {CONTIG: contig_size},
-                iter(
-                    (CONTIG, int(p), int(p) + signal_step, float(v))
-                    for p, v in zip(positions, values, strict=True)
-                ),
+                CONTIG,
+                positions,
+                values.astype(np.float32),
+                ends=positions + signal_step,
+                missing=np.nan,
+                zooms=0,
             )
-            writer.close()
             paths[key] = str(path)
         samples.append({"sample_id": f"sample{sample}", **paths})
 
