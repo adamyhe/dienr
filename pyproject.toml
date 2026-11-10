@@ -10,21 +10,42 @@ readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
 authors = [{ name = "Adam Youlin He", email = "ayhe@stanford.edu" }]
+keywords = ["nascent RNA", "PRO-seq", "GRO-seq", "pre-RNA isoforms", "transcription", "DENR"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
 dependencies = [
     "numpy>=1.24",
     "scipy>=1.11",
-    "polars>=1.30",
-    "figwig>=0.3",
+    "polars>=1.34,<3",
+    # figwig is pre-1.0 and handles all BigWig I/O: a minor release may change its API.
+    "figwig>=0.3,<0.4",
     "pydantic>=2.0",
     # Caps BLAS threads while fitting: the matrices are tiny (plan 14.4).
     "threadpoolctl>=3.1",
 ]
 
+[project.urls]
+Homepage = "https://github.com/adamyhe/dienr"
+Documentation = "https://github.com/adamyhe/dienr/tree/main/docs"
+Issues = "https://github.com/adamyhe/dienr/issues"
+Changelog = "https://github.com/adamyhe/dienr/commits/main"
+
 [project.optional-dependencies]
-bam = ["pysam>=0.22"]
-# polars-bio is a compiled plugin pinned to a minimum polars; see plan section 7.
-intervals = ["polars-bio>=0.35"]
-ml = ["torch", "anndata"]
+# Polars' default runtime needs AVX2 and fails to import on older x86 CPUs.
+# This adds its compatibility build, which polars then prefers on every
+# machine (set POLARS_FORCE_PKG=32 to use the default where AVX2 exists).
+compat = ["polars[rtcompat]>=1.34"]
 
 [project.scripts]
 dienr = "dienr.cli:main"
@@ -47,9 +68,10 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.mypy]
 files = ["src/dienr"]
-# python_version is deliberately unset: pinning it to our 3.11 floor makes mypy
-# reject numpy's own stubs, which use 3.12 `type` statements. It therefore
-# checks against the interpreter in use.
+# 3.12, not the 3.11 runtime floor: numpy's own stubs use 3.12 `type`
+# statements, which mypy rejects when targeting 3.11. Type-checking only; the
+# suite runs on 3.11-3.14 (plan 20, item 6).
+python_version = "3.12"
 # numpy and polars both expose broad union return types, so strict mode mostly
 # produces noise on array and DataFrame code. This setting catches the errors
 # that matter -- unguarded None, wrong argument types, uncallable values --
@@ -62,3 +84,9 @@ no_implicit_optional = true
 [[tool.mypy.overrides]]
 module = ["scipy.*", "threadpoolctl"]
 ignore_missing_imports = true
+
+[tool.uv]
+# With .python-version pinning 3.13, use uv's own CPython, never whatever 3.13
+# is on PATH. "managed" is not enough: an active conda base counts as an
+# explicit request and wins over a mere preference.
+python-preference = "only-managed"

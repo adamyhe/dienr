@@ -1,0 +1,50 @@
+cff-version: 1.2.0
+message: >-
+  If you use dienr, please cite it as below, and also cite the DENR paper, whose
+  method dienr reimplements.
+title: "dienr: Deconvolution of Isoform Expression from Nascent RNAs"
+abstract: >-
+  A Python reimplementation of DENR that explains nascent RNA sequencing signal
+  (PRO-seq, GRO-seq) at each locus as a nonnegative mixture of pre-RNA isoform
+  models, with reusable designs, explicit identifiability, count likelihoods and
+  run-on tails.
+type: software
+authors:
+  - family-names: He
+    given-names: Adam Youlin
+    email: ayhe@stanford.edu
+version: 0.1.0.dev0
+license: MIT
+repository-code: "https://github.com/adamyhe/dienr"
+keywords:
+  - nascent RNA
+  - PRO-seq
+  - GRO-seq
+  - pre-RNA isoforms
+  - transcription
+  - bioinformatics
+references:
+  - type: article
+    title: >-
+      Deconvolution of expression for nascent RNA-sequencing data (DENR)
+      highlights pre-RNA isoform diversity in human cells
+    authors:
+      - family-names: Zhao
+        given-names: Yixin
+      - family-names: Dukler
+        given-names: Noah
+      - family-names: Barshad
+        given-names: Gilad
+      - family-names: Toneyan
+        given-names: Shushan
+      - family-names: Danko
+        given-names: Charles G.
+      - family-names: Siepel
+        given-names: Adam
+    journal: Bioinformatics
+    volume: 37
+    issue: 24
+    start: 4727
+    end: 4736
+    year: 2021
+    doi: 10.1093/bioinformatics/btab582
