@@ -14,6 +14,15 @@ behind a 0/1 model column.
 
 Reference: `dienr.shape`. Design notes and full evidence: plan §18.
 
+> **Status: a DENR feature, fixed; fit and inspect it, but don't apply it.** In
+> simulation a shared profile is close to a wash (plan §18.8, §18.11), adds
+> nothing on top of a [run-on tail](runon-tails.md) (§18.13), and on real
+> K562 PRO-seq it made held-out Poisson deviance **16% worse** in total
+> (§18.14). The run-on tail is the design change that helps. A profile is
+> still useful as a *measurement*: pausing index, 5′:3′ ratio, cross-sample
+> comparison. `build-design --shape-profile` still works, but warns every
+> time it's used.
+
 ## Why
 
 Nascent RNA sequencing shows a sharp promoter-proximal pausing peak within a
@@ -26,9 +35,10 @@ There is a second reason, specific to this package. With a binary `M`, the
 fitted mean `μ` is constant across a model's support, and every generalized
 linear model whose variance function is `V(μ)` then reduces to the *same*
 estimating equation. Least squares, Poisson and NB2 agree to `0.000e+00` — this
-was measured, twice, as decision Gates B and D. A shape profile is the only
-thing in the pipeline that makes `M` non-binary, so it is a prerequisite for
-any count likelihood to affect a point estimate at all.
+was measured, twice, as decision Gates B and D. A non-binary `M` is
+therefore a prerequisite for any count likelihood to affect a point estimate
+at all. A shape profile was the first way to get one; a
+[run-on tail](runon-tails.md) is the second, and the one that pays off.
 
 How much it is worth, measured over 200 Poisson resamplings against
 `legacy` identity least squares on the same data:
@@ -58,7 +68,7 @@ Reproduce with `scripts/simulate_nascentrnasim.R` then
 
 | arm | isoform \|log2\| err | isoform rho | dominant isoform | zero estimates |
 |---|---|---|---|---|
-| binary / legacy_log (DENR default) | 0.344 / 0.271 | 0.669 / 0.555 | 0.708 / 0.585 | 0.186 / 0.166 |
+| binary / legacy_log (DENR's objective) | 0.344 / 0.271 | 0.669 / 0.555 | 0.708 / 0.585 | 0.186 / 0.166 |
 | binary / legacy_identity | 0.338 / 0.332 | 0.611 / 0.514 | 0.653 / 0.512 | 0.221 / 0.190 |
 | binary / poisson | 0.320 / 0.328 | 0.613 / 0.492 | 0.653 / 0.512 | 0.205 / 0.202 |
 | shape / legacy_log | 0.399 / 0.287 | **0.700 / 0.634** | 0.750 / 0.561 | 0.156 / 0.135 |
@@ -94,9 +104,11 @@ a zero is a qualitative claim that an isoform is off, not a small number.
 
 **It does not improve dominant-isoform identification, which is the paper's
 headline use case** (§3.4 is built on dominant-isoform differences between cell
-types). Of the four arms tested, the best dominant-isoform accuracy belongs to
-`binary/legacy_log` — DENR's default scheme with no shape profile at all
-(0.761 against 0.750 shaped, 0.733 binary/poisson, 0.737 shape/poisson).
+types). The four arms are within seed-to-seed noise of one another: on the
+recorded seeds, 0.757 for `binary/legacy_log` (DENR's default, no profile),
+0.761 shaped, 0.744 binary/poisson, 0.754 shape/poisson, and the paired share
+of discordant loci a profile gets right is 0.54–0.56. (An earlier run, three of
+whose seeds were not recorded, had DENR's default narrowly ahead; plan §18.11.)
 
 **And the mechanism proposed earlier does not survive.** A graded design really
 is better conditioned — median condition number at multi-model loci falls from
@@ -589,7 +601,7 @@ SHAPE_PROBE_TRIALS=700 /Users/adamhe/.../Rscript scripts/probe_r_shape_profile.R
 Every number in this document and in plan §18 comes from that script. It lives
 outside the test suite because it needs the reference environment; the Python
 side of the same findings is pinned as regressions in `tests/test_shape.py`,
-which needs no R:
+which needs no R (run from a checkout; see [CONTRIBUTING](../CONTRIBUTING.md)):
 
 ```bash
 uv run pytest tests/test_shape.py -q

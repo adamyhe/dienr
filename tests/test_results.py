@@ -696,3 +696,10 @@ def test_parallel_fit_works_from_a_script_without_a_main_guard(tmp_path):
         cwd=root,
     )
     assert done.stdout.count("threads after count") == 1  # the script ran once, not per worker
+
+
+def test_log_offset_is_recorded_and_only_for_the_log_objective(design):
+    result = fit(design, synthetic_counts(design), log_offset=0.01)
+    assert result.provenance["log_offset"] == 0.01
+    with pytest.raises(ValueError, match="log_offset"):
+        fit(design, synthetic_counts(design), likelihood="poisson", log_offset=0.01)

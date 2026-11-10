@@ -25,7 +25,7 @@ from .design import Design
 from .results import FitResult, collect_results
 from .solvers import inference, poisson
 from .solvers._glm import Exposure
-from .solvers.legacy import LocusFit, Transform, fit_locus
+from .solvers.legacy import LOG_OFFSET, LocusFit, Transform, fit_locus
 from .solvers.penalties import NO_PENALTY, Penalty
 from .status import FitStatus, is_failure
 
@@ -50,6 +50,7 @@ def fit(
     provenance: dict[str, Any] | None = None,
     blas_threads: int | None = 1,
     n_jobs: int = 1,
+    log_offset: float = LOG_OFFSET,
 ) -> FitResult:
     """Fit every locus of every sample and assemble the output tables.
 
@@ -87,6 +88,9 @@ def fit(
             a tiny independent problem: on a whole-genome run, multithreaded
             BLAS made fitting 1.26-1.46x *slower* (plan 14.4). Results do not
             depend on it.
+        log_offset: The constant inside the legacy log transform, ``log(y + c)``.
+            The published ``1e-3`` (default) keeps R parity. Legacy ``log``
+            only.
         n_jobs: Worker processes fitting loci in parallel. Every locus is an
             independent problem fitted by the same function either way, so the
             results are identical for any value; 1 fits in this process. If
@@ -122,6 +126,7 @@ def fit(
             provenance=provenance,
             blas_threads=blas_threads,
             n_jobs=n_jobs,
+            log_offset=log_offset,
         )
 
 
@@ -139,6 +144,7 @@ def _fit(
     provenance: dict[str, Any] | None,
     blas_threads: int | None,
     n_jobs: int,
+    log_offset: float,
 ) -> FitResult:
     """`fit`'s body, run inside its BLAS limit; workers apply the same limit."""
     if n_jobs < 1:
@@ -148,6 +154,8 @@ def _fit(
         raise ValueError(
             f"likelihood must be 'legacy', 'poisson' or 'quasi_poisson', got {likelihood!r}"
         )
+    if log_offset != LOG_OFFSET and not (likelihood == "legacy" and transform == "log"):
+        raise ValueError("log_offset applies only to likelihood='legacy' with transform='log'")
     if likelihood == "legacy":
         if penalty.is_active:
             raise ValueError(
@@ -181,6 +189,7 @@ def _fit(
         penalty=penalty,
         max_iterations=max_iterations,
         min_unmasked_bins=min_unmasked_bins,
+        log_offset=log_offset,
     )
     tasks = [
         _LocusTask(
@@ -224,6 +233,8 @@ def _fit(
     merged.update(dispersion_record)
     if likelihood == "legacy":
         merged["transform"] = transform
+        if transform == "log":
+            merged["log_offset"] = log_offset
     else:
         merged.update(penalty.describe())
         merged["use_bin_exposure"] = use_bin_exposure
@@ -243,6 +254,7 @@ class _FitOptions:
     penalty: Penalty
     max_iterations: int
     min_unmasked_bins: int
+    log_offset: float
 
 
 @dataclass(frozen=True)
@@ -264,6 +276,7 @@ def _fit_task(task: _LocusTask, options: _FitOptions) -> LocusFit:
             max_iterations=options.max_iterations,
             min_unmasked_bins=options.min_unmasked_bins,
             prior_status=task.prior,
+            log_offset=options.log_offset,
         )
     return poisson.fit_locus(
         task.models,

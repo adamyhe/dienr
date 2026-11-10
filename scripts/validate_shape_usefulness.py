@@ -36,6 +36,7 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
+from scipy.stats import rankdata
 
 import dienr
 from dienr.shape import ShapeConfig, apply_shape_profile, fit_shape_profile
@@ -74,10 +75,17 @@ def read_truth(bed: Path) -> pl.DataFrame:
 
 
 def spearman(a: np.ndarray, b: np.ndarray) -> float:
+    """Spearman rho with average ranks for ties.
+
+    Ties are common here -- zero estimates form a large block, and nascentRNASim
+    draws abundances from a discrete kernel grid -- and the old
+    ``argsort(argsort())`` ranking broke them by row order, which polars does not
+    fix after a join or group_by, so the statistic varied between identical runs.
+    """
     if a.size < 2:
         return float("nan")
-    ra = np.argsort(np.argsort(a)).astype(float)
-    rb = np.argsort(np.argsort(b)).astype(float)
+    ra = rankdata(a)
+    rb = rankdata(b)
     ra -= ra.mean()
     rb -= rb.mean()
     denominator = np.sqrt((ra @ ra) * (rb @ rb))
@@ -138,12 +146,18 @@ def run_seed(sim: Path, *, min_models: int, span: float) -> dict:
             .group_by("locus_id")
             .agg(
                 n=pl.len(),
-                estimated=pl.col("model_index").sort_by("abundance_raw", descending=True).first(),
-                truthful=pl.col("model_index").sort_by("truth", descending=True).first(),
+                # Correct if the top estimate is *a* truly dominant model:
+                # truth ties are common (discrete abundance kernel), and picking
+                # one tied model by row order made the score vary between runs.
+                hit=pl.col("truth")
+                .sort_by(["abundance_raw", "model_index"], descending=[True, False])
+                .first()
+                == pl.col("truth").max(),
             )
             .filter(pl.col("n") >= 2)
+            .sort("locus_id")
         )
-        hits = (dominant["estimated"] == dominant["truthful"]).to_numpy()
+        hits = dominant["hit"].to_numpy()
 
         # Per-locus error, for pairing: median |log2| over the locus's models.
         locus_error = (

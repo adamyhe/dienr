@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+from scipy.stats import rankdata
 
 from dienr.solvers import legacy, poisson
 from dienr.solvers._glm import Exposure
@@ -319,11 +320,17 @@ def _median(values: list[float]) -> float:
 
 
 def _spearman(a: np.ndarray, b: np.ndarray) -> float:
-    """Rank correlation without a scipy.stats dependency."""
+    """Spearman rho with average ranks for ties.
+
+    Ties are common here -- zero estimates form a large block, and nascentRNASim
+    draws abundances from a discrete kernel grid -- and the old
+    ``argsort(argsort())`` ranking broke them by row order, which polars does not
+    fix after a join or group_by, so the statistic varied between identical runs.
+    """
     if a.size < 2:
         return float("nan")
-    ra = np.argsort(np.argsort(a)).astype(float)
-    rb = np.argsort(np.argsort(b)).astype(float)
+    ra = rankdata(a)
+    rb = rankdata(b)
     ra -= ra.mean()
     rb -= rb.mean()
     denominator = np.sqrt((ra @ ra) * (rb @ rb))

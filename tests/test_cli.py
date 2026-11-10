@@ -629,8 +629,10 @@ def test_build_design_applies_a_shape_profile(shape_cli_inputs, tmp_path, capsys
         )
         == 0
     )
-    shaped_out = capsys.readouterr().out
+    shaped = capsys.readouterr()
+    shaped_out = shaped.out
     assert "reshaped by profile" in shaped_out
+    assert "not recommended" in shaped.err
     assert "reshaped by profile" not in plain_out
 
     plain = _read_design(plain_dir)

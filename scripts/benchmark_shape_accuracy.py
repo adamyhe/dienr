@@ -46,6 +46,7 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
+from scipy.stats import rankdata
 
 import dienr
 from dienr.shape import ShapeConfig, applied_dynamic_range, apply_shape_profile, fit_shape_profile
@@ -173,14 +174,16 @@ def score(estimates: pl.DataFrame, truth_by_model: pl.DataFrame) -> dict[str, fl
         .group_by("locus_id")
         .agg(
             n=pl.len(),
-            est_arg=pl.col("model_index").sort_by("abundance_raw", descending=True).first(),
-            tru_arg=pl.col("model_index").sort_by("truth", descending=True).first(),
+            # Correct if the top estimate is *a* truly dominant model; truth
+            # ties are common and were broken by row order (see `_spearman`).
+            hit=pl.col("truth")
+            .sort_by(["abundance_raw", "model_index"], descending=[True, False])
+            .first()
+            == pl.col("truth").max(),
         )
     )
     multi = multi.filter(pl.col("n") >= 2)
-    dominant = (
-        float((multi["est_arg"] == multi["tru_arg"]).mean()) if multi.height else float("nan")
-    )
+    dominant = float(multi["hit"].mean()) if multi.height else float("nan")
 
     return {
         "n_models_scored": float(expressed.height),
@@ -198,10 +201,17 @@ def score(estimates: pl.DataFrame, truth_by_model: pl.DataFrame) -> dict[str, fl
 
 
 def _spearman(a: np.ndarray, b: np.ndarray) -> float:
+    """Spearman rho with average ranks for ties.
+
+    Ties are common here -- zero estimates form a large block, and nascentRNASim
+    draws abundances from a discrete kernel grid -- and the old
+    ``argsort(argsort())`` ranking broke them by row order, which polars does not
+    fix after a join or group_by, so the statistic varied between identical runs.
+    """
     if a.size < 2:
         return float("nan")
-    ra = np.argsort(np.argsort(a)).astype(float)
-    rb = np.argsort(np.argsort(b)).astype(float)
+    ra = rankdata(a)
+    rb = rankdata(b)
     ra -= ra.mean()
     rb -= rb.mean()
     denominator = np.sqrt((ra @ ra) * (rb @ rb))
