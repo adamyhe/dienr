@@ -2,16 +2,27 @@
 
 from __future__ import annotations
 
+import typing
+
 import numpy as np
 import polars as pl
-import pybigtools
 import pytest
+from figwig import BigWigReader
 
+from dienr import counts as counts_module
 from dienr.annotation import Annotation
-from dienr.counts import SignalFile, count_sample, declared_contigs, read_binned
+from dienr.counts import (
+    SignalFile,
+    count_sample,
+    declared_contigs,
+    read_binned,
+    read_loci_binned,
+)
 from dienr.design import build_design
 from dienr.solvers.legacy import fit_locus
 from dienr.status import FitStatus
+
+from .fixtures.bigwig import write_intervals
 
 
 @pytest.fixture
@@ -24,24 +35,25 @@ def minus_bw(extdata):
     return extdata / "test_double_strand_minus.bw"
 
 
-# --- the two mandatory reader flags ----------------------------------------
+# --- exactness ---------------------------------------------------------------
 
 
-def test_binned_read_is_exact_not_zoom_level(plus_bw):
-    """`exact=True` must be set; the zoom-level default silently disagrees.
+def test_binned_read_is_exact_per_base_sum(plus_bw):
+    """Bins are exact per-base sums, never a lossy zoom-level summary.
 
-    This is the defect the wrapper exists to prevent, so it is asserted
-    directly rather than trusted.
+    ``[63, 68, 72, 77]`` is the true per-base sum of 250 bp bins over
+    ``1:0-2000``; the zoom-level path `pybigtools` took without ``exact=True``
+    returned ``[62.53, 69.53, 71.47, 76.76]`` with no error. figwig has no zoom
+    path, but the numbers stay pinned so a reader that ever grows one cannot
+    slip in silently.
     """
-    handle = pybigtools.open(str(plus_bw))
-    truth = np.asarray(handle.values("1", 0, 2000, fillna=0)).reshape(8, 250).sum(axis=1)
-    approximate = np.asarray(handle.values("1", 0, 2000, bins=8, summary="sum", fillna=0))
+    per_base = BigWigReader(str(plus_bw)).read(["1"], [0], 2000)[0]
+    truth = per_base.reshape(8, 250).sum(axis=1, dtype=np.float64)
 
     ours = read_binned(plus_bw, "1", 0, 2000, 8, summary="sum")
 
-    np.testing.assert_allclose(ours, truth)
-    # Guard against the wrapper regressing to the lossy path.
-    assert not np.allclose(approximate, truth)
+    np.testing.assert_array_equal(ours, truth)
+    np.testing.assert_array_equal(ours[:4], [63, 68, 72, 77])
 
 
 def test_uncovered_positions_read_as_zero_not_nan(extdata):
@@ -97,7 +109,12 @@ def test_count_sample_aligns_to_design(two_locus_design, plus_bw, minus_bw):
     for locus_id, values in enumerate(counts.values):
         assert values.size == two_locus_design.bin_count(locus_id)
     assert counts.design_digest == two_locus_design.digest
-    assert counts.provenance["reader_settings"]["exact"] is True
+    # The settings that make uncovered bases distinguishable from zero-valued
+    # intervals must be recorded, since every covered-base summary depends on
+    # them (figwig's default `missing=0.0` would silently change each `mean`).
+    assert counts.provenance["reader"] == "figwig"
+    assert counts.provenance["reader_settings"]["missing"] == "nan"
+    assert counts.provenance["reader_settings"]["oob"] == "nan"
 
 
 def test_signal_is_nonnegative_on_both_strands(two_locus_design, plus_bw, minus_bw):
@@ -221,12 +238,34 @@ def test_require_count_equivalent_rejects_a_mean_summary(plus_bw):
     signal.require_count_equivalent("legacy", summary="mean")
 
 
+@pytest.mark.parametrize("likelihood", ["poisson", "quasi_poisson"])
+def test_every_count_likelihood_is_guarded_by_the_public_check(likelihood):
+    """`SignalFile.require_count_equivalent` covers every count likelihood.
+
+    Its likelihood set once lived apart from `fit`'s and lacked
+    ``"quasi_poisson"``, so a per-base mean passed the public check for it.
+    `fit` was unaffected only because it carried a second, correct copy.
+    The check reads metadata only, so no file is needed and this runs without
+    the R reference fixtures.
+    """
+    path = "never-opened.bw"
+    with pytest.raises(ValueError, match="count-preserving summary"):
+        SignalFile(path, "+").require_count_equivalent(likelihood, summary="mean")
+    with pytest.raises(ValueError, match="count-equivalent"):
+        SignalFile(path, "+", value_kind="library_normalized").require_count_equivalent(likelihood)
+
+
+def test_fit_and_signal_file_share_one_set_of_count_likelihoods():
+    from dienr import pipeline
+
+    assert set(typing.get_args(pipeline.Likelihood)) - {"legacy"} == counts_module.COUNT_LIKELIHOODS
+
+
 def test_window_clipped_at_the_contig_end_is_zero_padded(plus_bw):
     """A locus running off the end of a contig must still align to the design.
 
-    pybigtools returns fewer bins than requested when the window is clipped,
-    so the vector is padded rather than left short, which would misalign every
-    downstream index.
+    A vector shorter than the design's bin count would misalign every
+    downstream index, so the clipped window must still yield every bin.
     """
     length = declared_contigs(plus_bw)["1"]
     frame = pl.DataFrame(
@@ -254,3 +293,123 @@ def test_total_signal_sums_across_loci(two_locus_design, plus_bw, minus_bw):
         (SignalFile(plus_bw, "+"), SignalFile(minus_bw, "-")),
     )
     assert counts.total_signal() == pytest.approx(sum(v.sum() for v in counts.values))
+
+
+# --- batched tile reads ------------------------------------------------------
+
+_SUMMARIES = ("sum", "mean", "min", "max", "std")
+_SIZES = {"c1": 50_003, "c2": 30_011}  # not multiples of any tile
+
+
+@pytest.fixture
+def random_signal(tmp_path):
+    """Sparse, signed, partly zero-valued signal on two contigs."""
+    rng = np.random.default_rng(7)
+    intervals = []
+    for contig, length in _SIZES.items():
+        position = 0
+        while True:
+            position += int(rng.integers(0, 80))
+            if position >= length:
+                break
+            end = min(position + int(rng.integers(1, 50)), length)
+            value = float(rng.choice([0.0, 1.0, 3.0, -2.0, rng.normal() * 4]))
+            intervals.append((contig, position, end, value))
+            position = end
+    return write_intervals(tmp_path / "random.bw", _SIZES, intervals)
+
+
+def _random_windows(rng, bin_size, n=60):
+    windows = []
+    for _ in range(n):
+        contig = str(rng.choice(list(_SIZES)))
+        n_bins = int(rng.choice([1, 2, 15, 16, 17, 33, int(rng.integers(1, 120))]))
+        start = int(rng.integers(0, _SIZES[contig] - n_bins * bin_size))
+        windows.append((contig, start, n_bins))
+    # Two windows ending exactly at the contig end, so their final tile runs
+    # off it, and a duplicate.
+    windows.append(("c1", _SIZES["c1"] - 7 * bin_size, 7))
+    windows.append(("c2", _SIZES["c2"] - 20 * bin_size, 20))
+    windows.append(windows[0])
+    return windows
+
+
+@pytest.mark.parametrize("summary", _SUMMARIES)
+@pytest.mark.parametrize("max_bytes", [64 * 2**20, 1])
+@pytest.mark.parametrize("bin_size", [1, 37, 250])
+def test_batched_read_equals_one_window_at_a_time(
+    random_signal, monkeypatch, summary, max_bytes, bin_size
+):
+    """`read_loci_binned` is `read_binned` per window, for every summary.
+
+    ``max_bytes=1`` forces one window per figwig call, so chunk boundaries are
+    exercised as hard as possible; the default puts every window in one call.
+    """
+    monkeypatch.setattr(counts_module, "MAX_CHUNK_BYTES", max_bytes)
+    reader = BigWigReader(str(random_signal))
+    windows = _random_windows(np.random.default_rng(bin_size), bin_size)
+
+    batched = read_loci_binned(reader, windows, bin_size, summary=summary)
+
+    for (contig, start, n_bins), got in zip(windows, batched, strict=True):
+        expected = read_binned(
+            random_signal, contig, start, start + n_bins * bin_size, n_bins, summary=summary
+        )
+        np.testing.assert_allclose(got, expected, rtol=1e-12, atol=1e-12)
+        assert got.dtype == np.float64 and got.shape == (n_bins,)
+
+
+def test_batched_results_do_not_share_memory(random_signal):
+    """Each locus vector is masked in place downstream, so none may alias."""
+    reader = BigWigReader(str(random_signal))
+    first, second = read_loci_binned(reader, [("c1", 0, 4), ("c1", 1000, 4)], 250)
+    assert not np.shares_memory(first, second)
+
+
+@pytest.mark.parametrize("summary", ["sum", "mean"])
+def test_count_sample_batched_equals_per_locus(random_signal, monkeypatch, summary):
+    """`count_sample` through the batch matches a locus-by-locus read.
+
+    The design includes a locus overrunning the contig end, which takes the
+    separate clipped path, so both paths and their merge are covered.
+    """
+    frame = pl.DataFrame(
+        {
+            "transcript_id": ["a", "a2", "b", "c", "edge"],
+            "contig": ["c1", "c1", "c1", "c2", "c2"],
+            "start": [100, 900, 20_000, 5_000, _SIZES["c2"] - 600],
+            "end": [6_000, 4_000, 31_000, 9_100, _SIZES["c2"] + 2_000],
+            "strand": ["+", "+", "+", "+", "+"],
+        }
+    )
+    design = build_design(Annotation.from_frame(frame), bin_size=250)
+    signal = SignalFile(random_signal, "+")
+
+    batched = count_sample(design, "s", signal, summary=summary)
+    monkeypatch.setattr(counts_module, "MAX_CHUNK_BYTES", 1)
+    one_per_call = count_sample(design, "s", signal, summary=summary, n_jobs=1)
+
+    lengths = declared_contigs(random_signal)
+    for locus in design.loci.iter_rows(named=True):
+        locus_id = locus["locus_id"]
+        n_bins = design.bin_count(locus_id)
+        start = int(locus["start"])
+        expected = read_binned(
+            random_signal,
+            locus["contig"],
+            start,
+            min(start + n_bins * 250, lengths[locus["contig"]]),
+            n_bins,
+            summary=summary,
+        )
+        assert batched.totals_all_bins[locus_id] == pytest.approx(expected.sum(), rel=1e-12)
+        expected[design.mask(locus_id)] = 0.0
+        np.testing.assert_allclose(batched.values[locus_id], expected, rtol=1e-12, atol=1e-12)
+        np.testing.assert_array_equal(batched.values[locus_id], one_per_call.values[locus_id])
+    assert batched.locus_status == one_per_call.locus_status
+
+
+def test_batched_read_rejects_a_nonpositive_thread_count(random_signal):
+    reader = BigWigReader(str(random_signal))
+    with pytest.raises(ValueError, match="n_jobs"):
+        read_loci_binned(reader, [("c1", 0, 4)], 250, n_jobs=0)

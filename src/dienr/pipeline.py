@@ -13,24 +13,20 @@ from typing import Any, Literal
 import numpy as np
 import polars as pl
 
-from .counts import SampleCounts
+from .counts import COUNT_LIKELIHOODS, SampleCounts, require_count_equivalent
 from .design import Design
 from .results import FitResult, collect_results
-from .solvers import inference, negative_binomial, poisson
+from .solvers import inference, poisson
 from .solvers._glm import Exposure
 from .solvers.legacy import LocusFit, Transform, fit_locus
 from .solvers.penalties import NO_PENALTY, Penalty
 from .status import FitStatus, is_failure
 
-Likelihood = Literal["legacy", "poisson", "quasi_poisson", "negative_binomial"]
+Likelihood = Literal["legacy", "poisson", "quasi_poisson"]
 
-#: Likelihoods that need raw counts rather than a per-base mean.
-_COUNT_LIKELIHOODS = ("poisson", "quasi_poisson", "negative_binomial")
-
-#: Likelihoods whose point estimate comes from the Poisson solver.
-#: quasi-Poisson is not a different estimator -- it is the same fit with an
-#: honest variance -- so it must not be implemented as a separate objective.
-_POISSON_ESTIMATORS = ("poisson", "quasi_poisson")
+# Every count likelihood takes its point estimate from the Poisson solver.
+# quasi-Poisson is not a different estimator -- it is the same fit with an
+# honest variance -- so it must not be implemented as a separate objective.
 
 
 def fit(
@@ -40,7 +36,6 @@ def fit(
     likelihood: Likelihood = "legacy",
     transform: Transform = "log",
     penalty: Penalty = NO_PENALTY,
-    dispersion: float | None = None,
     use_bin_exposure: bool = False,
     inactive_transcripts: set[str] | None = None,
     max_iterations: int = 15_000,
@@ -53,8 +48,7 @@ def fit(
         design: Reusable locus geometry.
         counts: One or more samples counted against `design`.
         likelihood: ``"legacy"`` (default, and the only one with established R
-            parity), ``"poisson"``, ``"quasi_poisson"``, or
-            ``"negative_binomial"``.
+            parity), ``"poisson"`` or ``"quasi_poisson"``.
 
             ``"quasi_poisson"`` gives **the same abundances as** ``"poisson"``
             and differs only in the reported standard errors, which are scaled
@@ -64,17 +58,12 @@ def fit(
             and 64% at ``phi = 1.0``, while quasi-Poisson tracks it to within a
             few percent and needs no second likelihood.
 
-            ``"negative_binomial"`` is **deprioritized**. On a rounded binary
-            design it cannot change the point estimate at all -- see plan
-            Gate D -- and quasi-Poisson matches it on uncertainty far more
-            cheaply. It remains available for designs where the fitted mean
-            varies enough across a locus for the full variance function to
-            matter.
+            There is no negative binomial: it was removed (plan Gate D). On a
+            binary design it cannot move a point estimate at any dispersion,
+            and quasi-Poisson matched its standard errors to within 1-4%.
         transform: Legacy objective; ignored by the count likelihoods.
         penalty: Named penalty. Only the count likelihoods accept one; the
             legacy solver has no penalty support, matching the reference.
-        dispersion: Shared ``phi``, required for ``negative_binomial`` and
-            normally from `dienr.solvers.negative_binomial.estimate_dispersion`.
         use_bin_exposure: Pass each locus's effective bin lengths as exposure.
             Only meaningful for count likelihoods, where a partial terminal bin
             genuinely had less opportunity to accumulate reads.
@@ -90,13 +79,12 @@ def fit(
 
     Raises:
         ValueError: For an unknown likelihood, a penalty on the legacy solver,
-            a missing dispersion for NB, or count-likelihood input that is not
-            count-equivalent.
+            or count-likelihood input that is not count-equivalent.
     """
     samples = [counts] if isinstance(counts, SampleCounts) else list(counts)
-    if likelihood not in ("legacy", *_COUNT_LIKELIHOODS):
+    if likelihood != "legacy" and likelihood not in COUNT_LIKELIHOODS:
         raise ValueError(
-            f"likelihood must be 'legacy', 'poisson' or 'negative_binomial', got {likelihood!r}"
+            f"likelihood must be 'legacy', 'poisson' or 'quasi_poisson', got {likelihood!r}"
         )
     if likelihood == "legacy":
         if penalty.is_active:
@@ -110,15 +98,18 @@ def fit(
                 "use_bin_exposure applies only to the count likelihoods; the "
                 "legacy objective has no exposure term"
             )
-    if likelihood == "negative_binomial" and dispersion is None:
-        raise ValueError(
-            "negative_binomial requires an explicit dispersion. Estimate one "
-            "across loci with dienr.solvers.negative_binomial.estimate_dispersion; "
-            "section 4.3 forbids fitting it per locus."
-        )
-    if likelihood in _COUNT_LIKELIHOODS:
+    if likelihood in COUNT_LIKELIHOODS:
         for sample in samples:
-            _require_count_equivalent(sample, likelihood)
+            # The reference's add_data hardcodes a per-base *mean* summary, so
+            # count_sample defaults to it for parity; handing that to a count
+            # likelihood is the likeliest misuse, and it is refused here.
+            files = sample.provenance.get("signal_files", [])
+            require_count_equivalent(
+                likelihood,
+                summary=str(sample.provenance.get("summary", "sum")),
+                value_kinds=[str(entry.get("value_kind", "raw")) for entry in files],
+                source=f"sample {sample.sample_id!r}",
+            )
 
     pinned = _pinned_models(design, inactive_transcripts)
 
@@ -145,42 +136,25 @@ def fit(
                 )
                 continue
 
-            exposure = _sample_exposure(design, sample, locus_id, use_bin_exposure)
-            if likelihood in _POISSON_ESTIMATORS:
-                fits.append(
-                    poisson.fit_locus(
-                        models,
-                        observed,
-                        exposure=exposure,
-                        penalty=penalty,
-                        inactive=inactive,
-                        max_iterations=max_iterations,
-                        min_unmasked_bins=min_unmasked_bins,
-                        prior_status=prior,
-                    )
+            fits.append(
+                poisson.fit_locus(
+                    models,
+                    observed,
+                    exposure=_sample_exposure(design, sample, locus_id, use_bin_exposure),
+                    penalty=penalty,
+                    inactive=inactive,
+                    max_iterations=max_iterations,
+                    min_unmasked_bins=min_unmasked_bins,
+                    prior_status=prior,
                 )
-            else:
-                fits.append(
-                    negative_binomial.fit_locus(
-                        models,
-                        observed,
-                        float(dispersion),  # type: ignore[arg-type]
-                        exposure=exposure,
-                        penalty=penalty,
-                        inactive=inactive,
-                        max_iterations=max_iterations,
-                        min_unmasked_bins=min_unmasked_bins,
-                        prior_status=prior,
-                    )
-                )
+            )
         fitted.append((sample, fits))
 
     dispersion_record: dict[str, Any] = {}
-    if likelihood in _POISSON_ESTIMATORS:
+    if likelihood in COUNT_LIKELIHOODS:
         # Quasi-Poisson needs a second pass: the dispersion is pooled over
         # every locus of every sample, which cannot be known while fitting one
-        # locus. Section 4.3's rule against per-locus dispersion applies here
-        # exactly as it does to NB.
+        # locus. Section 4.3 forbids per-locus dispersion.
         estimate = (
             inference.POISSON_DISPERSION
             if likelihood == "poisson"
@@ -200,38 +174,11 @@ def fit(
     else:
         merged.update(penalty.describe())
         merged["use_bin_exposure"] = use_bin_exposure
-    if likelihood == "negative_binomial":
-        merged["dispersion"] = float(dispersion)  # type: ignore[arg-type]
     if inactive_transcripts:
         merged["n_inactive_transcripts"] = len(inactive_transcripts)
     if provenance:
         merged.update(provenance)
     return collect_results(design, fitted, provenance=merged)
-
-
-def _require_count_equivalent(sample: SampleCounts, likelihood: str) -> None:
-    """Reject input that is not count-equivalent for a count likelihood.
-
-    Two ways it can fail, and the second is the one that actually bites: the
-    reference's `add_data` hardcodes a per-base *mean* summary, so
-    `count_sample` defaults to it for parity. Feeding that to a Poisson would
-    hand a count likelihood a density divided by bin width.
-    """
-    summary = str(sample.provenance.get("summary", "sum"))
-    files = sample.provenance.get("signal_files", [])
-    kinds = {str(entry.get("value_kind", "raw")) for entry in files}
-    if summary != "sum":
-        raise ValueError(
-            f"sample {sample.sample_id!r} was counted with summary={summary!r}, "
-            f"which is a per-base density, but likelihood {likelihood!r} needs "
-            "counts. Re-run count_sample with summary='sum'."
-        )
-    transformed = kinds - {"raw"}
-    if transformed:
-        raise ValueError(
-            f"sample {sample.sample_id!r} has value_kind {sorted(transformed)}, "
-            f"but likelihood {likelihood!r} requires untransformed counts."
-        )
 
 
 def _sample_exposure(

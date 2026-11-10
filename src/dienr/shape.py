@@ -99,9 +99,10 @@ from typing import Literal
 
 import numpy as np
 import polars as pl
+from figwig import BigWigReader
 
 from .annotation import Annotation
-from .counts import SignalFile, declared_contigs, read_binned
+from .counts import SignalFile, read_binned
 from .design import Design
 from .loci import assign_loci
 
@@ -432,14 +433,16 @@ def fit_shape_profile(
     if missing:
         raise ValueError(f"training genes lie on strand(s) {sorted(missing)} with no signal file")
 
-    readers = {strand: declared_contigs(item.path) for strand, item in by_strand.items()}
+    # One reader per file, reused for every gene: figwig parses the data index
+    # once per reader, so reopening per gene would re-read it each time.
+    readers = {strand: BigWigReader(str(item.path)) for strand, item in by_strand.items()}
     positions: list[np.ndarray] = []
     densities: list[np.ndarray] = []
     n_genes = 0
 
     for gene in candidates.iter_rows(named=True):
         strand = gene["strand"]
-        if gene["contig"] not in readers[strand]:
+        if gene["contig"] not in readers[strand].chrom_sizes:
             rejected["missing_contig"] = rejected.get("missing_contig", 0) + 1
             continue
         width = gene["end"] - gene["start"]
@@ -451,6 +454,7 @@ def fit_shape_profile(
             gene["start"] + n_bins * config.bin_size,
             n_bins,
             summary="mean",
+            reader=readers[strand],
         )
         # Orient 5' to 3'. A minus-strand gene's TSS is at its highest
         # coordinate, so bin order has to be reversed before it can share an

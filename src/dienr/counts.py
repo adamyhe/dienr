@@ -1,32 +1,42 @@
 """BigWig aggregation into per-bin signal, with exposure and provenance.
 
-All BigWig access in this package goes through `read_binned`, which exists
-mainly to pin two `pybigtools` arguments that are wrong by default and silently
-so:
+All BigWig access in this package goes through `read_binned`, built on
+`figwig`. figwig reads exact per-base values and has no zoom-level path, so the
+binning -- and therefore every semantic choice about it -- happens here, in
+plain NumPy, where it is visible and tested:
 
-``exact=True``
-    Without it, ``values(..., bins=N)`` reads precomputed zoom levels, which
-    are lossy. On the reference package's ``test_double_strand_plus.bw``, 250 bp
-    bins over ``1:0-2000`` have a true per-base sum of ``[63, 68, 72, 77]``
-    while the zoom-level path returns ``[62.53, 69.53, 71.47, 76.76]``. No
-    error is raised and every abundance downstream is biased. Small windows can
-    agree by coincidence, so a small unit test may not catch it.
+Uncovered bases
+    A base no interval covers is read as ``NaN`` (``missing=nan``) so it can be
+    told apart from an interval whose value is ``0``. It contributes nothing to
+    any summary, and a bin with no covered base summarizes to ``0``: in a
+    nascent-RNA BigWig an absent interval means zero observed polymerase, and a
+    leaked ``NaN`` would surface as a spurious numerical failure rather than a
+    legitimate zero.
 
-``fillna=0``
-    Uncovered positions and empty bins come back as ``NaN``. In a nascent-RNA
-    BigWig an absent interval means zero observed polymerase, not a missing
-    observation, and a leaked ``NaN`` would surface as a spurious numerical
-    failure instead of a legitimate zero.
+Covered-base statistics
+    ``mean``, ``min``, ``max`` and ``std`` are taken over *covered* bases only,
+    a zero-valued interval counting as covered; ``std`` is the sample standard
+    deviation, ``0`` for fewer than two bases. These are the semantics the
+    package had under `pybigtools` (``values(..., exact=True, fillna=0)``),
+    measured base by base, and R parity was established against them.
+
+Bin edges
+    Bin ``i`` of a window ``[start, end)`` is
+    ``[start + floor(i * w / n), start + floor((i + 1) * w / n))`` with
+    ``w = end - start``, so a window that is not a multiple of ``n`` gives the
+    remainder to later bins rather than reading fractional bases.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
 import numpy as np
-import pybigtools
+from figwig import BigWigReader
 
 from .design import Design
 from .status import FitStatus
@@ -44,11 +54,14 @@ VALUE_KINDS: tuple[str, ...] = (
     "other_transformed",
 )
 
-#: Likelihoods that require count-equivalent input.
-_COUNT_LIKELIHOODS = frozenset({"poisson", "negative_binomial"})
+#: Likelihoods that require count-equivalent input. The single definition:
+#: `fit` and `SignalFile.require_count_equivalent` both go through
+#: `require_count_equivalent`. There used to be two copies, and this one lacked
+#: ``"quasi_poisson"``, so the public check let a per-base mean through for it.
+COUNT_LIKELIHOODS = frozenset({"poisson", "quasi_poisson"})
 
-#: Per-bin summaries that preserve counts. ``mean`` divides by bin width, so it
-#: is a density and cannot be fed to a count likelihood.
+#: Per-bin summaries that preserve counts. ``mean`` divides by the number of
+#: covered bases, so it is a density and cannot be fed to a count likelihood.
 _COUNT_SUMMARIES = frozenset({"sum"})
 
 
@@ -84,20 +97,44 @@ class SignalFile:
         Two distinct ways the input can fail to be a count: the file itself was
         transformed, or the per-bin summary divided by bin width.
         """
-        if likelihood not in _COUNT_LIKELIHOODS:
-            return
-        if self.value_kind != "raw":
-            raise ValueError(
-                f"{self.path}: likelihood {likelihood!r} requires count-equivalent "
-                f"signal, but value_kind is {self.value_kind!r}. Use an untransformed "
-                "BigWig or select a non-count likelihood explicitly."
-            )
-        if summary not in _COUNT_SUMMARIES:
-            raise ValueError(
-                f"{self.path}: likelihood {likelihood!r} requires a count-preserving "
-                f"summary, but summary is {summary!r}, which is a per-base density. "
-                f"Use one of {sorted(_COUNT_SUMMARIES)}."
-            )
+        require_count_equivalent(
+            likelihood, summary=summary, value_kinds=(self.value_kind,), source=str(self.path)
+        )
+
+
+def require_count_equivalent(
+    likelihood: str,
+    *,
+    summary: str,
+    value_kinds: Iterable[str],
+    source: str,
+) -> None:
+    """Raise if `likelihood` needs counts and the input described is not counts.
+
+    Args:
+        likelihood: Likelihood name; anything outside `COUNT_LIKELIHOODS` passes.
+        summary: Per-bin summary the signal was aggregated with.
+        value_kinds: `ValueKind` of every signal file involved.
+        source: What to name in the error -- a path or a sample.
+
+    Raises:
+        ValueError: If any file is transformed, or the summary is a density.
+    """
+    if likelihood not in COUNT_LIKELIHOODS:
+        return
+    transformed = sorted(set(value_kinds) - {"raw"})
+    if transformed:
+        raise ValueError(
+            f"{source}: likelihood {likelihood!r} requires count-equivalent, "
+            f"untransformed counts, but value_kind is {transformed}. Use an "
+            "untransformed BigWig or select a non-count likelihood explicitly."
+        )
+    if summary not in _COUNT_SUMMARIES:
+        raise ValueError(
+            f"{source}: likelihood {likelihood!r} requires a count-preserving summary, "
+            f"but summary is {summary!r}, which is a per-base density. Re-count with "
+            f"one of {sorted(_COUNT_SUMMARIES)}."
+        )
 
 
 @dataclass
@@ -144,24 +181,22 @@ def read_binned(
     n_bins: int,
     *,
     summary: Summary = "sum",
-    reader: pybigtools.BBIReader | None = None,
+    reader: BigWigReader | None = None,
 ) -> np.ndarray:
     """Read `n_bins` exact, non-negative binned summaries from a BigWig.
 
-    The single BigWig read path for the whole package. Both normalizations that
-    every caller needs are applied *here*, at the I/O boundary, rather than by
-    each caller:
+    The single BigWig read path for the whole package. Every normalization a
+    caller needs is applied *here*, at the I/O boundary, rather than by each
+    caller; the module docstring gives the binning semantics.
 
     - **Magnitude.** Minus-strand BigWigs are conventionally written with
       negative values so a browser draws them below the axis; the signal is the
       magnitude. Strand is carried as data on `SignalFile`, never inferred from
       the sign, so a signed value has no meaning downstream and is only a way
       to get a wrong answer.
-    - **Length.** The result has to align to `n_bins` of design geometry.
-      Measured, `pybigtools` with ``oob=0.0`` already returns exactly `n_bins`
-      for every window we can construct, including one clipped at or past a
-      contig end, so the pad below is a guard on that behavior rather than a
-      code path in use.
+    - **Length.** The result always has exactly `n_bins` values, aligned to the
+      design geometry, including for a window clipped at or past a contig end
+      (bases past the end are uncovered).
 
     Both used to live in `count_sample`, so when `dienr.shape` was added it read
     through this function and got neither. On a conventionally signed
@@ -177,7 +212,7 @@ def read_binned(
         contig: Contig name, which must appear in the file header.
         start: 0-based inclusive window start.
         end: Half-open window end.
-        n_bins: Number of equal-width bins spanning the window.
+        n_bins: Number of bins spanning the window.
         summary: Per-bin statistic. ``"sum"`` is the count-preserving choice
             and the default *here*, since this is the raw aggregation
             primitive. Note `count_sample` defaults to ``"mean"`` instead,
@@ -190,23 +225,204 @@ def read_binned(
         uncovered positions and positions past a contig end counted as zero.
 
     Raises:
-        KeyError: If `contig` is absent from the file header.
+        KeyError: If `contig` is absent from the file header. figwig itself
+            would only warn and return zeros, which is the silent conflation of
+            `FitStatus.MISSING_CONTIG` with `FitStatus.ALL_ZERO` that section 10
+            of the plan forbids.
+        ValueError: If the window is empty or `n_bins` is not positive.
     """
-    handle = reader if reader is not None else pybigtools.open(str(path))
-    values = handle.values(
-        contig,
-        start,
-        end,
-        bins=n_bins,
-        summary=summary,
-        exact=True,  # never read lossy zoom levels; see module docstring
-        fillna=0.0,  # uncovered means zero polymerase, not missing
-        oob=0.0,  # reads past a contig end are zero, not an error
-    )
-    binned = np.asarray(values, dtype=np.float64)
-    if binned.size < n_bins:  # pragma: no cover - unreachable with oob=0.0
-        binned = np.concatenate([binned, np.zeros(n_bins - binned.size)])
-    return np.abs(binned, out=binned)
+    width = end - start
+    if width <= 0 or n_bins <= 0:
+        raise ValueError(f"empty window {contig}:{start}-{end} or n_bins={n_bins}")
+    handle = reader if reader is not None else BigWigReader(str(path))
+    if contig not in handle.chrom_sizes:
+        raise KeyError(contig)
+
+    per_base = handle.read(
+        [contig],
+        [start],
+        width,
+        n_jobs=1,  # one window per call: threads cannot help and cost startup
+        missing=np.nan,  # uncovered must stay distinguishable from a 0 interval
+        oob=np.nan,  # past the contig end is uncovered, not zero
+    )[0]
+    return np.abs(_summarize_bins(per_base, n_bins, summary))
+
+
+def _summarize_bins(per_base: np.ndarray, n_bins: int, summary: Summary) -> np.ndarray:
+    """Summarize per-base values (``NaN`` = uncovered) into `n_bins` bins.
+
+    `per_base` is figwig's float32 output and is overwritten: uncovered bases
+    are zeroed in place, and every reduction accumulates in float64 without
+    materializing a float64 copy of the window. On the dense benchmark the
+    copies were as expensive as decompressing the BigWig.
+    """
+    width = per_base.size
+    if width % n_bins == 0:
+        # The common case -- every design window is a whole number of bins --
+        # is a reshape, with no index arithmetic to get wrong.
+        return _summarize_rows(per_base.reshape(n_bins, width // n_bins), summary)
+
+    uncovered = np.isnan(per_base)
+    per_base[uncovered] = 0.0
+    edges = (np.arange(n_bins + 1, dtype=np.int64) * width) // n_bins
+    lengths = np.diff(edges)
+    nonempty = lengths > 0
+    starts = edges[:-1][nonempty]
+
+    def reduce_bins(ufunc: np.ufunc, array: np.ndarray, empty: float) -> np.ndarray:
+        out = np.full(n_bins, empty)
+        out[nonempty] = ufunc.reduceat(array, starts)
+        return out
+
+    n = lengths - reduce_bins(np.add, uncovered.astype(np.int64), 0)
+    sums = reduce_bins(np.add, per_base.astype(np.float64), 0.0)
+    if summary == "sum":
+        return sums
+    mean = np.divide(sums, n, out=np.zeros(n_bins), where=n > 0)
+    if summary == "mean":
+        return mean
+    if summary in ("min", "max"):
+        fill = np.inf if summary == "min" else -np.inf
+        ufunc = np.minimum if summary == "min" else np.maximum
+        out = reduce_bins(ufunc, np.where(uncovered, fill, per_base.astype(np.float64)), fill)
+        return np.where(n > 0, out, 0.0)
+    deviations = per_base - np.repeat(mean, lengths)
+    deviations[uncovered] = 0.0
+    squares = reduce_bins(np.add, np.square(deviations), 0.0)
+    return np.sqrt(np.divide(squares, n - 1, out=np.zeros(n_bins), where=n > 1))
+
+
+def _summarize_rows(rows: np.ndarray, summary: Summary) -> np.ndarray:
+    """Summarize each row of a 2-D per-base array (``NaN`` = uncovered).
+
+    One row is one bin. Used both for a single whole-bin window and for every
+    bin of a batched tile read at once. `rows` is overwritten.
+    """
+    n_rows, width = rows.shape
+    uncovered = np.isnan(rows)
+    np.copyto(rows, 0.0, where=uncovered)  # unlike rows[mask] = 0, releases the GIL
+    sums = rows.sum(axis=1, dtype=np.float64)
+    if summary == "sum":
+        return sums
+    n = width - uncovered.sum(axis=1)
+    mean = np.divide(sums, n, out=np.zeros(n_rows), where=n > 0)
+    if summary == "mean":
+        return mean
+    if summary in ("min", "max"):
+        fill = np.inf if summary == "min" else -np.inf
+        reduce = np.min if summary == "min" else np.max
+        masked = np.where(uncovered, fill, rows)
+        return np.where(n > 0, reduce(masked, axis=1).astype(np.float64), 0.0)
+    deviations = rows - mean[:, None]
+    deviations[uncovered] = 0.0
+    squares = np.square(deviations).sum(axis=1)
+    return np.sqrt(np.divide(squares, n - 1, out=np.zeros(n_rows), where=n > 1))
+
+
+#: Bins per tile in `read_loci_binned`. A tile is the unit figwig reads; it is a
+#: whole number of bins so no bin straddles two tiles. 16 bins (4 kb at the
+#: default 250 bp) wastes at most one tile per locus and gives a thread pool
+#: thousands of equal windows to share.
+TILE_BINS = 16
+
+#: Upper bound on one figwig call's per-base output. Loci are read in chunks
+#: under this cap, so memory stays flat however much of the genome the design
+#: spans (a whole genome read per base is gigabytes). A locus larger than the
+#: cap is read alone.
+MAX_CHUNK_BYTES = 64 * 2**20
+
+
+def read_loci_binned(
+    reader: BigWigReader,
+    windows: list[tuple[str, int, int]],
+    bin_size: int,
+    *,
+    summary: Summary = "sum",
+    n_jobs: int = 8,
+) -> list[np.ndarray]:
+    """Read many whole-bin windows at once, as `read_binned` would one by one.
+
+    figwig is fast when given many equal-width windows in one multithreaded
+    call, and no faster than one call per window otherwise -- one call per
+    locus left its thread pool idle and was slower than the previous reader.
+    Each window ``(contig, start, n_bins)`` is cut into tiles of
+    ``TILE_BINS * bin_size`` bases; tiles are read in calls capped at
+    `MAX_CHUNK_BYTES`, every bin of a chunk is summarized in one vectorized
+    pass, and each window takes its contiguous run of bins.
+
+    The result is identical to ``read_binned(..., start, start + n_bins *
+    bin_size, n_bins)`` for each window, which a test asserts for every
+    summary. Tile bases past a window's end are read and discarded; bases past
+    a contig end are uncovered, exactly as in `read_binned`.
+
+    Args:
+        reader: Open reader; every window's contig must be in its header.
+        windows: ``(contig, start, n_bins)`` per window, in any order.
+        bin_size: Bin width in bases.
+        summary: Per-bin statistic, as in `read_binned`.
+        n_jobs: Threads per call, for figwig's read and for binning.
+
+    Raises:
+        ValueError: If `n_jobs` is below 1. (figwig alone would read ``-1`` as
+            every CPU; the binning pool has no such convention, so it is
+            refused rather than half-honored.)
+
+    Returns:
+        One non-negative float64 array of `n_bins` values per window, in input
+        order.
+    """
+    if n_jobs < 1:
+        raise ValueError(f"n_jobs must be at least 1, got {n_jobs}")
+    tile = TILE_BINS * bin_size
+    max_tiles = max(1, MAX_CHUNK_BYTES // (4 * tile))
+    out: list[np.ndarray] = [np.empty(0)] * len(windows)
+    # Genomic order keeps each chunk's tiles close together in the file.
+    order = sorted(range(len(windows)), key=lambda i: (windows[i][0], windows[i][1]))
+
+    chunk: list[int] = []
+    n_tiles = 0
+    pool = ThreadPoolExecutor(n_jobs) if n_jobs > 1 else None
+
+    def flush() -> None:
+        tiles_per = [-(-windows[i][2] // TILE_BINS) for i in chunk]
+        contigs = np.repeat([windows[i][0] for i in chunk], tiles_per)
+        starts = np.concatenate(
+            [
+                windows[i][1] + tile * np.arange(k, dtype=np.int64)
+                for i, k in zip(chunk, tiles_per, strict=True)
+            ]
+        )
+        per_base = reader.read(contigs, starts, tile, n_jobs=n_jobs, missing=np.nan, oob=np.nan)
+        rows = per_base.reshape(-1, bin_size)
+        # Binning a chunk costs about as much as reading it, single-threaded;
+        # NumPy releases the GIL in these reductions, so split the rows across
+        # the same number of threads figwig used.
+        blocks = np.array_split(rows, min(n_jobs, len(rows)))
+        if pool is None:
+            parts = [_summarize_rows(block, summary) for block in blocks]
+        else:
+            parts = list(pool.map(lambda block: _summarize_rows(block, summary), blocks))
+        binned = np.abs(np.concatenate(parts))
+        first = 0
+        for i, k in zip(chunk, tiles_per, strict=True):
+            out[i] = binned[first : first + windows[i][2]].copy()
+            first += k * TILE_BINS
+
+    try:
+        for i in order:
+            k = -(-windows[i][2] // TILE_BINS)
+            if chunk and n_tiles + k > max_tiles:
+                flush()
+                chunk, n_tiles = [], 0
+            chunk.append(i)
+            n_tiles += k
+        if chunk:
+            flush()
+    finally:
+        if pool is not None:
+            pool.shutdown()
+    return out
 
 
 def declared_contigs(path: str | Path) -> dict[str, int]:
@@ -217,7 +433,7 @@ def declared_contigs(path: str | Path) -> dict[str, int]:
     in the window of interest (`FitStatus.ALL_ZERO`). Inferring the contig list
     from observed data conflates the two, which section 10 of the plan forbids.
     """
-    return dict(pybigtools.open(str(path)).chroms())
+    return dict(BigWigReader(str(path)).chrom_sizes)
 
 
 def count_sample(
@@ -227,6 +443,7 @@ def count_sample(
     *,
     summary: Summary = "mean",
     exposure: float = 1.0,
+    n_jobs: int = 8,
 ) -> SampleCounts:
     """Aggregate stranded BigWig signal into `design`'s bins.
 
@@ -246,6 +463,7 @@ def count_sample(
             likelihood needs ``"sum"`` instead, and must not be combined with
             ``"mean"``.
         exposure: Known sample scaling factor, recorded but not applied here.
+        n_jobs: Threads for the batched BigWig reads (`read_loci_binned`).
 
     Returns:
         A `SampleCounts` aligned to `design`.
@@ -266,13 +484,19 @@ def count_sample(
     if missing:
         raise ValueError(f"design contains loci on strand(s) {sorted(missing)} with no signal file")
 
-    readers = {s: pybigtools.open(str(f.path)) for s, f in by_strand.items()}
-    headers = {s: dict(r.chroms()) for s, r in readers.items()}
+    readers = {s: BigWigReader(str(f.path)) for s, f in by_strand.items()}
+    headers = {s: dict(r.chrom_sizes) for s, r in readers.items()}
 
     values: list[np.ndarray] = [np.empty(0) for _ in range(design.n_loci)]
     statuses: list[FitStatus] = [FitStatus.OK] * design.n_loci
     totals: list[float] = [float("nan")] * design.n_loci
 
+    # Loci whose window lies inside the contig are batched per strand; that is
+    # nearly all of them. A window running past the contig end is read alone
+    # through `read_binned`, clipped at the end, exactly as before batching.
+    batched: dict[str, list[tuple[int, tuple[str, int, int]]]] = {s: [] for s in by_strand}
+    raws: dict[int, np.ndarray] = {}
+    bin_size = design.config.bin_size
     for locus in design.loci.iter_rows(named=True):
         locus_id = locus["locus_id"]
         strand = locus["strand"]
@@ -289,17 +513,33 @@ def count_sample(
         # this from the bins frame would also mean an unguarded `.min()` that
         # returns None for an empty selection.
         window_start = int(locus["start"])
-        window_end = window_start + n_bins * design.config.bin_size
-
-        raw = read_binned(
+        window_end = window_start + n_bins * bin_size
+        if window_end <= headers[strand][contig]:
+            batched[strand].append((locus_id, (contig, window_start, n_bins)))
+            continue
+        raws[locus_id] = read_binned(
             by_strand[strand].path,
             contig,
             window_start,
-            min(window_end, headers[strand][contig]),
+            headers[strand][contig],
             n_bins,
             summary=summary,
             reader=readers[strand],
         )
+
+    for strand, items in batched.items():
+        if not items:
+            continue
+        results = read_loci_binned(
+            readers[strand],
+            [window for _, window in items],
+            bin_size,
+            summary=summary,
+            n_jobs=n_jobs,
+        )
+        raws.update(zip((locus_id for locus_id, _ in items), results, strict=True))
+
+    for locus_id, raw in raws.items():
         # Record the total before masking; after this the masked bins are gone.
         totals[locus_id] = float(raw.sum())
         raw[design.mask(locus_id)] = 0.0
@@ -318,8 +558,13 @@ def count_sample(
                 {"path": str(f.path), "strand": f.strand, "value_kind": f.value_kind} for f in files
             ],
             "summary": summary,
-            "reader": "pybigtools",
-            "reader_settings": {"exact": True, "fillna": 0.0, "oob": 0.0},
+            "reader": "figwig",
+            "tile_bases": TILE_BINS * bin_size,
+            "reader_settings": {
+                "missing": "nan",
+                "oob": "nan",
+                "uncovered": "excluded from every summary; empty bin = 0",
+            },
         },
         exposure=exposure,
     )

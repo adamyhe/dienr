@@ -41,7 +41,7 @@ from dienr.shape import (
     rescale_position,
 )
 
-pytest.importorskip("pybigtools")
+from .fixtures.bigwig import write_intervals
 
 CONTIG = "chr1"
 CONTIG_SIZE = 4_000_000
@@ -97,9 +97,7 @@ def _write_signal(
     step: int = 250,
 ):
     """Write a BigWig carrying `_true_shape` for `strand`'s genes only."""
-    import pybigtools
-
-    intervals: list[tuple[str, int, int, float]] = [(CONTIG, 0, 1, 0.0)]
+    intervals: list[tuple[str, int, int, float]] = []
     for gene in genes.iter_rows(named=True):
         if gene["strand"] != strand:
             continue
@@ -113,10 +111,7 @@ def _write_signal(
         for offset, value in zip(offsets, values, strict=True):
             begin = gene["start"] + int(offset)
             intervals.append((CONTIG, begin, min(begin + step, gene["end"]), float(value)))
-    writer = pybigtools.open(str(path), "w")
-    writer.write({CONTIG: CONTIG_SIZE}, iter(sorted(intervals)))
-    writer.close()
-    return path
+    return write_intervals(path, {CONTIG: CONTIG_SIZE}, intervals)
 
 
 @pytest.fixture
@@ -1077,9 +1072,7 @@ def test_fill_gaps_refuses_an_all_non_finite_fit():
 
 def _write_signed_signal(path, genes: pl.DataFrame, strand: str, *, sign: float):
     """Write a BigWig whose values carry `sign`, as real minus-strand files do."""
-    import pybigtools
-
-    intervals: list[tuple[str, int, int, float]] = [(CONTIG, 0, 1, 0.0)]
+    intervals: list[tuple[str, int, int, float]] = []
     for gene in genes.iter_rows(named=True):
         if gene["strand"] != strand:
             continue
@@ -1091,10 +1084,7 @@ def _write_signed_signal(path, genes: pl.DataFrame, strand: str, *, sign: float)
         for offset, value in zip(offsets, values, strict=True):
             begin = gene["start"] + int(offset)
             intervals.append((CONTIG, begin, min(begin + 250, gene["end"]), sign * float(value)))
-    writer = pybigtools.open(str(path), "w")
-    writer.write({CONTIG: CONTIG_SIZE}, iter(sorted(intervals)))
-    writer.close()
-    return path
+    return write_intervals(path, {CONTIG: CONTIG_SIZE}, intervals)
 
 
 def test_fit_handles_conventionally_negative_minus_strand(tmp_path, small_config):
@@ -1162,9 +1152,7 @@ def test_read_binned_returns_n_bins_past_a_contig_end(tmp_path):
     """A window running past the contig end still returns exactly n_bins.
 
     The length contract, which the caller relies on to align the result to
-    design geometry. `pybigtools` with ``oob=0.0`` satisfies it already, so
-    this pins the behavior we depend on rather than exercising the pad that
-    guards it.
+    design geometry.
     """
     from dienr.counts import read_binned
 
