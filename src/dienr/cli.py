@@ -12,6 +12,7 @@ cannot pass for a successful one.
 from __future__ import annotations
 
 import argparse
+import os
 import pickle
 import sys
 from pathlib import Path
@@ -145,6 +146,27 @@ def build_parser() -> argparse.ArgumentParser:
     fit_parser.add_argument("--counts", required=True, type=Path)
     fit_parser.add_argument("--output", required=True, type=Path)
     fit_parser.add_argument(
+        "--jobs",
+        type=_positive_int,
+        default=_default_jobs(),
+        help=(
+            "worker processes fitting loci in parallel (default: 4, or fewer if "
+            "fewer CPUs are available to this process). Results are identical for "
+            "any value; beyond 4 the single-threaded remainder dominates (plan 14.5)"
+        ),
+    )
+    fit_parser.add_argument(
+        "--blas-threads",
+        type=_blas_threads,
+        default=1,
+        metavar="N|auto",
+        help=(
+            "threads BLAS may use while fitting (default 1: each locus is a tiny "
+            "problem, and more threads made fitting slower, plan 14.4); 'auto' "
+            "leaves the BLAS library's own setting"
+        ),
+    )
+    fit_parser.add_argument(
         "--likelihood",
         choices=("legacy", "poisson", "quasi_poisson"),
         default="legacy",
@@ -243,6 +265,24 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--max-failure-fraction", type=float, default=1.0)
 
     return parser
+
+
+def _default_jobs() -> int:
+    """4 fitting workers, capped by the CPUs this process may use (Slurm-aware)."""
+    try:
+        available = len(os.sched_getaffinity(0))
+    except AttributeError:  # pragma: no cover - not on Linux
+        available = os.cpu_count() or 1
+    return max(1, min(4, available))
+
+
+def _blas_threads(value: str) -> int | None:
+    if value == "auto":
+        return None
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("--blas-threads must be >= 1 or 'auto'")
+    return number
 
 
 def _load_design(directory: Path) -> Design:
@@ -454,6 +494,8 @@ def cmd_fit(args: argparse.Namespace) -> int:
         penalty=Penalty(kind=args.penalty, lambda1=args.lambda1, lambda2=args.lambda2),
         use_bin_exposure=args.use_bin_exposure,
         inactive_transcripts=inactive,
+        blas_threads=args.blas_threads,
+        n_jobs=args.jobs,
     )
     result.write(args.output)
     return _report(result, args.max_failure_fraction)

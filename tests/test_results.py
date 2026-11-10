@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import numpy as np
 import polars as pl
@@ -593,3 +594,105 @@ def test_dispersion_pools_across_samples(design):
     # One dispersion, applied to every sample's errors.
     assert isinstance(result.provenance["dispersion"], float)
     assert result.model_abundance["sample_id"].n_unique() == 3
+
+
+# --- BLAS thread cap (plan 14.4) ----------------------------------------------
+
+
+def test_blas_cap_does_not_change_results(design):
+    counts = synthetic_counts(design)
+    capped = fit(design, counts, likelihood="poisson", blas_threads=1)
+    free = fit(design, counts, likelihood="poisson", blas_threads=None)
+    assert capped.model_abundance.equals(free.model_abundance)
+
+
+def test_blas_cap_is_active_while_fitting(design, monkeypatch):
+    from threadpoolctl import threadpool_info
+
+    import dienr.pipeline as pipeline
+
+    seen = []
+    original = pipeline.poisson.fit_locus
+
+    def spy(*args, **kwargs):
+        seen.extend(i["num_threads"] for i in threadpool_info() if i["user_api"] == "blas")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline.poisson, "fit_locus", spy)
+    fit(design, synthetic_counts(design), likelihood="poisson", blas_threads=1)
+    assert seen and set(seen) == {1}
+
+
+def test_blas_threads_must_be_positive(design):
+    with pytest.raises(ValueError, match="blas_threads"):
+        fit(design, synthetic_counts(design), blas_threads=0)
+
+
+# --- parallel fitting ----------------------------------------------------------
+
+
+@pytest.mark.parametrize("likelihood", ["legacy", "poisson", "quasi_poisson"])
+def test_parallel_fit_is_identical_to_serial(design, likelihood):
+    """Each locus is fitted by the same function in either case."""
+    samples = [synthetic_counts(design, "a"), synthetic_counts(design, "b", scale=3.0)]
+    if likelihood != "legacy":
+        samples = [replace(s, provenance={**s.provenance, "summary": "sum"}) for s in samples]
+    serial = fit(design, samples, likelihood=likelihood)
+    parallel = fit(design, samples, likelihood=likelihood, n_jobs=3)
+    assert parallel.model_abundance.equals(serial.model_abundance)
+    assert parallel.locus_qc.equals(serial.locus_qc)
+
+
+def test_n_jobs_must_be_positive(design):
+    with pytest.raises(ValueError, match="n_jobs"):
+        fit(design, synthetic_counts(design), n_jobs=0)
+
+
+def test_parallel_fit_works_from_a_script_without_a_main_guard(tmp_path):
+    """Most scripts don't guard ``__main__``; workers mustn't re-import it."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from .fixtures.bigwig import write_intervals
+
+    # Count first, multithreaded, as in a real session; then idle pool threads
+    # are alive when fit starts.
+    rows = [
+        {
+            "transcript_id": f"t{i}",
+            "contig": "c",
+            "start": 30_000 * i,
+            "end": 30_000 * i + 20_000 + 1_000 * (i % 3),
+            "strand": "+",
+        }
+        for i in range(60)
+    ]
+    plus = write_intervals(tmp_path / "p.bw", {"c": 2_000_000}, [("c", 0, 1_900_000, 2.0)])
+    minus = write_intervals(tmp_path / "m.bw", {"c": 2_000_000}, [("c", 0, 1_900_000, 0.1)])
+    script = tmp_path / "unguarded.py"
+    script.write_text(
+        "import threading, polars as pl, dienr\n"
+        f"rows = {rows!r}\n"
+        "d = dienr.build_design(dienr.Annotation.from_frame(pl.DataFrame(rows)), bin_size=250)\n"
+        f"signal = (dienr.SignalFile({str(plus)!r}, '+'), dienr.SignalFile({str(minus)!r}, '-'))\n"
+        "c = dienr.count_sample(d, 's', signal, summary='sum', n_jobs=4)\n"
+        # figwig keeps a shared reader pool alive between reads; small reads
+        # may not start it, so hold an idle executor open the same way.
+        "from concurrent.futures import ThreadPoolExecutor\n"
+        "idle = ThreadPoolExecutor(2); idle.submit(int).result(); idle.submit(int).result()\n"
+        "assert threading.active_count() > 1\n"
+        "print('threads after count:', threading.active_count())\n"
+        "r = dienr.fit(d, c, likelihood='poisson', n_jobs=2)\n"
+        "assert r.model_abundance.height > 0\n"
+    )
+    root = Path(__file__).resolve().parents[1]
+    done = subprocess.run(
+        [sys.executable, str(script)],
+        check=True,
+        timeout=120,
+        capture_output=True,
+        text=True,
+        cwd=root,
+    )
+    assert done.stdout.count("threads after count") == 1  # the script ran once, not per worker

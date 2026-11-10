@@ -99,10 +99,9 @@ from typing import Literal
 
 import numpy as np
 import polars as pl
-from figwig import BigWigReader
 
 from .annotation import Annotation
-from .counts import SignalFile, read_binned
+from .counts import SignalFile, open_bigwig, read_binned
 from .design import Design
 from .loci import assign_loci
 
@@ -435,7 +434,7 @@ def fit_shape_profile(
 
     # One reader per file, reused for every gene: figwig parses the data index
     # once per reader, so reopening per gene would re-read it each time.
-    readers = {strand: BigWigReader(str(item.path)) for strand, item in by_strand.items()}
+    readers = {strand: open_bigwig(item.path) for strand, item in by_strand.items()}
     positions: list[np.ndarray] = []
     densities: list[np.ndarray] = []
     n_genes = 0

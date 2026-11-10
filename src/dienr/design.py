@@ -283,8 +283,8 @@ def _build(annotation: Annotation, config: DesignConfig) -> Design:
     width = config.bin_size
     grouped = assign_loci(annotation.transcripts, distance=config.effective_distance)
     loci = locus_table(grouped)
+    n_loci = loci.height
 
-    bin_rows: list[pl.DataFrame] = []
     models: list[np.ndarray] = []
     masks: list[np.ndarray] = []
     bin_lengths: list[np.ndarray] = []
@@ -292,21 +292,39 @@ def _build(annotation: Annotation, config: DesignConfig) -> Design:
     map_rows: list[dict] = []
     model_rows: list[dict] = []
 
-    # Per-locus transcript slices, in locus order.
-    partitions = grouped.partition_by("locus_id", as_dict=True, maintain_order=True)
+    # Per-locus transcript slices from one stable sort: within a locus,
+    # transcripts keep their input order, exactly as `partition_by(...,
+    # maintain_order=True)` gave them. Plain arrays, because building a
+    # DataFrame per locus was a third of the whole stage at genome scale
+    # (plan 14.4).
+    order = np.argsort(grouped["locus_id"].to_numpy(), kind="stable")
+    tx_locus = grouped["locus_id"].to_numpy()[order]
+    tx_start = grouped["start"].to_numpy()[order]
+    tx_end = grouped["end"].to_numpy()[order]
+    tx_plus = grouped["strand"].to_numpy()[order] == "+"
+    tx_id = grouped["transcript_id"].to_numpy()[order]
+    tx_gene = grouped["gene_id"].to_numpy()[order]
+    locus_ids = loci["locus_id"].to_numpy()
+    first = np.searchsorted(tx_locus, locus_ids, side="left")
+    last = np.searchsorted(tx_locus, locus_ids, side="right")
+    locus_lo = loci["start"].to_numpy()
+    locus_hi = loci["end"].to_numpy()
+    locus_names = loci["locus_name"].to_list()
+    n_bins_all = -(-(locus_hi - locus_lo) // width)  # ceil division
 
-    for locus in loci.iter_rows(named=True):
-        locus_id = locus["locus_id"]
-        members = partitions[(locus_id,)]
-        lo, hi = locus["start"], locus["end"]
-        n_bins = -(-(hi - lo) // width)  # ceil division
+    for row in range(n_loci):
+        locus_id = int(locus_ids[row])
+        a, b = first[row], last[row]
+        starts, ends, plus = tx_start[a:b], tx_end[a:b], tx_plus[a:b]
+        lo, hi = int(locus_lo[row]), int(locus_hi[row])
+        n_bins = int(n_bins_all[row])
 
         bin_starts = lo + np.arange(n_bins, dtype=np.int64) * width
         bin_ends = bin_starts + width
         # The last bin overhangs the locus; its usable extent is shorter.
         effective = np.minimum(bin_ends, hi) - bin_starts
 
-        matrix = _occupancy_matrix(members, bin_starts, bin_ends, width)
+        matrix = _occupancy_matrix(starts, ends, bin_starts, bin_ends, width)
 
         # Masks come from the *unrounded* occupancy, and rounding happens after.
         # The order matters and is not interchangeable: a transcript whose first
@@ -316,9 +334,9 @@ def _build(annotation: Annotation, config: DesignConfig) -> Design:
         # models collapsed together on 12 of 124 loci in the benchmark, in both
         # directions, while every small fixture still passed.
         if config.uses_base_windows:
-            masked = _mask_bins_by_bases(members, bin_starts, bin_ends, config)
+            masked = _mask_bins_by_bases(starts, ends, plus, bin_starts, bin_ends, config)
         else:
-            masked = _mask_bins(matrix, members["strand"].to_list(), config)
+            masked = _mask_bins(matrix, plus, config)
         rounded = _BIN_OPERATIONS[config.bin_operation](matrix)
         # Read the occupied span off the rounded matrix before masking zeroes
         # its ends, then keep only the representative columns' spans.
@@ -332,25 +350,11 @@ def _build(annotation: Annotation, config: DesignConfig) -> Design:
         bin_lengths.append(effective.astype(np.float64))
         model_spans.append(spans[representatives, :])
 
-        bin_rows.append(
-            pl.DataFrame(
-                {
-                    "locus_id": np.full(n_bins, locus_id, dtype=np.uint32),
-                    "bin_index": np.arange(n_bins, dtype=np.uint32),
-                    "contig": [locus["contig"]] * n_bins,
-                    "start": bin_starts,
-                    "end": bin_ends,
-                    "effective_length": effective,
-                    "masked": masked,
-                }
-            )
-        )
-
-        transcript_ids = members["transcript_id"].to_list()
-        gene_ids = members["gene_id"].to_list()
+        transcript_ids = tx_id[a:b]
+        gene_ids = tx_gene[a:b]
         for model_index, member_columns in enumerate(class_members):
             size = len(member_columns)
-            model_id = _model_id(locus["locus_name"], reduced[:, model_index])
+            model_id = _model_id(locus_names[row], reduced[:, model_index])
             has_support = bool(reduced[:, model_index].any())
             model_rows.append(
                 {
@@ -375,21 +379,7 @@ def _build(annotation: Annotation, config: DesignConfig) -> Design:
                     }
                 )
 
-    bins = (
-        pl.concat(bin_rows)
-        if bin_rows
-        else pl.DataFrame(
-            schema={
-                "locus_id": pl.UInt32,
-                "bin_index": pl.UInt32,
-                "contig": pl.String,
-                "start": pl.Int64,
-                "end": pl.Int64,
-                "effective_length": pl.Int64,
-                "masked": pl.Boolean,
-            }
-        )
-    )
+    bins = _bins_table(loci, n_bins_all, width, masks)
 
     transcript_map = pl.DataFrame(
         map_rows,
@@ -447,8 +437,43 @@ def _occupied_spans(matrix: np.ndarray) -> np.ndarray:
     return spans
 
 
+def _bins_table(
+    loci: pl.DataFrame, n_bins: np.ndarray, width: int, masks: list[np.ndarray]
+) -> pl.DataFrame:
+    """The design's bin table, built once for every locus."""
+    total = int(n_bins.sum())
+    locus_index = np.repeat(np.arange(loci.height), n_bins)
+    offsets = np.concatenate([[0], np.cumsum(n_bins)[:-1]]).astype(np.int64)
+    bin_index = np.arange(total, dtype=np.int64) - np.repeat(offsets, n_bins)
+    lo = loci["start"].to_numpy().astype(np.int64)[locus_index]
+    hi = loci["end"].to_numpy().astype(np.int64)[locus_index]
+    starts = lo + bin_index * width
+    ends = starts + width
+    return pl.DataFrame(
+        {
+            "locus_id": loci["locus_id"].to_numpy()[locus_index].astype(np.uint32),
+            "bin_index": bin_index.astype(np.uint32),
+            "contig": loci["contig"].gather(pl.Series(locus_index, dtype=pl.UInt32)),
+            "start": starts,
+            "end": ends,
+            "effective_length": np.minimum(ends, hi) - starts,
+            "masked": np.concatenate(masks) if masks else np.zeros(0, dtype=bool),
+        },
+        schema={
+            "locus_id": pl.UInt32,
+            "bin_index": pl.UInt32,
+            "contig": pl.String,
+            "start": pl.Int64,
+            "end": pl.Int64,
+            "effective_length": pl.Int64,
+            "masked": pl.Boolean,
+        },
+    )
+
+
 def _occupancy_matrix(
-    members: pl.DataFrame,
+    tx_starts: np.ndarray,
+    tx_ends: np.ndarray,
     bin_starts: np.ndarray,
     bin_ends: np.ndarray,
     width: int,
@@ -459,8 +484,8 @@ def _occupancy_matrix(
     by the nominal width rather than the effective length is deliberate: it
     keeps a fully covered bin at exactly 1.0 and matches the published method.
     """
-    starts = members["start"].to_numpy()[None, :]
-    ends = members["end"].to_numpy()[None, :]
+    starts = tx_starts[None, :]
+    ends = tx_ends[None, :]
     overlap = np.minimum(bin_ends[:, None], ends) - np.maximum(bin_starts[:, None], starts)
     np.maximum(overlap, 0, out=overlap)
     return overlap.astype(np.float64) / width
@@ -468,7 +493,7 @@ def _occupancy_matrix(
 
 def _mask_bins(
     matrix: np.ndarray,
-    strands: list[str],
+    plus: np.ndarray,
     config: DesignConfig,
 ) -> np.ndarray:
     """Union of per-transcript masked bins for one locus.
@@ -478,40 +503,43 @@ def _mask_bins(
     on strand, so a minus-strand transcript takes `mask_start_bins` at its
     highest-coordinate bin.
 
+    Vectorized over transcripts: each of the four marks is one broadcast of
+    ``origin + step * arange(count)``. Marking one transcript at a time was
+    326k calls at genome scale (plan 14.4).
+
     Returns a boolean array over bins; True means masked.
     """
-    n_bins, n_transcripts = matrix.shape
+    n_bins = matrix.shape[0]
     masked = np.zeros(n_bins, dtype=bool)
     start_in, start_out = config.mask_start_bins
     end_in, end_out = config.mask_end_bins
     if start_in == start_out == end_in == end_out == 0:
         return masked
 
-    for column in range(n_transcripts):
-        occupied = np.flatnonzero(matrix[:, column])
-        if occupied.size == 0:
-            continue
-        low, high = int(occupied[0]), int(occupied[-1])
+    occupied = matrix != 0
+    present = occupied.any(axis=0)
+    low = np.argmax(occupied, axis=0)[present]
+    high = (n_bins - 1 - np.argmax(occupied[::-1, :], axis=0))[present]
+    plus = np.asarray(plus, dtype=bool)[present]
 
-        if strands[column] == "+":
-            five_prime, three_prime = low, high
-            inward, outward = 1, -1
-        else:
-            # On the minus strand the 5' end sits at the higher coordinate, so
-            # "inward" runs toward lower bin indices.
-            five_prime, three_prime = high, low
-            inward, outward = -1, 1
+    # On the minus strand the 5' end sits at the higher coordinate, so
+    # "inward" runs toward lower bin indices.
+    five_prime = np.where(plus, low, high)
+    three_prime = np.where(plus, high, low)
+    inward = np.where(plus, 1, -1)
+    outward = -inward
 
-        _mark(masked, five_prime, start_in, inward)
-        _mark(masked, five_prime + outward, start_out, outward)
-        _mark(masked, three_prime, end_in, -inward)
-        _mark(masked, three_prime - outward, end_out, -outward)
-
+    _mark(masked, five_prime, start_in, inward)
+    _mark(masked, five_prime + outward, start_out, outward)
+    _mark(masked, three_prime, end_in, -inward)
+    _mark(masked, three_prime - outward, end_out, -outward)
     return masked
 
 
 def _mask_bins_by_bases(
-    members: pl.DataFrame,
+    tx_starts: np.ndarray,
+    tx_ends: np.ndarray,
+    plus: np.ndarray,
     bin_starts: np.ndarray,
     bin_ends: np.ndarray,
     config: DesignConfig,
@@ -544,46 +572,37 @@ def _mask_bins_by_bases(
     Returns a boolean array over bins; True means masked.
     """
     masked = np.zeros(bin_starts.size, dtype=bool)
-    starts = members["start"].to_numpy()
-    ends = members["end"].to_numpy()
-    strands = members["strand"].to_list()
+    plus = np.asarray(plus, dtype=bool)
+    # Half-open spans: the first transcribed base is `start`, the last is
+    # `end - 1`. Which of those is the TSS depends on strand.
+    tss = np.where(plus, tx_starts, tx_ends - 1)
+    pas = np.where(plus, tx_ends - 1, tx_starts)
 
-    for index, strand in enumerate(strands):
-        span_start, span_end = int(starts[index]), int(ends[index])
-        # Half-open spans: the first transcribed base is `start`, the last is
-        # `end - 1`. Which of those is the TSS depends on strand.
-        if strand == "+":
-            tss, pas = span_start, span_end - 1
-        else:
-            tss, pas = span_end - 1, span_start
-
-        for window, anchor in ((config.mask_tss, tss), (config.mask_pas, pas)):
-            # (0, 0) disables that end, matching how the legacy bin-count form
-            # treats it. Without this it would still mask the single base at
-            # the anchor, and hence its whole bin, which is not what a caller
-            # writing (0, 0) means.
-            if window is None or window == (0, 0):
-                continue
-            upstream, downstream = window
-            if strand == "+":
-                lo, hi = anchor - upstream, anchor + downstream
-            else:
-                # Upstream is the higher coordinate on the minus strand.
-                lo, hi = anchor - downstream, anchor + upstream
-            # Half-open window centred so that (u, d) is symmetric when u == d.
-            hi += 1
-            if hi <= lo:
-                continue
-            masked |= (bin_starts < hi) & (bin_ends > lo)
+    for window, anchor in ((config.mask_tss, tss), (config.mask_pas, pas)):
+        # (0, 0) disables that end, matching how the legacy bin-count form
+        # treats it. Without this it would still mask the single base at
+        # the anchor, and hence its whole bin, which is not what a caller
+        # writing (0, 0) means.
+        if window is None or window == (0, 0):
+            continue
+        upstream, downstream = window
+        # Upstream is the higher coordinate on the minus strand.
+        lo = np.where(plus, anchor - upstream, anchor - downstream)
+        # Half-open window centred so that (u, d) is symmetric when u == d.
+        hi = np.where(plus, anchor + downstream, anchor + upstream) + 1
+        keep = hi > lo
+        lo, hi = lo[keep], hi[keep]
+        hits = (bin_starts[:, None] < hi[None, :]) & (bin_ends[:, None] > lo[None, :])
+        masked |= hits.any(axis=1)
 
     return masked
 
 
-def _mark(masked: np.ndarray, origin: int, count: int, step: int) -> None:
-    """Mask `count` bins from `origin` in direction `step`, clipped to range."""
-    if count <= 0:
+def _mark(masked: np.ndarray, origin: np.ndarray, count: int, step: np.ndarray) -> None:
+    """Mask `count` bins from each `origin` in its direction `step`, clipped."""
+    if count <= 0 or origin.size == 0:
         return
-    indices = origin + step * np.arange(count)
+    indices = (origin[:, None] + step[:, None] * np.arange(count)[None, :]).ravel()
     indices = indices[(indices >= 0) & (indices < masked.size)]
     masked[indices] = True
 
