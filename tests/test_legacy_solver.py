@@ -325,3 +325,54 @@ def test_pinned_model_gradient_is_recomputed():
     assert result.abundance[0] == 0.0
     expected = gradient(result.abundance, models, observed, "log")
     assert result.gradient_norm == pytest.approx(float(np.abs(expected).max()))
+
+
+# --- the log offset as a parameter (plan 18.23) ---------------------------------
+
+
+@pytest.mark.parametrize("offset", [1e-4, 0.1, 1.0])
+def test_log_offset_gradient_matches_finite_differences(two_model_design, offset):
+    observed = two_model_design @ np.array([0.2, 0.05])
+    observed[0] = 0.0
+    point = np.array([0.13, 0.04])
+    analytic = gradient(point, two_model_design, observed, "log", log_offset=offset)
+    step = 1e-7
+    numeric = np.array(
+        [
+            (
+                objective(point + step * e, two_model_design, observed, "log", log_offset=offset)
+                - objective(point - step * e, two_model_design, observed, "log", log_offset=offset)
+            )
+            / (2 * step)
+            for e in np.eye(2)
+        ]
+    )
+    np.testing.assert_allclose(analytic, numeric, rtol=1e-4, atol=1e-6)
+
+
+def test_fused_closure_matches_reference_with_another_offset(two_model_design):
+    from dienr.solvers.legacy import _value_and_grad
+
+    observed = two_model_design @ np.array([0.3, 0.1])
+    point = np.array([0.2, 0.15])
+    value, grad = _value_and_grad(two_model_design, observed, "log", 0.05)(point)
+    assert value == pytest.approx(
+        objective(point, two_model_design, observed, "log", log_offset=0.05)
+    )
+    np.testing.assert_allclose(
+        grad, gradient(point, two_model_design, observed, "log", log_offset=0.05)
+    )
+
+
+def test_default_log_offset_is_the_published_one(two_model_design):
+    observed = two_model_design @ np.array([0.3, 0.1])
+    default = fit_locus(two_model_design, observed)
+    explicit = fit_locus(two_model_design, observed, log_offset=LOG_OFFSET)
+    np.testing.assert_array_equal(default.abundance, explicit.abundance)
+    single = fit_locus(two_model_design[:, :1], observed, log_offset=0.5)
+    assert single.status is FitStatus.OK
+
+
+def test_log_offset_must_be_positive(two_model_design):
+    with pytest.raises(ValueError, match="log_offset"):
+        fit_locus(two_model_design, np.ones(6), log_offset=0.0)

@@ -1,6 +1,9 @@
 # Python Reimplementation of DENR: Implementation Plan
 
-Status: proposed  
+Status: legacy pipeline implemented with R parity; count likelihoods and run-on
+tails implemented. This file is the binding design spec **and** the validation
+record (sections 17-18); user documentation lives in `docs/`. See
+`notes/README.md` for how the two relate.  
 Package name: `dienr`  
 Target: a scientifically faithful, multi-sample, failure-transparent implementation of DENR for Python and machine-learning workflows
 
@@ -980,6 +983,118 @@ Provisional performance targets, to be finalized after Phase 0:
 - Near-linear useful scaling through four CPU workers for the fitting stage.
 - Reusing a design for a new sample must avoid all annotation and equivalence-class reconstruction.
 
+### 14.4 Genome scale: where the time goes (November 2026)
+
+`scripts/profile_k562.py`, one process per run, each stage timed and run
+under cProfile. K562 PRO-seq rep1, Ensembl GRCh37.87, contigs renamed; Python
+3.13.13, polars 2.1.0, numpy 2.5.2, the Poisson single-model fast path. The
+14.2 benchmarks were 124 and 955 loci; this is 18,967 loci / 49,511 models
+(protein-coding, 81,579 transcripts, 11,633 multi-model loci, up to 32 models
+and 9,219 bins) and 46,994 loci / 122,969 models (every transcript).
+
+Same node (cbsubscb20, EPYC 9554), protein-coding, 8 data threads:
+
+| stage | BLAS 8 threads | BLAS 1 thread |
+|---|---|---|
+| build_design | 9.60 s | 9.39 s |
+| fit_legacy | 11.43 s | 7.85 s |
+| fit_poisson | 8.84 s | 7.03 s |
+| count (sum) | 2.50 s | 1.89 s |
+| parse | 1.79 s | 1.51 s |
+| runon_tail | 0.64 s | 1.16 s |
+| strand check, apply tail, write | < 1 s each | < 1 s each |
+| **total** | **35.8 s** | **29.7 s** |
+
+- **A whole-genome run takes about half a minute.** Fitting is about half of
+  it; design building about a third.
+- **Multithreaded BLAS costs 1.26-1.46x on fitting** -- the matrices are tiny
+  and the threads only add synchronization. Capping BLAS at one thread inside
+  `fit` (threadpoolctl) is the cheapest speedup available.
+- **An earlier "4x BLAS slowdown" was the node, not BLAS.** The first profile
+  ran BLAS-8 on cbsubscb16 (EPYC 7763) and BLAS-1 on cbsubscb20, and every
+  stage was ~4x slower on 16, including pure-Python ones (build_design 53 s vs
+  14 s). 18.18's rep1 trial, also on cbsubscb16, took 2,407 s against rep2's
+  323 s on cbsubscb17. Compare configurations on one node.
+- **Cold start is a separate, larger cost on Lustre.** The first figwig read
+  in a fresh process spent 24 s in `runon_tail` on a cold cache: 11.4 s in 372
+  `stat` calls and 2.8 s in `open_code`, all from importing numba/llvmlite
+  modules out of a `.venv` on /home2, plus ~1.6 s of numba compilation. Warm,
+  the same stage takes 0.6-1.2 s. Each CLI command is a new process, so a
+  `.venv` on local disk (/workdir) matters more than any kernel.
+- **build_design's cost is Polars construction per locus**, not geometry:
+  18,967 small DataFrames (4.2 s cumulative in Polars constructors) and
+  326k calls to `design._mark` (2.3 s). Building the bins table once, in
+  NumPy, is a plain vectorization job.
+- **Numba: still no.** The arithmetic in the fitting closures is ~5 s of a
+  30 s run; 14.3's ~2x on those would save ~2.5 s, against a second
+  bit-identical implementation of every likelihood. The two items above
+  (BLAS cap, vectorized design build) are worth more and cost less.
+
+**Both done.** `fit(blas_threads=1)` (CLI `--blas-threads`, `auto` to leave
+the library alone) wraps fitting in `threadpoolctl.threadpool_limits`; results
+are unchanged, which a test pins. `build_design` now slices transcripts per
+locus from one stable sort instead of `partition_by` + per-locus DataFrames,
+vectorizes both mask forms over transcripts, and builds the bin table once.
+Timed on one node (cbsubscb20, job 4108219, best of 3), every output
+bit-identical to the previous code on the K562 annotations -- digest, bins,
+models, masks, spans, maps, for paper, base-window and no masking:
+
+| annotation, masks | before | after |
+|---|---|---|
+| protein-coding, paper | 5.49 s | 2.35 s |
+| protein-coding, no PAS mask | 4.85 s | 2.10 s |
+| every transcript, paper | 12.80 s | 5.27 s |
+| every transcript, no PAS mask | 11.43 s | 4.89 s |
+
+What remains is ~0.1 ms of NumPy call overhead per locus, spread evenly;
+going further means batching loci together, which isn't worth it at ~2 s.
+
+### 14.5 Lazy figwig import and parallel fitting (November 2026)
+
+**Lazy import.** `import dienr` used to load figwig and with it numba and
+llvmlite, so `build-design` and `fit` paid for a JIT stack they never use.
+Every BigWig is now opened through `counts.open_bigwig`, which imports figwig
+on first use; a test asserts `import dienr, dienr.cli` loads none of the three.
+Fresh-process `import dienr.cli` on cbsubscb20 with the `.venv` on /home2
+(job 4108222, alternating old/new): **15.9 s -> 1.8 s** on the first, cold
+run; ~2.0 s -> 0.77 s warm.
+
+**Parallel fitting.** `fit(n_jobs=N)` (CLI `--jobs`) fits loci in worker
+processes. Every locus is fitted by the same function, so outputs are
+identical for any N (tested for legacy, Poisson and quasi-Poisson). Each
+locus's data goes to one worker once, in contiguous chunks balanced by
+bins x models^2, eight chunks per worker. K562 protein-coding, one sample,
+cbsubscb20 (job 4108225), every output identical to N = 1:
+
+| | N = 1 | 2 | 4 | 8 |
+|---|---|---|---|---|
+| legacy (defaults) | 7.73 s | 4.91 s | 3.17 s | 2.94 s |
+| quasi-Poisson + tail | 7.17 s | 5.11 s | 3.82 s | 3.67 s |
+
+About 2.5 s stays serial -- building per-locus tasks, assembling the result
+tables, and quasi-Poisson's pooled standard-error pass -- so 4 workers get
+nearly all of it. The CLI defaults to 4, capped by `os.sched_getaffinity`
+(which honours a Slurm allocation); the library defaults to 1.
+
+**Start method -- a trap found while timing.** `forkserver` and `spawn`
+re-import the caller's `__main__`, so a script calling `fit(n_jobs=4)`
+without an `if __name__ == "__main__":` guard crashed (the timing script
+itself did). `fork` doesn't, but is unsafe while another thread is mid-work.
+`_start_context` forks when every other Python thread is a
+`concurrent.futures` pool worker -- in practice figwig's shared reader pool,
+which outlives each read, is idle once `count` returns, and is keyed by PID --
+and falls back to `forkserver` otherwise. Python's "multi-threaded fork"
+DeprecationWarning is silenced around the pool only, because NumPy's OpenBLAS
+threads trigger it in every process and OpenBLAS reinitializes itself after
+fork. A test runs an unguarded script that counts, holds an idle executor,
+and fits with N = 2; it fails under the stricter "no other thread" rule.
+
+**Not done: warm starts across samples.** Starting each Poisson locus at the
+previous sample's estimate would save iterations only at multi-model loci in
+multi-sample runs, and would move results by solver tolerance (single-model
+loci already take the closed form). Next to the above it isn't worth the
+change in outputs.
+
 ## 15. Normalization and downstream inference
 
 Fitting and between-sample normalization must be separate operations.
@@ -1658,6 +1773,9 @@ between seeds. Better conditioning is real and does not cash out as accuracy.
 case.** Of four arms, the best dominant accuracy is `binary/legacy_log` --
 DENR's default with no profile at all (0.761 vs 0.750 shaped, 0.733
 binary/poisson, 0.737 shape/poisson).
+**Does not reproduce on the recorded seeds -- see 18.11:** there
+`shape/legacy_log` edges it, 0.761 vs 0.757, a gap well inside seed-to-seed
+noise; the wash verdict stands.
 
 So the defensible uses are narrow:
 
@@ -1685,28 +1803,981 @@ archetypes may understate how *predictable* shape is within a cell type
 (strengthening it). Real data would settle it; see 18.6 for the accessions.
 
 
+### 18.9 Could *any* density model help? The oracle ceiling
+
+18.8 left one door open, and the DENR paper's Discussion points at it: a
+per-gene density model fitted inside the likelihood instead of one shared
+profile. Before building one, `scripts/oracle_shape_ceiling.py` asks what
+bounds it -- how much better deconvolution gets if the design knows every
+isoform's **true** expected density. No model estimated from data can beat that.
+
+**The oracle is exact, not approximate.** nascentRNASim gives each simulated
+transcript exactly the width of one archetype (the 62 archetype widths are
+unique) and generates its sense signal by resampling that archetype's counts,
+so `E[count at p] = score * L * sense_arch[p] / abundance_estimate_arch` for one
+library constant `L` (`simulate_data`). `scripts/export_archetypes.R` exports
+the vectors. Checked before use: on 60 isolated single-isoform loci the
+observed/expected ratio was within a few percent of one `L` (0.0343) for 90% of
+loci, per-bin correlation 0.975 against -0.06 with the column reversed; the
+outliers each had an expressed transcript excluded from that check within the
+6 kb flank.
+
+**Corrected by 18.10.** The first version of this section scored every arm on
+~200 multi-model loci per seed and concluded that the ceiling was "absent" by
+the letter of the rule, that a general density model was not worth building, and
+that most of the gain was run-on. All three were artifacts of a Poisson solver
+bug (18.10): the exact-density oracle arms failed `invalid_mean` at ~55-65% of
+loci, pairing kept only the loci where they happened to fit, and those were the
+easy ones (binary accuracy 0.84 there vs 0.73 overall). The numbers below are
+from the fixed solver; the old ones are kept in the last column.
+
+Five 1500-locus seeds (5, 17, 29, 41, 53 -- the three 18.8 seeds besides 5 and 17
+were never recorded, so these are new), the paper's masking, Poisson unless
+stated, every arm scored on the same **~790 multi-model loci per seed** (>= 2
+models, one expressed, fitted by every arm -- now all scorable loci). Means over
+seeds:
+
+| arm (what the design knows) | dominant accuracy | median abs log2 err | expressed at zero | *old dominant (~200 loci)* |
+|---|---|---|---|---|
+| binary/legacy_log (DENR default) | 0.731 | 0.381 | 16.5% | *0.840* |
+| binary/poisson | 0.698 | 0.415 | 18.7% | *0.828* |
+| shape/poisson (shared profile) | 0.715 | 0.433 | 17.1% | *0.821* |
+| oracle_flat -- true per-isoform scale only | 0.697 | 0.389 | 18.6% | *0.831* |
+| oracle_2level -- true head (2 kb) / body step | 0.745 | 0.336 | 14.2% | *0.855* |
+| oracle_smooth -- true shape, 5-bin running mean | 0.822 | 0.261 | 6.7% | *0.886* |
+| oracle -- exact expected density, annotated span | 0.877 | 0.177 | 3.7% | *0.912* |
+| oracle_flank -- plus run-on / upstream signal in the locus | **0.976** | **0.042** | 2.0% | *0.978* |
+| oracle/legacy_log | 0.909 | 0.170 | 2.7% | *0.945* |
+
+At single-model loci every oracle arm reaches 0.027 median abs log2 error
+(binary/poisson 0.078), confirming the construction end to end.
+
+**The pre-registered rule says the ceiling EXISTS, as written.** Fixed before
+running: `oracle/poisson` vs `binary/poisson`, paired, must win >= 60% of
+discordant-dominant loci pooled and > 50% in every seed, AND show a within-locus
+Spearman gain > 0 in every seed. **Pooled 0.949 (747 gained / 40 lost)**, > 0.5
+every seed, rho gain +0.23 to +0.38 in every seed; lower error at 79% of loci.
+(The first run "failed" the rho criterion on 9-16 loci per seed and was
+reinterpreted post hoc; that reinterpretation is now moot, and the small count
+was itself a symptom of the bug.)
+
+What the ladder says (the gap from binary/poisson to oracle_flank is 0.28):
+
+- **Knowing units alone does nothing for the dominant call** (flat 0.697 vs
+  binary 0.698), and only modestly helps magnitude (error wins 58%). Truth is
+  defined against a masked-mean abundance estimate, so a flat design is off by
+  a per-archetype factor (CV 0.175) -- a magnitude effect, not a ranking one.
+- **Body shape is about 0.18 of the gap, run-on about 0.10.** Not "most of it
+  is read-through", which is what the easy subset showed.
+- **A one-parameter-per-isoform density model has a small ceiling**: 2-level
+  0.745, +1.5 points over DENR's default, winning 56% of discordant loci
+  against it.
+- **A smooth per-gene shape has a large ceiling**: 0.822 (+9 over DENR's
+  default, winning 77% of discordant loci against it), and exact shape 0.877.
+  The exact oracle overstates what is reachable: the simulator resamples each
+  archetype's own counts, so every copy has its spikes in the same places and
+  the exact column "knows the noise". Treat `oracle_smooth` as the realistic
+  ceiling for body shape.
+- **A shared profile captures almost none of it** (shape/poisson 0.715, 18.8).
+  The body-shape ceiling is gene-specific shape, and nothing here shows that is
+  estimable from the same sparse counts it would be used to deconvolve.
+
+**Decision (revised): run-on is the cheap, estimable part -- trialed in 18.10
+and it passes. Per-gene body shape has the larger ceiling but no estimator; it
+is worth a design study, not code.** Caveats: the oracle shows the information
+exists, not that it is estimable at the very loci where overlapping isoforms
+confound it; the simulator flatters shape models (every isoform is an
+archetype); about 30% of models are equivalence classes whose members have
+different archetypes and got an equal-weight average column, which weakens the
+oracle, so the ceiling is if anything understated. Real data before shipping
+anything.
+
+
+### 18.10 A fitted run-on tail -- and the solver bug that hid half the loci
+
+`scripts/runon_trial.py`, same five seeds and masking as 18.9.
+
+**The term.** Each binary model column gets a shared tail `r(d)` in the `d`-th
+bin past its PAS (24 bins = the simulator's 6 kb flank), inside the locus
+window, masked bins zero. `r` is a ratio of sums over isolated, expressed
+single-isoform loci -- `sum tail_signal(d) / sum body_density`, 60-91 loci per
+seed, no other transcript (either strand, +/- flank) reaching the tail window.
+Training loci are single-isoform, scoring loci multi-isoform; no truth is used.
+
+**The fitted tail is termination biology, not decay.** Mean over seeds, in body
+units: 1.62 at 0.25 kb past the PAS, **rising to ~2.4 at 1.5-2 kb**, then 1.1
+at 3 kb and 0.34 at 5.75 kb; total mass ~27 bins of body signal. Polymerase
+slows and accumulates in the termination zone. The peak lies beyond the 4-bin
+(1 kb) PAS mask, which is why masking does not remove the confusion.
+
+**Pre-registered rule.** `runon/poisson` vs `binary/poisson`, paired: win >=
+60% of discordant-dominant loci pooled and > 50% every seed, AND lower
+per-locus error at > 50% of loci every seed. Recommendable only if it also
+beats DENR's default on pooled win share.
+
+| arm | dominant accuracy | median abs log2 err | expressed at zero |
+|---|---|---|---|
+| binary/legacy_log (DENR default) | 0.731 | 0.381 | 16.5% |
+| binary/poisson | 0.697 | 0.415 | 18.7% |
+| **runon/poisson (fitted tail)** | **0.833** | **0.282** | 13.6% |
+| runon/legacy_log | 0.815 | 0.353 | 12.2% |
+| runon_oracle/poisson (each isoform's exact tail) | 0.886 | 0.222 | 10.2% |
+
+**Verdict: package candidate, and recommendable.** Pooled win share **0.810
+(697 / 163)**, > 0.5 every seed; error wins **0.583-0.616**, > 0.5 every seed;
+against DENR's default 0.761 (587 / 184), > 0.5 every seed. The fitted tail
+realizes 72% of the exact tail's accuracy gain. Single-model loci are
+unchanged (their tails fall outside the window).
+
+**How the first run got it wrong.** The first run scored "fail": error wins
+0.469 and 0.487 in two seeds. It was scored, like 18.9, on loci fitted by every
+arm *including the exact-body oracles*, ~200 per seed. Diagnosing the
+magnitude result found that the oracle arms returned `invalid_mean` at 493-575
+of ~910 multi-model loci, and that on all ~790 loci the run-on arm won error
+in every seed. The decision set was first narrowed to the non-oracle arms (a
+post-hoc scoring change, recorded as such), then the cause was found and
+fixed, after which the two sets coincide and the rule passes as originally
+specified.
+
+**The bug: Poisson's starting point was not scale-invariant.**
+`_glm.moment_initialization` started each model at `M'y / M'scale`, the
+M-weighted mean of `y`. That is the single-model MLE only for a 0/1 column;
+for entries of size `s` it starts `~s^2` too high. Exact-density columns hold
+expected reads per bin (median 226, max 1.7e4) against abundances ~0.04, so
+`mu` started ~500x above the data and L-BFGS-B ran every abundance onto the
+zero bound without converging -- all 493 failing loci on seed 5 had `a = 0`
+for every model. scipy's L-BFGS-B fails identically from that start; rescaling
+the columns to mean 1 rescues 492/493. Foreign reads (antisense signal,
+neighbouring flanks) in bins where an oracle column is exactly zero explain
+only 9. **Fix:** start at `sum(y over the support) / sum(scale * M)`, the
+single-model Poisson MLE the docstring already described; identical for 0/1
+columns. `test_fit_is_invariant_to_column_scale` fails on the old start.
+**Impact:** binary designs were unaffected; 18.8's shape designs (mean ~1) move
+only in the third decimal when rerun with each start; 18.9's oracle arms were
+the casualty. "Failures never become zeros" held: every bad fit was
+`invalid_mean` with NaN, which is how it was found.
+
+**Where the residual error loss sits** (`scripts/runon_diagnose.py`, error-win
+fraction vs binary/poisson, pooled):
+
+- **Not a metric artifact.** Restricting the per-locus error to models positive
+  in both arms (the tail rescues zeros) gives 0.606 vs 0.603.
+- **Where the tail lands.** If some model's tail falls on another model's body:
+  0.625 (exact tail 0.689). If it lands on nothing (14% of loci): 0.465
+  (exact 0.446). **Corrected by 18.12: that is not a loss.** At those loci the
+  tail is entirely clipped or masked, the two fits are bit-identical, and the
+  error difference is only the per-arm calibration constant (0.5-1.2% apart).
+- **Gene-specific tail size, at the extremes.** Where the shared tail is > 2x an
+  isoform's true tail mass (6% of loci) error wins drop to 0.486; within 2x,
+  0.678.
+- **No length trend** across shortest expressed isoform.
+
+The obvious refinement -- add the tail only where it overlaps another model's
+body -- was trialed in 18.12 and is identical to this design.
+
+**Caveats.** The simulator truncates run-on at 6 kb (archetype vectors end
+there); real termination zones are often longer and gene-specific, so a shared
+tail has an easier job here. No real data. Not yet a package feature: shipping
+needs a tail estimator on real data (isolated-gene selection, strand handling
+through `read_binned`) and a design-digest change.
+
+### 18.11 Reproducibility: tracing the 18.8 drift
+
+Rerunning 18.8 in November did not reproduce its table -- dominant accuracy
+`binary/legacy_log` 0.757 (table 0.761), `shape/legacy_log` 0.761 (0.750),
+`binary/poisson` 0.744 (0.733), `shape/poisson` 0.754 (0.737) -- even for the
+arm no recent code change touches. Three causes, separated:
+
+1. **Different simulations, mostly.** 18.8 used seeds 5, 17 and three seeds
+   that were never recorded; the reruns use 5, 17, 29, 41, 53. Seeds 5 and 17
+   do reproduce: regenerated with `scripts/simulate_nascentrnasim.R` on
+   BioHPC, they match 18.6's recorded per-arm isoform errors and zero fractions
+   to three decimals in every binary arm (the data would not). The September
+   session's transcripts are on another machine, so the other three seeds are
+   unrecoverable.
+2. **Not code.** 18.8's script at its own commit (`4f6fcc0`, pybigtools era)
+   and at HEAD give identical binary-arm results on the same data: the figwig
+   switch moved nothing. The Poisson start fix (18.10) moves `shape/poisson` in
+   the third decimal. Fits are bitwise deterministic run to run.
+3. **The scoring was nondeterministic.** Two identical runs disagreed (seed 53
+   `binary/legacy_log` 0.7852 vs 0.7877). Two tie-breaks depended on polars row
+   order, which a join or `group_by` does not fix:
+   - *Dominant call with tied truth.* nascentRNASim draws abundances from a
+     discrete kernel grid (`rgtex` samples `dens$x`; 818 distinct values among
+     2,564 expressed transcripts on seed 53), so two models can have equal
+     truth; picking one by row order flipped 1 of 391 loci, exactly the 0.0025.
+   - *Spearman with ties.* `argsort(argsort())` ranks tied values by row order,
+     and zero estimates are a ~17-19% tie block.
+
+   **Fixed in every harness** (`validate_shape_usefulness`,
+   `benchmark_shape_accuracy`, `oracle_shape_ceiling` and so `runon_trial`,
+   `validate_likelihoods`): Spearman uses average ranks
+   (`scipy.stats.rankdata`), and a dominant call is correct when the top
+   estimate is *a* truly dominant model (estimate ties broken by model index).
+   Repeat runs are now bit-identical. 18.9 and 18.10 move only in the third
+   decimal (numbers above are rescored); their verdicts are unchanged.
+
+18.8 on the recorded seeds, rescored (multi-model loci, means of 5):
+
+| arm | dominant | isoform rho | median abs log2 | zeros |
+|---|---|---|---|---|
+| binary/legacy_log | 0.757 | 0.636 | 0.381 | 16.5% |
+| binary/poisson | 0.744 | 0.577 | 0.415 | 18.7% |
+| shape/legacy_log | 0.761 | 0.657 | 0.412 | 15.0% |
+| shape/poisson | 0.754 | 0.601 | 0.433 | 17.1% |
+
+Paired, shape vs binary: share of discordant loci shape wins 0.54 (Poisson;
+0.39-0.65 by seed) and 0.56 (legacy_log); fraction of loci with lower error
+0.48 and 0.48. **The verdict stands** -- a wash on the dominant call and on
+magnitude, a reproducible cut in zero estimates (Poisson 18.7% -> 17.1%,
+legacy_log 16.5% -> 15.0%) -- but "the best of four arms is DENR's default" was
+a seed draw: on these seeds `shape/legacy_log` is 0.004 ahead, well inside the
+0.03-0.06 seed-to-seed spread. The within-locus and zero-excluded rho rows of
+the 18.8 table came from analysis outside the committed script and were not
+rerun. 18.6's rho column is tie-order dependent in the same way; its error and
+zero columns reproduce.
+
+
+### 18.12 An overlap-only tail is the same design
+
+`scripts/runon_overlap_trial.py` was written to test the refinement 18.10
+proposed: keep each model's tail only in bins where another model has unmasked
+support (bin-level), plus a model-level gate as a secondary arm. The rule was
+fixed before running (replace the full tail only if it still passes 18.10's
+rule, wins error against the full tail in every seed with ties excluded, and
+is no worse on the dominant call).
+
+**All three designs are bit-identical at every locus**, so the rule returns
+"keep the full tail" trivially (no discordant loci; 3,894 of 3,894 error
+comparisons tied). The reason is structural: a locus window is the union of
+its transcripts' spans, a connected component, so any bin inside it is covered
+by some model. A tail bin inside the window therefore always overlaps another
+model's support, unless it is masked (zero either way). The full tail already
+*is* an overlap-only tail; it never adds a bin to the fit.
+
+That also overturns the 18.10 diagnosis it came from. At the 14% of loci
+labelled "tail lands on nothing", the tail is wholly outside the window or
+masked: on 1,474 models there, fitted tail mass in the window is 0.0 and the
+run-on and binary abundances are identical. Their 0.465 error-win rate is the
+global calibration constant differing between arms (ratio 0.995-1.012 by seed)
+shifting every calibrated error slightly, then compared with a strict `<`.
+Counting identical fits as ties, the fitted tail's error wins are 0.62 at
+overlap loci and undefined elsewhere. The one residual-loss finding that
+survives is gene-specific tail size: where the shared tail is > 2x an
+isoform's true tail mass, error wins are 0.486.
+
+The lesson for paired error scoring: **a per-arm calibration constant makes
+identical fits look different**. Where two arms share a fit, compare the
+uncalibrated estimates, or count the locus as a tie.
+
+### 18.13 Shape profile on top of the run-on tail: no
+
+`scripts/shape_runon_trial.py`: `apply_shape_profile` (dienr defaults), then
+18.10's fitted tail past each PAS; profile and tail both from the data alone.
+Same five seeds and scoring (tie-aware; error wins exclude exact ties). Rule,
+fixed before running: replace `runon/poisson` only if, paired against it, the
+combination wins >= 60% of discordant-dominant loci pooled and > 50% every
+seed, and wins per-locus error at > 50% of loci every seed.
+
+| arm | dominant | median abs log2 (multi) | zeros (multi) | single-model err |
+|---|---|---|---|---|
+| binary/legacy_log (DENR default) | 0.730 | 0.381 | 16.5% | 0.106 |
+| binary/poisson | 0.697 | 0.415 | 18.7% | 0.078 |
+| shape/poisson | 0.714 | 0.433 | 17.1% | 0.185 |
+| **runon/poisson** | 0.833 | **0.283** | 13.5% | **0.078** |
+| shape_runon/poisson | **0.840** | 0.319 | 11.3% | 0.185 |
+| shape_runon/legacy_log | 0.825 | 0.372 | 10.1% | 0.148 |
+
+**Fails both criteria:** pooled win share 0.539 (214 / 183; 0.51-0.59 by seed),
+and error wins 0.43-0.46 in every seed. Adding the profile reproduces its 18.8
+signature on top of the tail: +0.7 points on the dominant call, ~16% fewer
+zeros, and worse magnitudes at multi-model loci (0.283 -> 0.319) and at single-
+model loci (0.078 -> 0.185). The gains do add (the profile's +1.7 alone is
+roughly +0.7 on top of the tail), but the profile's share stays small and its
+cost stays, because its information is the average gene's and the 18.9 ceiling
+is in each gene's own shape.
+
+**Where this leaves the density-model line.** Run-on is the one validated,
+estimable component; a shared profile is not worth applying, alone or with it;
+per-gene body shape has the larger ceiling and no estimator. Next steps, in
+order of value:
+
+1. **Real data before more simulation.** Every density result here comes from
+   one simulator whose run-on is truncated at 6 kb and whose isoforms are
+   archetypes. On public PRO-seq (K562 `GSE96869`): (a) the fitted tail's real
+   extent and shape past 6 kb; (b) a truth-free test -- held-out-bin predictive
+   deviance, binary vs run-on design, with contiguous blocks held out as in
+   Gate B -- which asks whether the tail models real signal better; (c) as an
+   orthogonal proxy, dominant-isoform agreement with matched RNA-seq or
+   long-read data.
+2. **Run-on as an opt-in package feature**, only if (1) holds up: a tail
+   estimator (isolated-gene selection, strand handling through `read_binned`),
+   a design operation that changes the digest, CLI exposure, and tests.
+3. **Per-gene tail scale** for the residual loss where the shared tail is > 2x
+   an isoform's own (6% of loci); only after (1), since real tails vary more.
+
+### 18.14 Real data: the run-on tail predicts held-out K562 signal better
+
+`scripts/k562_runon_check.py`. GEO `GSE96869` (Dukler et al. 2017 -- the data
+nascentRNASim's archetypes come from), K562 0 min, two replicates, `primary`
+3'-end bigWigs, hg19 (checked: `plus` holds + strand transcription on GAPDH and
+MYC, `minus` holds - strand on ACTB and EEF1A1, as negative values). Ensembl
+GRCh37.87 protein-coding transcripts on chr1-22 and X, contigs renamed
+explicitly `N -> chrN`: 81,579 transcripts, 18,967 loci. Paper masking,
+250 bp bins, `summary="sum"`, Poisson. No ground truth is needed: at
+multi-model loci (>= 10 usable bins, >= 20 reads) five contiguous blocks are
+held out in turn and each design is scored by Poisson deviance on the held-out
+block. The run-on and binary designs fit the same bins (18.12) and the tail is
+fixed before fitting, so they have the same per-locus parameters. **Tail and
+profile are fitted on one replicate and scored on the other.**
+
+**The real tail** (ratio of sums over ~845 isolated, expressed single-isoform
+genes per replicate, same-strand isolation, 5 kb buffer), body-density units:
+
+| kb past PAS | 0.25 | 1.25 | 2.25 | 3.25 | 4.25 | 5.25 | 7.25 | 10.25 | 14.25 |
+|---|---|---|---|---|---|---|---|---|---|
+| rep1 | 1.18 | 1.51 | 1.13 | 0.76 | 0.56 | 0.41 | 0.28 | 0.24 | 0.15 |
+| rep2 | 1.04 | 1.37 | 1.02 | 0.70 | 0.52 | 0.38 | 0.26 | 0.22 | 0.15 |
+
+Same form as the simulator's (a rise past the PAS, then decay) but flatter
+(peak ~1.4x vs 2.4x; the archetypes are 62 curated, highly expressed genes)
+and much longer: total mass ~28 bins of body signal, **27% of it beyond 6 kb**,
+where nascentRNASim truncates, and still ~0.15 at 15 kb.
+
+**Pre-registered rule** (fixed before running): run-on is supported only if, in
+both replicates, `runon` vs `binary` has lower total held-out deviance AND
+lower per-locus held-out deviance at > 50% of loci (exact ties excluded).
+
+| scored replicate (tail from) | loci | runon vs binary: total deviance | locus wins | runon6 vs binary | shape vs binary |
+|---|---|---|---|---|---|
+| rep1 (rep2) | 8,358 | **-5.5%** | **0.572** | -3.2%, 0.565 | +15.9%, 0.628 |
+| rep2 (rep1) | 8,264 | **-5.4%** | **0.574** | -3.2%, 0.565 | +16.0%, 0.562 |
+
+**Passes in both replicates.** ~1,490 loci tie exactly: every tail there is
+clipped or masked. Cutting the tail at the simulator's 6 kb (`runon6`) keeps
+only ~58% of the gain, and the full tail beats it directly (-2.4%, 0.57 of
+loci), so the length past 6 kb is real signal, not overfitting.
+
+**The shape profile is worse in total and better at most loci** -- +16% total
+held-out deviance, yet lower deviance at 56-63% of loci. The total is
+dominated by high-count loci, where a shared profile's misfit of each gene's
+own pause peak costs most (18.6's mechanism under a count likelihood). Its
+real-data dynamic range is only ~1.5x with defaults against ~4.9x simulated,
+which also limits what it could do.
+
+**What this does and does not show.** Held-out deviance tests whether the
+design models *real signal* better, not whether abundances are more accurate;
+the simulator remains the only accuracy evidence (18.10). The tail may also be
+absorbing unannotated downstream transcription, which is still signal a
+binary design misattributes. One cell line, one lab, untreated cells.
+
+**Next:** run-on as an opt-in package feature (tail estimator with isolated-gene
+selection and strand handling through `read_binned`, a design operation that
+changes the digest, CLI flags, tests), with the tail fitted to >= 15 kb rather
+than the simulator's 6 kb. An orthogonal accuracy check (dominant isoform vs
+matched K562 RNA-seq or long-read data) would be the next evidence after that.
+
+### 18.15 Run-on in the package
+
+`dienr.runon` (`RunonConfig`, `fit_runon_tail`, `apply_runon_tail`), the CLI
+command `dienr runon-tail`, and `dienr build-design --runon-tail`. Design
+choices, and where they differ from the analysis scripts:
+
+- **Estimator**: the same ratio of sums, but self-contained -- it reads gene
+  bodies directly instead of borrowing a design's counts. Body density excludes
+  the first 250 bp (pause) and last 1 kb (PAS); the tail starts exactly at the
+  PAS. Training genes need no other same-strand transcript within
+  `buffer_bases` (5 kb) of their **whole span** or tail window -- stricter than
+  the scripts, which checked the tail window only -- so multi-isoform genes are
+  excluded outright. Identical spans are collapsed first. Opposite-strand
+  genes are ignored (stranded data). Default tail 15 kb (18.14).
+- **Application**: added past each model's pre-mask span, clipped to the
+  window, masked bins zeroed; records `Design.runon_digest` and changes the
+  design digest; the results manifest now records `shape_digest` and
+  `runon_digest`. Refuses a second tail or a bin-size mismatch. Commutes with
+  `apply_shape_profile` (a test asserts it).
+- **Tests** (`tests/test_runon.py`, 26): recovery of a known tail; strand file
+  and orientation (minus-only and plus-only training agree; swapped files
+  fail); scale-freeness; isolation rules; placement on both strands;
+  single-model loci untouched; **usable bins unchanged** (18.12 as a test);
+  masked bins stay zero; digests and guards; a known-truth case where binary
+  Poisson credits a short isoform's read-through to the long one and the
+  run-on design does not; CLI fit/save/apply and errors.
+
+**Re-validated on K562** with the packaged code (defaults), scored as in 18.14
+(tail from the other replicate): held-out deviance **-6.7% / -6.8%** vs binary,
+lower at **56.3% / 57.0%** of loci -- slightly better in total than the
+script's tail. The stricter isolation leaves ~560 training genes (vs ~845) and
+a larger tail (peak ~2.0x, mass ~43 body-bins vs ~28): the genes left are those
+with no neighbour at all, whose read-through is not truncated by one.
+
+**A bug this turned up, unrelated to run-on**: `read_annotation` let Polars
+infer the GTF contig column's type, so an Ensembl GTF (contigs "1".."22", "X")
+was parsed as integers and failed at "X" -- `dienr build-design` could not read
+a stock Ensembl annotation. Contig is now always a string;
+`test_ensembl_numeric_contig_names_stay_strings` fails on the old code. (The
+analysis scripts never hit it: they parse the GTF themselves.)
+
+### 18.16 A strand-orientation check
+
+`dienr.strand.check_strand_orientation`, run by `dienr count` on every
+sample. `dienr` takes strand from the declared file, never the sign, so a
+swapped plus/minus pair was undetectable -- and a swap is the most likely
+conversion error (single-end PRO-seq reads are the reverse complement of the
+RNA). The check reads each locus window from both files, over loci that no
+opposite-strand locus overlaps (there the opposite file legitimately holds
+another gene's sense signal), capped at 2,000 loci taken evenly across the
+design, and reports the fraction of gene-body signal in the declared-sense
+file plus the fraction of loci where sense exceeds antisense.
+
+Calibration (correct / deliberately swapped files):
+
+| data | sense fraction | locus agreement |
+|---|---|---|
+| K562 PRO-seq rep1 (1,807 loci) | 0.876 / 0.124 | 0.748 / 0.226 |
+| K562 PRO-seq rep2 (1,789 loci) | 0.879 / 0.121 | 0.750 / 0.224 |
+| nascentRNASim, 5 seeds (~1,180 loci) | 0.958-0.963 / 0.037-0.042 | 0.953-0.961 / 0.039-0.046 |
+
+Thresholds: `swapped` below 0.5 (count refuses; `--allow-strand-mismatch`
+overrides), `low` below 0.7 (warning), `insufficient` under 20 informative
+loci (warning). Both real-data margins are wide. The verdict and statistics
+are stored in each sample's counts provenance. ~1-2 s per sample on K562.
+11 tests (`tests/test_strand.py`), including that negative minus-strand files
+pass and that `count` refuses a swapped sheet.
+
+### 18.17 Per-locus termination scale and a depth gate: neither helps
+
+`scripts/k562_pergene_trial.py`, rules committed before results were read
+(`6083b53`). 18.15's packaged tail on K562, tail from the other replicate,
+5-fold held-out Poisson deviance at ~8,300 multi-model loci.
+
+**Per-locus termination scale (`runon_scaled`): fails.** Each fold fits the
+run-on design on training bins, predicts the signal its tails put in an
+isolated 15 kb window *downstream of the locus* (never scored), and rescales
+that locus's tail by `clip((O + 20) / (E + 20), 0.25, 4)`. About 5,850 of the
+loci have a usable window. The scales are broad (5th-95th percentile 0.35-3.6,
+median 1.13-1.16), and using them makes the fit *worse*:
+
+| scored (tail from) | vs `runon`: total deviance | locus wins | vs `binary` |
+|---|---|---|---|
+| rep1 (rep2) | +0.68% | 0.463 | -6.0% |
+| rep2 (rep1) | +0.63% | 0.474 | -6.2% |
+
+The downstream window does not predict the in-locus tail well enough to beat a
+shared one: it also collects unannotated downstream transcription, and its
+Poisson noise is large at most loci even with shrinkage. A per-gene tail needs
+a better estimator than this, or none.
+
+**Depth gate (`runon_gated`): no gate is chosen.** Picking the threshold on
+the training replicate selects decile 0 -- apply the tail everywhere -- in both
+directions, so the gated arm *is* `runon` and the rule (lower total deviance)
+cannot pass. Training-replicate totals rise monotonically with the threshold:
+the tail lowers held-out deviance in **every** depth decile, including the
+shallowest (binary minus run-on, deciles 0-10 through 80-90: +558 ... +146k on
+rep2-trained, +539 ... +109k on rep1-trained; all positive).
+
+**Correction.** A stratification I reported in conversation after 18.15 --
+"the tail slightly hurts the low-signal half (+1-2% deviance, 52% of loci)" --
+was an artifact. It binned loci by the *binary* arm's own held-out deviance on
+the scored replicate, i.e. it selected on the comparator's outcome: loci where
+binary happens to fit unusually well are over-represented in the bottom bins,
+so the challenger looks worse there by regression to the mean. Binned by an
+independent depth measure (the other replicate), the effect is positive
+everywhere. Same lesson as 18.10's calibration artifact: **stratify by
+something measured independently of the outcome being compared.**
+
+**Where that leaves run-on:** the shared tail, applied everywhere, stays the
+recommendation. The residual per-gene variation is real (the downstream scales
+are broad) but not recoverable from this signal.
+
+### 18.18 With a run-on tail, drop the PAS mask
+
+`scripts/k562_pasmask_trial.py`, rules written before running (job 4108105,
+code at `8d0a720` plus the uncommitted script). The paper's PAS mask,
+`mask_end_bins=(4, 4)`, hides 1 kb either side of every PAS because a binary
+column can't explain signal there. The run-on tail now explains the part past
+the PAS (its peak, ~1.4x body density at ~1.25 kb, lies inside the mask), so
+the question was whether the mask still earns the bins it discards.
+
+**Comparable scoring.** Smaller masks fit more bins, so every arm is scored on
+the *same* test bins -- those usable under `(4, 4)` -- in 5 contiguous blocks,
+and each arm trains on its own usable bins outside the block's span. A
+smaller mask only adds training bins; the question is whether they improve
+the prediction of bins every arm sees. Counts read once without a PAS mask;
+TSS mask `(1, 1)` throughout; tail from the other replicate. 18,967 loci,
+masked fraction 6.6% at `(4, 4)` vs 1.4% with no PAS mask.
+
+| vs `runon_4_4` (rep1 / rep2) | total held-out deviance | locus wins |
+|---|---|---|
+| `runon_4_0` (unmask past the PAS only) | -0.80% / -0.64% | 0.581 / 0.576 |
+| `runon_1_1` | -3.79% / -3.69% | 0.640 / 0.636 |
+| **`runon_0_0`** (no PAS mask) | **-4.09% / -3.88%** | **0.641 / 0.628** |
+| `binary_0_0` (no PAS mask, no tail) | -1.98% / -1.58% | 0.596 / 0.586 |
+
+Also: `runon_4_4` vs `binary_4_4` -6.7% / -6.8% (18.15 reproduced on this
+scoring), and **`binary_0_0` vs `binary_4_4` -8.5% / -8.3%, wins 0.68**.
+
+**Decision: all three smaller masks pass in both replicates; the new
+recommended PAS mask is none, `(0, 0)`.** Two readings:
+
+- **Most of the gain is the *inside* half of the mask.** Unmasking past the
+  PAS alone (`4_0`) buys under 1%; also unmasking the last 1 kb of gene body
+  buys ~4%. Those bins carry abundance information about the gene that ends
+  there, and masking them was costing more than the PAS pile-up it guarded
+  against -- even without a tail (`binary_0_0` beats `binary_4_4` by 8%).
+- **The tail still pays with no mask** (`runon_0_0` vs `binary_0_0`, -2.2% /
+  -2.3%, derived from the totals above), less than its -6.8% under the paper's mask,
+  because part of what it did was compensate for the bins that mask removed.
+
+Held-out deviance scores signal prediction, not isoform calls; whether the
+unmasked fit calls dominant isoforms better needs a truth set (section 20,
+item 1). The R-parity default stays `(4, 4)` -- it's what R does -- but the
+recommended configuration changes. The TSS mask is 18.19.
+
+### 18.19 The TSS mask stays at one bin
+
+`scripts/k562_tssmask_trial.py`, rules committed before running (`88657c3`;
+job 4108181). 18.18's scoring, with the PAS mask at 18.18's choice, `(0, 0)`,
+and every arm carrying the tail; test bins are those usable under the largest
+mask, `(4, 4)`. Run on the rebuilt environment (CPython 3.13.13, polars 2.1.0,
+the Poisson fast path), which all arms share.
+
+| vs `tss_1_1` (rep1 / rep2) | total held-out deviance | locus wins |
+|---|---|---|
+| `tss_0_0` (no TSS mask) | +10.4% / +10.3% | 0.315 / 0.337 |
+| `tss_1_0` (unmask upstream) | +0.83% / +0.75% | 0.523 / 0.535 |
+| `tss_2_2` | -2.86% / -1.83% | 0.521 / **0.450** |
+| `tss_4_4` | +2.22% / +3.63% | 0.436 / 0.394 |
+
+**Decision: no arm passes; `(1, 1)` stays.** Unmasking the TSS is clearly
+harmful, as expected: a 0/1 column can't explain the pause peak, and fitting
+it inflates the models that start there. `tss_2_2` lowers the total on both
+replicates but wins at fewer than half the loci on rep2: a gain concentrated
+in a minority of (large) loci, not a better default. Unlike the PAS mask, the
+TSS mask is protecting the fit from signal the model genuinely can't
+represent.
+
+**Recommended configuration from here:** run-on tail, `mask_start_bins=(1, 1)`,
+no PAS mask, Poisson / quasi-Poisson, `summary="sum"`.
+
+### 18.20 Dominant-isoform accuracy against K562 long reads: rule fails, one finding replicates
+
+`scripts/k562_longread_accuracy.py`, rules written before running (job
+4108192; the switch from ID.version to ID matching was made from match
+coverage, before any fit). Truth: ENCODE K562 PacBio Sequel II long reads
+(ENCSR983KDL, ENCFF302ZXZ + ENCFF448BDX pooled, 2.75M reads on *Known*
+GENCODE v29 transcripts), matched to GRCh37.87 protein-coding transcripts by
+Ensembl ID. Scored on transcript groups that every arm resolves. Funnel:
+11,633 multi-group loci -> 7,683 with every transcript in v29 -> 3,144 with
+>= 20 long reads -> 3,122 fitted by every arm -> **2,974 with a decisive
+(>= 2x) top group**. Chance (1/n_groups) is 0.364.
+
+| dominant-group accuracy | rep1 | rep2 |
+|---|---|---|
+| `denr_default` (PAS 4, no tail, legacy log) | 0.754 | 0.747 |
+| `binary_poisson` (PAS 4, no tail) | 0.700 | 0.701 |
+| `runon_4_4` (PAS 4, tail) | 0.733 | 0.704 |
+| `binary_0_0` (no PAS mask, no tail) | 0.747 | 0.747 |
+| `recommended` (no PAS mask, tail) | **0.778** | 0.745 |
+
+Paired, `recommended` vs `denr_default`: rep1 wins 0.555 of discordant loci
+(p = 0.006); **rep2 0.497 (p = 0.91)**. **The pre-registered rule fails**: the
+recommended configuration does not beat DENR's default on both replicates.
+The same pattern holds at 1.5x and 3x decisiveness. The exact-version subset
+(103 loci) is too small to say anything.
+
+What replicates, and what doesn't:
+
+- **Dropping the PAS mask improves accuracy -- replicated.** `binary_0_0` vs
+  `binary_poisson`: +4.7 points on both replicates, winning 0.745 / 0.732 of
+  discordant loci (p < 1e-15). 18.18's held-out-deviance result holds up on
+  accuracy, the measure that matters.
+- **The run-on tail's accuracy gain does not replicate.** `runon_4_4` vs
+  `binary_poisson`: +3.3 points on rep1 (p = 0.0002), +0.3 on rep2 (p = 0.73);
+  `recommended` vs `binary_0_0`: +3.1 vs -0.2. It is never worse, and its
+  held-out-deviance gain was consistent (18.14, 18.18), but the simulator's
+  large accuracy gain (18.10, 0.697 -> 0.833) is **not confirmed on real
+  data**. Why it depends on the replicate is open; the scored replicate's tail
+  comes from the other one, so the rep2 arm uses the rep1-fitted tail.
+- **DENR's legacy log least squares beats binary Poisson at dominant calls by
+  ~5 points on both replicates**, even though it is far worse in held-out
+  deviance (Gate B). The simulator showed the same ordering (18.9: DENR
+  default 0.731 vs binary/poisson 0.698). Predicting signal and ranking
+  isoforms are different jobs: `log(y + 1e-3)` compresses large bins, which
+  seems to help rank models even as it misfits counts.
+- Within-locus Spearman follows accuracy (rep1: recommended 0.628, DENR
+  default 0.583; rep2: 0.589 vs 0.577).
+
+**Consequences.** The "no PAS mask" recommendation now rests on accuracy as
+well as fit. The run-on tail stays recommended for signal prediction, with
+its accuracy benefit stated as unconfirmed. Poisson remains the recommendation
+for fitting counts and for standard errors, but **not because it calls
+dominant isoforms better** -- on that measure the reference's log objective
+is at least as good. Untested and worth a pre-registered follow-up: legacy log
+*with* no PAS mask (and with the tail), since the mask effect and the
+objective effect may stack. Absolute accuracies are agreement with
+steady-state mature RNA (long reads), shared by every arm.
+
+### 18.21 Log objective with no PAS mask: neither candidate passes; the mask effect replicates a third time
+
+`scripts/k562_longread_logmask.py`, rules committed before running
+(`9aab6ab`; job 4108194). 18.20's truth, matching, groups and scoring; the
+same 2,974 decisive loci.
+
+| dominant-group accuracy | rep1 | rep2 |
+|---|---|---|
+| `denr_default` (PAS 4, no tail, log) | 0.754 | 0.747 |
+| `log_0_0` (no PAS mask, no tail, log) | 0.776 | **0.769** |
+| `log_runon_0_0` (no PAS mask, tail, log) | 0.744 | 0.734 |
+| `recommended` (no PAS mask, tail, Poisson) | **0.778** | 0.746 |
+| `binary_0_0` (no PAS mask, no tail, Poisson) | 0.747 | 0.748 |
+
+**Decision: neither candidate passes; 18.20's conclusions stand.**
+`log_0_0` beats `denr_default` on both replicates (wins 0.653 / 0.636,
+p < 1e-5) but only ties `recommended` on rep1 (0.497, p = 0.91; rep2 0.548,
+p = 0.011). `log_runon_0_0` is worse than `log_0_0` and loses or ties every
+reference.
+
+Readings, all replicated on both PRO-seq replicates:
+
+- **Dropping the PAS mask helps under DENR's own objective too** (`log_0_0`
+  vs `denr_default`, +2.3 / +2.2 points). With 18.18 (deviance) and 18.20
+  (Poisson accuracy), the PAS mask result has now held three ways. The
+  smallest change that improves on DENR is to keep everything else and drop
+  `mask_end_bins`.
+- **The log objective beats Poisson at dominant calls with no PAS mask as
+  well** (`log_0_0` vs `binary_0_0`, +3.0 / +2.2, p <= 0.002).
+- **The run-on tail hurts under the log objective** (`log_runon_0_0` vs
+  `log_0_0`, -3.2 / -3.5 points, p < 1e-4), where with Poisson it was +3.1 /
+  -0.2 (18.20). The tail was only ever validated with Poisson
+  (`docs/runon-tails.md` already said so); now there is evidence against the
+  combination, not just an absence of evidence for it.
+
+What this leaves: for dominant-isoform calls, two configurations are
+statistically indistinguishable overall and both beat DENR's default on at
+least one replicate -- Poisson with tail and no PAS mask (wins on rep1), and
+log least squares with no tail and no PAS mask (wins on rep2, and against the
+default on both). The pre-registered rule couldn't separate them, and picking
+one after seeing these numbers would be the forking path the rules exist to
+prevent. The recommendation stays as 18.19 states it, with the PAS-mask change
+also recommended to anyone who keeps the R-parity objective.
+
+### 18.22 The built-in defaults are the dominant-isoform recommendation
+
+`scripts/k562_longread_defaults.py`, rules committed before running
+(`be1ad63`; job 4108220). 18.20's truth and scoring, same 2,974
+decisive loci.
+
+**Correction to 18.20-18.21.** Their `denr_default` arm was not DENR's
+defaults. It was DENR's objective with the *paper's* masking (TSS 1 bin, PAS
+4 bins). R DENR's function defaults mask nothing
+(`transcript_quantifier(mask_start_bins = NULL, mask_end_bins = NULL)`), and
+dienr's defaults reproduce those exactly: 250 bp bins, no masks, `round`, log
+least squares on a `mean` summary. The comparisons in 18.20-18.21 stand; only
+the label was wrong. Read `denr_default` there as "DENR, paper masking".
+
+| dominant-group accuracy | rep1 | rep2 |
+|---|---|---|
+| `defaults` (no masks, log, no tail) | 0.771 | 0.769 |
+| `log_tss_1_1` (TSS 1 bin, no PAS mask, log) | 0.776 | 0.769 |
+| `denr_paper` (TSS 1, PAS 4, log) | 0.754 | 0.747 |
+| `poisson_runon` (TSS 1, no PAS mask, tail, Poisson) | 0.778 | 0.746 |
+
+**Decision: the TSS mask does not pass** (`log_tss_1_1` vs `defaults`: wins
+0.571, p = 0.17; 0.500, p = 1.0). **The dominant-isoform recommendation is the
+built-in defaults, with no flags.** The defaults beat DENR with the paper's
+masking on both replicates (wins 0.604 / 0.625, p <= 0.001) and match the
+Poisson configuration (0.485, p = 0.47; 0.549, p = 0.010 in the defaults'
+favour).
+
+So the defaults are a sound compromise as well as DENR-faithful: nothing in
+the code changes. The recommendation splits by goal -- defaults for dominant
+isoforms and R parity; Poisson / quasi-Poisson with run-on tail, TSS mask
+`(1, 1)` and no PAS mask for magnitudes and standard errors -- and the TSS
+mask's value depends on the objective (it matters to Poisson's fit, 18.19, not
+to the log objective's calls).
+
+### 18.23 The log offset matters; the bin size barely does
+
+`scripts/k562_longread_sweep.py`, rules committed before running (`1a4ca1c`;
+job 4108226). The defaults' configuration (legacy log, `mean`, no masks, no
+tail) with bin size {100, 250, 500} x log offset `c` {1e-4, 1e-3, 1e-2,
+1e-1, 1}; locus grouping fixed at `distance=250` so every arm sees the same
+loci. 18.20's truth and scoring. Groups are rebuilt from these 15 arms, so
+the decisive set (~3,010 loci, chance 0.33) differs from 18.20-18.22's.
+
+Dominant-group accuracy, every decisive locus (rep1 / rep2; not used for the
+decision):
+
+| bin \ c | 1e-4 | 1e-3 | 1e-2 | 1e-1 | 1 |
+|---|---|---|---|---|---|
+| 100 | 0.626 / 0.627 | 0.663 / 0.667 | 0.705 / 0.713 | 0.755 / 0.757 | 0.774 / 0.774 |
+| 250 | 0.721 / 0.713 | **0.741 / 0.737** (default) | 0.759 / 0.752 | 0.774 / 0.771 | 0.775 / 0.776 |
+| 500 | 0.762 / 0.759 | 0.767 / 0.761 | 0.767 / 0.764 | 0.766 / 0.769 | 0.763 / 0.760 |
+
+**Decision, by the pre-registered rule: `b100_c1` passes.** Selected on PRO-seq
+rep1, odd chromosomes (1677 loci; accuracy 0.773, next
+`b250_c1` 0.769); confirmed on rep2, even chromosomes and X
+(1332 loci): 0.779 vs the default's 0.740, winning
+0.691 of discordant loci (94 vs 42), p = 9.7e-06.
+
+Readings:
+
+- **The offset is the active ingredient.** At 250 bp, `c` from 1e-3 to 1 is
+  +3.4 / +3.9 points; at `c = 1` the three bin sizes are within ~1 point,
+  and `b250_c1` vs `b100_c1` splits 74 / 71 (rep1) and 76 / 71 (rep2)
+  discordant loci. The rule picked 100 bp by a selection-set margin of 0.5
+  points; recommending 250 bp instead would be a post-hoc choice, so that
+  needs its own confirmation if wanted.
+- **Why it helps.** On the `mean` (per-base) scale, PRO-seq bins hold ~0.01-0.1;
+  with `c` = 1 the transform `log(y + c)` is nearly linear, so the objective
+  approaches identity least squares and empty bins stop dominating. Small `c`
+  with small bins is worst (more empty bins, each weighted heavily); larger
+  bins with small `c` recover much of the loss by having fewer empty bins.
+  This refines 18.20's reading: what made DENR's objective rank well was the
+  absence of masks, not the published offset, which is close to the worst
+  setting at 250 bp.
+- **Not tested here:** `--transform identity` itself, which large `c`
+  approximates, and anything with the Poisson configuration.
+
+**Consequence.** Code defaults stay DENR's (R parity). The rule's outcome
+was `b100_c1`. **Adopted recommendation (decided after seeing the grid):**
+the defaults plus `fit --log-offset 1`, i.e. `b250_c1` -- keeping 250 bp
+bins, because at `c = 1` bin size made no material difference (74 / 71 and
+76 / 71 discordant loci against `b100_c1`) and 250 bp is the default,
+faster, and needs no `--distance`. That choice is post hoc: `b250_c1`'s gain
+over the default (0.775 / 0.776 vs 0.741 / 0.737) is measured on the same
+data that suggested it and was not separately confirmed. 18.24 compares it
+with the Poisson configuration.
+
+### 18.24 Tuned log vs the Poisson configuration: two configurations stay -- and an unexplained interaction
+
+`scripts/k562_longread_headtohead.py`, rules committed before running
+(`0e76636`; job 4108232). 18.20's truth and scoring; groups rebuilt from these
+arms, 3,460 decisive loci (chance 0.317).
+
+| dominant-group accuracy | rep1 | rep2 |
+|---|---|---|
+| `tuned_log` (defaults + `c = 1`) | **0.771** | **0.773** |
+| `identity` (defaults, `--transform identity`) | 0.770 | 0.772 |
+| `defaults` (DENR, `c = 0.001`) | 0.728 | 0.730 |
+| `poisson_runon` (TSS 1, no PAS mask, tail, Poisson) | 0.631 | 0.585 |
+
+**Decision: outcome 1, two recommended configurations stay.** `tuned_log`
+beats `poisson_runon` on both replicates (wins 0.725 / 0.757, p < 1e-15).
+Also: `tuned_log` vs `defaults` +4.3 / +4.3 points (wins 0.706 / 0.705) on
+this larger locus set, supporting 18.23's adopted `b250_c1`; and `identity`
+is indistinguishable from `tuned_log` (23 / 20 and 29 / 32 discordant), as
+the near-linear transform predicts.
+
+**The Poisson configuration's collapse needs explaining.** It scored 0.778 /
+0.746 in 18.20-18.22. Those trials included a paper-masked arm, whose 4-bin
+PAS mask merges isoforms with PAS sites within ~1 kb into one group, so loci
+told apart mainly by nearby alternative polyadenylation were never scored.
+Here they are.
+
+**Exploratory decomposition** (`scripts/k562_longread_explore.py`, job
+4108234; *not* pre-registered, changes nothing by itself), same 3,460 loci:
+
+| Poisson variant | rep1 | rep2 |
+|---|---|---|
+| plain (no masks, no tail) | 0.668 | 0.673 |
+| + tail | 0.706 | 0.694 |
+| + TSS mask (1, 1) | 0.680 | 0.687 |
+| + tail + TSS mask (the recommended abundances configuration) | **0.631** | **0.585** |
+| tuned log + tail | 0.762 | 0.754 |
+
+The tail helps Poisson alone (+3.8 / +2.1, p <= 0.02); the TSS mask helps
+alone (+1.2 / +1.4); **together they hurt** (vs TSS mask alone: -4.9 / -10.2,
+wins 0.43 / 0.36, p < 1e-6). An interaction this strong may be a defect in how
+the tail meets a masked design rather than biology; `apply_runon_tail` adds
+the tail from the pre-mask span and zeroes masked bins afterwards, which looks
+right, so the next step is to inspect loci where `poisson_tss` is right and
+`poisson_runon` wrong. Until that is understood, the abundances
+configuration's dominant calls should not be trusted, and the 18.19 TSS-mask
+choice (made on held-out deviance with the tail) is in question. The tail
+also costs the tuned log objective (-0.9 / -1.9).
+
+### 18.25 Why tail + TSS mask fails: the window clips the longest isoform's tail
+
+`scripts/k562_tail_mask_diagnose.py` (exploratory; jobs 4108236, 4108238),
+18.24's 3,460 loci. Of the loci where Poisson + TSS mask calls the dominant
+group right and Poisson + TSS mask + tail calls it wrong (675 / 815,
+rep1 / rep2):
+
+- the tail fit picks a group whose PAS is **upstream** of the true group's in
+  97% / 97% (median -1.43 / -1.42 kb -- where the fitted tail peaks, ~1.4x
+  body density at ~1.25 kb), and with a different TSS in 97% / 96%;
+- **the true group's PAS is the locus window's end in 92% / 93%** (all other
+  loci: 73% / 72%), so its tail contributes **0** bins (median), while the
+  picked group's tail contributes 6;
+- plain Poisson got 89% / 88% of these loci right, the tuned log objective
+  93% / 94%, Poisson + tail without the mask 44% / 46%.
+
+**Mechanism.** A locus window is the union of its transcripts' spans
+(18.12), so it ends at the most downstream PAS and that isoform's tail falls
+entirely outside it. Every shorter isoform's tail lands inside the window,
+peaking ~1.4 kb past its PAS, on the longer isoform's 3' body; the longest
+isoform has no tail to answer with. The shorter isoform plus its tail then
+explains the longer one's 3' signal better than the longer one can. The TSS
+mask makes this decisive by removing the pause peak, the remaining evidence
+for which TSS is used. 18.12 recorded "a tail never adds usable bins" as
+harmless; it is an asymmetry in favour of shorter isoforms. It went unseen in
+18.20-18.22 because each included a paper-masked arm whose 4-bin PAS mask
+merged isoforms with nearby PAS sites, removing these loci from scoring.
+
+**Consequence.** The run-on tail as implemented is biased toward shorter
+isoforms at loci with nearby alternative PAS sites, with or without the TSS
+mask (Poisson + tail alone gets 44-46% of these loci right). The fix is to
+make every model's tail observable: extend each locus window downstream by
+the tail length (clipped at the next same-strand locus and the contig end)
+whenever a tail is applied, so the longest isoform's tail -- and the
+termination pile-up past its PAS -- is fitted like the others. Until then the
+abundances configuration's isoform-level results are biased, and its held-out
+deviance gains (18.14, 18.18, 18.19) may partly reflect the same asymmetry.
+
+### 18.26 Extending the windows doesn't rescue the tail: not recommended for isoform calls
+
+`scripts/k562_longread_tailfix.py`, rules committed with the fix before
+running (`cd9b0eb`; job 4108240). `apply_runon_tail` now extends every window
+downstream by the tail length (stopping at the next same-strand locus), so
+the longest isoform's tail is observed like the others (18.25). 18.20's truth
+and scoring, the same 3,461 loci as 18.24.
+
+| dominant-group accuracy | rep1 | rep2 |
+|---|---|---|
+| `tuned_log` (defaults + `c = 1`) | 0.771 | 0.773 |
+| `poisson_tss` (TSS 1, no tail) | 0.680 | 0.687 |
+| `runon_fixed` (TSS 1, tail, extended) | 0.629 | 0.611 |
+| `runon_clipped` (TSS 1, tail, `extend=False`) | 0.631 | 0.585 |
+| `tail_fixed` (no masks, tail, extended) | 0.652 | 0.647 |
+| `log_tail_fixed` (tuned log, tail, extended) | 0.694 | 0.690 |
+
+**Decisions, by the pre-registered rules:**
+
+1. **The fix works -- fails.** `runon_fixed` vs `runon_clipped`: rep1 0.496
+   of discordant loci (p = 0.83), rep2 0.555 (p = 0.002). It removes the
+   18.25 asymmetry where it bites (rep2) and costs nothing elsewhere, so
+   `extend=True` stays the default as the correct construction, but it does
+   not make the tail help.
+2. **The tail stays in the abundances configuration -- fails.**
+   `poisson_tss` beats `runon_fixed` on both replicates (wins 0.582 / 0.623,
+   p < 1e-15). The docs drop the tail from that configuration, which becomes
+   quasi-Poisson, TSS mask `(1, 1)`, no PAS mask.
+3. **Head-to-head -- outcome 1 again:** `tuned_log` beats `runon_fixed` on
+   both (0.750 / 0.762). Two recommended configurations stay.
+
+Reported: with every tail visible, **the tail lowers accuracy in every
+configuration**: `tail_fixed` vs `poisson_tss` -2.8 / -4.0 (p <= 0.004);
+`log_tail_fixed` vs `tuned_log` -7.7 / -8.3 (p < 1e-15). The clipped tail's
+apparent gains without the TSS mask (18.24 exploratory: +3.8 / +2.1) did not
+survive making it symmetric.
+
+**Where run-on stands.** It improves the fit to real signal (held-out
+deviance, 18.14, 18.18) and helped isoform calls in the DENR authors'
+simulator (18.10), whose isoforms all share archetype tails; on real data a
+tail shared by every gene does not help -- and with every tail visible,
+hurts -- telling isoforms apart, consistent with per-gene termination varying
+widely (18.17: downstream scales 0.35-3.6x). Demoted like shape profiles
+(18.8): kept and documented, `build-design --runon-tail` warns, not
+recommended for isoform calls. The held-out-deviance recommendations that
+included it (18.18's no-PAS-mask result was measured with the tail; 18.20-
+18.22 replicated it without) stand on their own evidence.
+
+### 18.27 Scope decision: replicate DENR; everything else is experimental
+
+November 2026, the maintainer's decision after 18.20-18.26. Measured against
+an independent truth (K562 long reads), no extension improved isoform calls
+enough to justify departing from DENR: shape profiles were a wash in
+simulation and worse on real data (18.8, 18.14); the run-on tail fits signal
+better but makes calls worse once applied symmetrically (18.26); Poisson and
+quasi-Poisson fit counts better but call dominant isoforms worse (18.24,
+18.26); penalties were never validated (Gate C). The one consistent gain,
+`--log-offset 1` (+3.4 to +4.3 points, 18.23-18.24), is modest and rests on
+one cell line.
+
+So: **the defaults -- DENR's, with its bugs fixed -- are the only
+recommendation.** Every extension stays in the code, tested and documented,
+and is labelled experimental in the docs and CLI help; nothing is removed.
+Improvement work stops here. What remains in scope is replicating DENR well:
+correctness, bug fixes, input checks, speed, packaging. Open items that would
+reopen method work -- TSS evidence from PINTS/dREG calls, a second cell line
+for the long-read comparison -- are deferred, not planned.
+
 ## 19. Definition of done for version 1.0
 
-Version 1.0 is complete when:
+Version 1.0 is complete when the following hold. Progress as of November 2026
+is in brackets.
 
-1. Annotation geometry and legacy fits pass frozen R parity tests.
-2. Raw BAM and count-equivalent BigWig inputs are supported and validated.
-3. Multi-sample Poisson fitting and at least ridge regularization are production-ready.
-4. Exact equivalence classes and locus conditioning are primary outputs.
-5. Every locus has an explicit status; numerical failures never appear as zeros.
-6. Output schemas are versioned, documented, and round-trip tested.
-7. Design matrices can be reused without recomputing annotation geometry.
-8. Performance targets are met or revised with documented benchmark evidence.
-9. A complete simulation and real-data validation report is published.
-10. Python API, CLI, container, and one workflow example are available.
+1. Annotation geometry and legacy fits pass frozen R parity tests. [done: 12/12 scenarios]
+2. Raw BAM and count-equivalent BigWig inputs are supported and validated. [BigWig done; BAM not written]
+3. Multi-sample Poisson fitting and at least ridge regularization are production-ready. [Poisson/quasi-Poisson done; ridge implemented but unvalidated -- Gate C never run, no lambda selection]
+4. Exact equivalence classes and locus conditioning are primary outputs. [done]
+5. Every locus has an explicit status; numerical failures never appear as zeros. [done]
+6. Output schemas are versioned, documented, and round-trip tested. [done; `docs/outputs.md`]
+7. Design matrices can be reused without recomputing annotation geometry. [done]
+8. Performance targets are met or revised with documented benchmark evidence. [done: 14.5x wall time, 8-9x memory, section 14]
+9. A complete simulation and real-data validation report is published. [simulation and one real dataset (18.14); no orthogonal real-data accuracy check yet]
+10. Python API, CLI, container, and one workflow example are available. [API, CLI and workflow in `docs/getting-started.md`; no container]
 
-## 20. Immediate next actions
+## 20. Next actions
 
-1. Select and record the DENR reference commit and execution environment.
-2. Export golden intermediate objects from the bundled synthetic tests.
-3. Write the coordinate and output-schema specifications as executable tests.
-4. Benchmark current DENR on one small fixture and one representative whole-genome sample set.
-5. Implement a prototype that accepts an already constructed \(M\) and \(y\), then compares legacy, Poisson, and Poisson-ridge fits before building genomic I/O.
-6. Resolve licensing metadata before copying or adapting implementation code.
+The original Phase 0 list (reference commit, golden exports, schema tests,
+benchmarks, `M`/`y` prototype) is complete. Licensing metadata is still
+unresolved upstream, so implementation continues from the paper and observed
+behaviour. Current priorities:
 
-The first go/no-go review should occur after Phase 2. At that point, the team will know whether parity is achievable, where the actual performance costs lie, and whether the new interface alone justifies continuation independent of the new statistical models.
+1. **Orthogonal real-data accuracy for run-on**: dominant-isoform calls against
+   matched K562 RNA-seq or long-read isoform data (18.14 tested signal, not
+   accuracy). [done, 18.20: the rule fails; dropping the PAS mask is
+   confirmed on accuracy, the tail's accuracy gain is not, and DENR's log
+   objective ranks isoforms as well as Poisson. Legacy log with no PAS mask
+   (18.21): neither candidate passes; the PAS-mask gain replicates under the
+   log objective too, and the tail hurts with log.]
+2. **Contig renaming** at the CLI (an explicit, recorded map), since Ensembl
+   GTFs and UCSC BigWigs do not match out of the box. [done, November 2026:
+   `dienr.contigs`, `--contig-map FILE|PRESET`. Applied to the annotation, so
+   the design digest changes; recorded as `Design.contig_map` and in the
+   manifest. Presets cover primary human chromosomes only -- scaffold names
+   differ in ways a prefix rule gets wrong (Ensembl `GL000192.1` is UCSC
+   `chr1_gl000192_random`) -- and files from
+   github.com/dpryan79/ChromosomeMappings (MIT) load unmodified. `count`
+   refuses when no locus contig is in the BigWigs and names a preset that
+   would fix it.]
+3. **BAM input: not supported, by decision (November 2026).** Converting
+   reads to polymerase positions is chemistry-specific -- single-end PRO-seq
+   needs the read's 5' end with strands swapped; paired-end depends on which
+   mate the kit puts on the RNA 3' end; GRO-seq is fragment-based; PRO-cap
+   and similar measure TSSs, not polymerase -- and a wrong choice yields files
+   that still look like nascent RNA. That decision belongs to the upstream
+   pipeline that knows the library, and a generic converter in dienr would
+   own defaults whose failure is silent. figwig's `bam2bw` would also still
+   need pysam (its `bam2bw` extra), and in figwig 0.3.0 its
+   `--opposite_strand` is silently ignored without `--mate_pairs`
+   (`bam2bw.py:390`; worth reporting upstream). Instead: BigWig input only,
+   chemistry guidance in `docs/input-data.md`, and a **strand-orientation
+   check** on every sample in `dienr count` (18.16), which catches the
+   commonest conversion error whatever produced the files. Normalization
+   factors (section 15) remain to be written.
+4. **Gate C** before any penalty is recommended: stability under resampling,
+   with a lambda-selection rule.
+5. **Per-gene run-on scale**: a downstream-window estimator was tried and
+   made held-out fit worse (18.17); needs a better estimator, if any. A depth
+   gate is unnecessary -- the tail helps at every depth (18.17).
+6. **Dependencies (November 2026).** Python floor raised to 3.12: numpy 2.5
+   and scipy 1.18 require it, so a 3.11 install resolved a separate, untested
+   stack (and BioHPC ships no 3.11). The `bam`, `intervals` (polars-bio) and
+   `ml` (torch, anndata) extras were removed: nothing imported them, `bam`
+   contradicted item 3, and polars-bio pins `polars<2.2`. If Phase 4
+   TSS-evidence joins ever need polars-bio (section 7), re-add it then.
+   New `compat` extra (`polars[rtcompat]`): Polars' default runtime needs
+   AVX2 and dies with `Illegal instruction` on Sandy/Ivy Bridge nodes
+   (cbsubscb02-12); with the extra, the full suite passes there. Polars
+   moved to 2.1.0 (suite, parity 12/12 and mypy unchanged); upper bounds
+   `polars<3` and `figwig<0.4` (pre-1.0, all BigWig I/O).
+   **Revised the same month: floor back to 3.11.** Raising it to 3.12 was
+   about an *untested* 3.11 stack, not an incompatible one. With the suite run
+   on 3.11-3.14, each in an environment resolved fresh for that version
+   (3.11: numpy 2.4.6, scipy 1.17.1, polars 2.1.0; job 4108228), all pass,
+   and `requires-python` is `>=3.11`. 3.10 stays out: end of life October
+   2026, Polars 2 requires 3.11, and `FitStatus` is an `enum.StrEnum`.

@@ -521,6 +521,13 @@ def fit_shape_profile(
 def apply_shape_profile(design: Design, profile: ShapeProfile) -> Design:
     """Reweight `design`'s model columns by `profile`, returning a new `Design`.
 
+    **Not recommended.** A shared profile was a wash on the DENR authors'
+    simulator (plan 18.8), added nothing on top of a run-on tail (18.13), and
+    made held-out Poisson deviance 16% worse on K562 PRO-seq (18.14). It is
+    kept for comparison and research. To change the design, use
+    `dienr.apply_runon_tail`; to study density along genes, inspect
+    `ShapeProfile.table` without applying it.
+
     Each model column's occupied bins are mapped onto ``[0, 1]`` along the
     direction of transcription and multiplied by the profile there. Multiplying
     rather than overwriting -- the reference overwrites -- is identical while
