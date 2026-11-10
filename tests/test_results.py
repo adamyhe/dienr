@@ -611,15 +611,23 @@ def test_blas_cap_is_active_while_fitting(design, monkeypatch):
 
     import dienr.pipeline as pipeline
 
-    seen = []
+    # macOS NumPy wheels use Accelerate, which threadpoolctl can neither see
+    # nor cap; there the cap is a no-op and there is nothing to check.
+    if not any(i["user_api"] == "blas" for i in threadpool_info()):
+        pytest.skip("no BLAS library visible to threadpoolctl (e.g. Accelerate)")
+    seen: list[int] = []
+    calls = 0
     original = pipeline.poisson.fit_locus
 
     def spy(*args, **kwargs):
+        nonlocal calls
+        calls += 1
         seen.extend(i["num_threads"] for i in threadpool_info() if i["user_api"] == "blas")
         return original(*args, **kwargs)
 
     monkeypatch.setattr(pipeline.poisson, "fit_locus", spy)
     fit(design, synthetic_counts(design), likelihood="poisson", blas_threads=1)
+    assert calls > 0
     assert seen and set(seen) == {1}
 
 

@@ -1,5 +1,10 @@
 # DIENR
 
+[![PyPI](https://img.shields.io/pypi/v/dienr)](https://pypi.org/project/dienr/)
+[![Tests](https://github.com/adamyhe/dienr/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/adamyhe/dienr/actions/workflows/ci.yml)
+[![Coverage](https://img.shields.io/badge/coverage-98%25-brightgreen)](https://github.com/adamyhe/dienr)
+[![PyPI Downloads](https://static.pepy.tech/personalized-badge/dienr?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/dienr)
+
 Deconvolution of Isoform Expression from Nascent RNAs.
 
 A Python reimplementation of [DENR](https://github.com/CshlSiepelLab/DENR)

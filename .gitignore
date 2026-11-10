@@ -37,7 +37,6 @@ MANIFEST
 venv/
 env/
 ENV/
-.python-version
 
 # Test and coverage
 .pytest_cache/
