@@ -220,3 +220,35 @@ def test_from_frame_rejects_empty_span():
     )
     with pytest.raises(ValueError, match="empty spans"):
         Annotation.from_frame(frame)
+
+
+def test_ensembl_numeric_contig_names_stay_strings(tmp_path):
+    """Regression: Ensembl GTFs name contigs "1", "2", ..., "X".
+
+    Polars inferred the contig column as an integer from the leading numeric
+    names and then failed on "X", so a stock Ensembl GTF could not be read.
+    (Found running `dienr runon-tail` on GRCh37.87; plan 18.15.)
+    """
+    rows = [
+        {
+            "transcript_id": f"t{i}",
+            "gene_id": f"g{i}",
+            "contig": str(1 + i % 22),
+            "start": 1001 + 10 * i,
+            "end": 5000 + 10 * i,
+            "strand": "+",
+        }
+        for i in range(2_000)
+    ] + [
+        {
+            "transcript_id": "tx",
+            "gene_id": "gx",
+            "contig": "X",
+            "start": 1001,
+            "end": 5000,
+            "strand": "-",
+        }
+    ]
+    annotation = read_annotation(write_gtf(tmp_path / "ens.gtf", rows))
+    assert annotation.transcripts["contig"].dtype == pl.String
+    assert set(annotation.contigs) >= {"1", "22", "X"}
