@@ -158,6 +158,53 @@ def _value_and_grad(
     return fused
 
 
+def _fit_single_model(
+    models: np.ndarray,
+    observed: np.ndarray,
+    scale: np.ndarray,
+    usable: np.ndarray,
+) -> LocusFit | None:
+    """Closed-form fit for one free model with no penalty or background.
+
+    The Poisson score for ``mu_b = a s_b m_b`` is ``sum_b (y_b / a - s_b m_b)``
+    over usable bins, so the MLE is ``a = sum y / sum s m`` -- for *any*
+    nonnegative column, graded or run-on tailed, not only a 0/1 one. It is
+    exactly `moment_initialization`'s start, so the general path would begin at
+    the answer and spend its L-BFGS-B setup confirming it; single-model loci are
+    the common case, which is why that cost is worth skipping (section 14.4).
+
+    Returns None, sending the caller to the general optimizer, where the closed
+    form isn't the optimum of the objective actually minimized: if the
+    `MU_FLOOR` guard would bind in some usable bin, or the estimate exceeds
+    the upper bound.
+    """
+    column = models[:, 0]
+    exposure_mass = float(scale[usable] @ column[usable])
+    if exposure_mass <= 0:  # pragma: no cover - usable bins have support
+        return None
+    estimate = float(observed[usable].sum()) / exposure_mass
+    if not np.isfinite(estimate) or estimate > _FREE_UPPER:
+        return None
+    if float(np.min(estimate * scale[usable] * column[usable])) <= MU_FLOOR:
+        return None
+    # The fused objective's value and gradient, restricted to the usable bins it
+    # sums over; the floor doesn't bind here, so mu is exactly a * s * m.
+    exposure_col = scale[usable] * column[usable]
+    y = observed[usable]
+    mu = estimate * exposure_col
+    value = float(mu.sum() - y @ np.log(mu))
+    grad = float(exposure_mass - (y * exposure_col) @ (1.0 / mu))
+    return LocusFit(
+        abundance=np.array([estimate]),
+        status=FitStatus.OK,
+        objective=value,
+        gradient_norm=abs(grad),
+        iterations=1,
+        converged=True,
+        message="closed-form single-model Poisson MLE",
+    )
+
+
 def fit_locus(
     models: np.ndarray,
     observed: np.ndarray,
@@ -246,6 +293,17 @@ def fit_locus(
 
     scale = exposure.scale(n_bins)
     offset = exposure.offset(n_bins)
+    if (
+        n_models == 1
+        and initial is None
+        and not penalty.is_active
+        and exposure.background is None
+        and not pinned[0]
+    ):
+        single = _fit_single_model(models, observed, scale, usable)
+        if single is not None:
+            return single
+
     if initial is None:
         start = moment_initialization(models, observed, scale, offset)
     else:

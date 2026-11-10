@@ -33,13 +33,29 @@ from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import numpy as np
-from figwig import BigWigReader
 
 from .design import Design
 from .status import FitStatus
+
+if TYPE_CHECKING:
+    from figwig import BigWigReader
+
+
+def open_bigwig(path: str | Path) -> BigWigReader:
+    """Open a BigWig with figwig, importing it only now.
+
+    figwig pulls in numba and llvmlite, which cost seconds to import -- far
+    more from a virtualenv on a network filesystem (plan 14.4) -- and only the
+    commands that read BigWigs need them. Every BigWig in the package is opened
+    here, so `import dienr`, `build-design` and `fit` never pay that cost.
+    """
+    from figwig import BigWigReader
+
+    return BigWigReader(str(path))
+
 
 Summary = Literal["sum", "mean", "min", "max", "std"]
 
@@ -234,7 +250,7 @@ def read_binned(
     width = end - start
     if width <= 0 or n_bins <= 0:
         raise ValueError(f"empty window {contig}:{start}-{end} or n_bins={n_bins}")
-    handle = reader if reader is not None else BigWigReader(str(path))
+    handle = reader if reader is not None else open_bigwig(path)
     if contig not in handle.chrom_sizes:
         raise KeyError(contig)
 
@@ -433,7 +449,7 @@ def declared_contigs(path: str | Path) -> dict[str, int]:
     in the window of interest (`FitStatus.ALL_ZERO`). Inferring the contig list
     from observed data conflates the two, which section 10 of the plan forbids.
     """
-    return dict(BigWigReader(str(path)).chrom_sizes)
+    return dict(open_bigwig(path).chrom_sizes)
 
 
 def count_sample(
@@ -484,7 +500,7 @@ def count_sample(
     if missing:
         raise ValueError(f"design contains loci on strand(s) {sorted(missing)} with no signal file")
 
-    readers = {s: BigWigReader(str(f.path)) for s, f in by_strand.items()}
+    readers = {s: open_bigwig(f.path) for s, f in by_strand.items()}
     headers = {s: dict(r.chrom_sizes) for s, r in readers.items()}
 
     values: list[np.ndarray] = [np.empty(0) for _ in range(design.n_loci)]

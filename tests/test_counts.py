@@ -413,3 +413,20 @@ def test_batched_read_rejects_a_nonpositive_thread_count(random_signal):
     reader = BigWigReader(str(random_signal))
     with pytest.raises(ValueError, match="n_jobs"):
         read_loci_binned(reader, [("c1", 0, 4)], 250, n_jobs=0)
+
+
+def test_importing_dienr_does_not_load_figwig_or_numba():
+    """build-design and fit never read a BigWig, so they mustn't pay for numba.
+
+    Importing numba/llvmlite from a virtualenv on a network filesystem cost
+    ~24 s per fresh process (plan 14.4); `counts.open_bigwig` defers it.
+    """
+    import subprocess
+    import sys
+
+    code = (
+        "import sys, dienr, dienr.cli\n"
+        "loaded = [m for m in ('figwig', 'numba', 'llvmlite') if m in sys.modules]\n"
+        "assert not loaded, loaded\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)

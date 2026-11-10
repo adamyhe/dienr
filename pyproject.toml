@@ -16,6 +16,8 @@ dependencies = [
     "polars>=1.30",
     "figwig>=0.3",
     "pydantic>=2.0",
+    # Caps BLAS threads while fitting: the matrices are tiny (plan 14.4).
+    "threadpoolctl>=3.1",
 ]
 
 [project.optional-dependencies]
@@ -58,5 +60,5 @@ warn_unreachable = true
 no_implicit_optional = true
 
 [[tool.mypy.overrides]]
-module = ["scipy.*"]
+module = ["scipy.*", "threadpoolctl"]
 ignore_missing_imports = true
