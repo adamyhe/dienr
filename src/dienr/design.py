@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Literal
 
 import numpy as np
@@ -154,8 +155,17 @@ class Design:
             changes what an abundance means, so it must be visible on the
             object and in `digest` rather than inferred from whether the
             matrices happen to hold non-integer values.
+        runon_digest: Digest of the `dienr.runon.RunonTail` added past each
+            model's PAS, or None. Like `shape_digest`, it changes what a model
+            column predicts, so it is recorded on the object and in `digest`.
         digest: Digest over annotation, config and resulting geometry. A change
             to any input yields a new value.
+        window_starts: Genomic start of each locus's bin window, or None when
+            every window starts at its locus's transcript span (`loci`
+            ``start``), as built. `dienr.runon.apply_runon_tail` extends
+            minus-strand windows downstream -- to lower coordinates -- so
+            their windows start before their spans. Read it through
+            `window_start`, never from `loci`.
         contig_map: The ``(old, new)`` contig renaming applied to the
             annotation, or None. Already reflected in `annotation_digest` (the
             contig names changed); kept here so results can record it.
@@ -173,7 +183,9 @@ class Design:
     annotation_digest: str
     digest: str
     shape_digest: str | None = None
+    runon_digest: str | None = None
     contig_map: tuple[tuple[str, str], ...] | None = None
+    window_starts: list[int] | None = None
 
     @property
     def n_loci(self) -> int:
@@ -230,6 +242,21 @@ class Design:
         `bin_size` or exclude these transcripts deliberately.
         """
         return self.model_table.filter(~pl.col("has_support"))
+
+    def window_start(self, locus_id: int) -> int:
+        """Genomic start of `locus_id`'s first bin. Bins are `bin_size` wide from here.
+
+        The locus's transcript span start unless a run-on tail extended the
+        window (see `window_starts`). An index, not a scan.
+        """
+        starts = getattr(self, "window_starts", None)  # absent on old pickles
+        if starts is not None:
+            return starts[locus_id]
+        return int(self._span_starts[locus_id])
+
+    @cached_property
+    def _span_starts(self) -> np.ndarray:
+        return self.loci["start"].to_numpy()
 
     def model_span(self, locus_id: int, model_index: int) -> tuple[int, int]:
         """Pre-mask ``(first_bin, last_bin)`` of one model, or ``(-1, -1)``.

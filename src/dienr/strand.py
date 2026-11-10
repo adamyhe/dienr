@@ -187,8 +187,9 @@ def _single_strand_loci(design: Design) -> list[tuple[str, str, int, int]]:
             s, e = starts[mine], ends[mine]
             # Opposite-strand loci overlapping [s, e): started before e, not ended by s.
             overlaps = np.searchsorted(o_start, e, "left") - np.searchsorted(o_end, s, "right")
-            for lid, start, keep in zip(ids[mine], s, overlaps == 0, strict=True):
+            for lid, keep in zip(ids[mine], overlaps == 0, strict=True):
                 if keep:
-                    out.append((strand, contig, int(start), design.bin_count(int(lid))))
+                    window = design.window_start(int(lid))
+                    out.append((strand, contig, window, design.bin_count(int(lid))))
     out.sort(key=lambda row: (row[1], row[2]))
     return out

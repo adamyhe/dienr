@@ -87,13 +87,15 @@ def objective(
     models: np.ndarray,
     observed: np.ndarray,
     transform: Transform,
+    *,
+    log_offset: float = LOG_OFFSET,
 ) -> float:
     """Legacy sum-of-squares objective."""
     predicted = models @ abundance
     if transform == "identity":
         residual = observed - predicted
     elif transform == "log":
-        residual = np.log(observed + LOG_OFFSET) - np.log(predicted + LOG_OFFSET)
+        residual = np.log(observed + log_offset) - np.log(predicted + log_offset)
     else:
         raise ValueError(f"transform must be 'identity' or 'log', got {transform!r}")
     return float(residual @ residual)
@@ -104,19 +106,21 @@ def gradient(
     models: np.ndarray,
     observed: np.ndarray,
     transform: Transform,
+    *,
+    log_offset: float = LOG_OFFSET,
 ) -> np.ndarray:
     """Analytic gradient of `objective` with respect to `abundance`."""
     predicted = models @ abundance
     if transform == "identity":
         return -2.0 * (models.T @ (observed - predicted))
     if transform == "log":
-        residual = np.log(observed + LOG_OFFSET) - np.log(predicted + LOG_OFFSET)
-        return -2.0 * (models.T @ (residual / (predicted + LOG_OFFSET)))
+        residual = np.log(observed + log_offset) - np.log(predicted + log_offset)
+        return -2.0 * (models.T @ (residual / (predicted + log_offset)))
     raise ValueError(f"transform must be 'identity' or 'log', got {transform!r}")
 
 
 def _value_and_grad(
-    models: np.ndarray, observed: np.ndarray, transform: Transform
+    models: np.ndarray, observed: np.ndarray, transform: Transform, log_offset: float = LOG_OFFSET
 ) -> Callable[[np.ndarray], tuple[float, np.ndarray]]:
     """Build a fused objective-and-gradient closure for one locus.
 
@@ -151,11 +155,11 @@ def _value_and_grad(
             return float(residual @ residual), gradient_value
 
     elif transform == "log":
-        log_observed = np.log(observed + LOG_OFFSET)
+        log_observed = np.log(observed + log_offset)
 
         def fused(abundance: np.ndarray) -> tuple[float, np.ndarray]:
             np.matmul(models, abundance, out=scratch)
-            np.add(scratch, LOG_OFFSET, out=scratch)
+            np.add(scratch, log_offset, out=scratch)
             np.log(scratch, out=residual)
             np.subtract(log_observed, residual, out=residual)
             value = float(residual @ residual)
@@ -171,7 +175,7 @@ def _value_and_grad(
 
 
 def _fit_single_model(
-    models: np.ndarray, observed: np.ndarray, transform: Transform
+    models: np.ndarray, observed: np.ndarray, transform: Transform, log_offset: float = LOG_OFFSET
 ) -> tuple[np.ndarray, float, int, bool, str]:
     """Fit a locus that has exactly one model, without the general optimizer.
 
@@ -199,7 +203,7 @@ def _fit_single_model(
         estimate = np.array([value])
         return (
             estimate,
-            objective(estimate, models, observed, transform),
+            objective(estimate, models, observed, transform, log_offset=log_offset),
             1,
             True,
             "closed-form nonnegative least squares",
@@ -208,7 +212,7 @@ def _fit_single_model(
     # Bracket the search using the identity-transform solution, which is the
     # right order of magnitude, then widen generously.
     scale = max(1.0, float(column @ observed) / denominator)
-    fused = _value_and_grad(models, observed, transform)
+    fused = _value_and_grad(models, observed, transform, log_offset)
     result = optimize.minimize_scalar(
         lambda a: fused(np.array([a]))[0],
         bounds=(0.0, scale * 1e3),
@@ -235,6 +239,7 @@ def fit_locus(
     max_iterations: int = 15_000,
     min_unmasked_bins: int = 1,
     prior_status: FitStatus | None = None,
+    log_offset: float = LOG_OFFSET,
 ) -> LocusFit:
     """Fit one locus by nonnegative least squares.
 
@@ -242,6 +247,9 @@ def fit_locus(
         models: ``(n_bins, n_models)`` design matrix, masked bins already zeroed.
         observed: Length ``n_bins`` signal vector, masked bins already zeroed.
         transform: ``"log"`` (default, as published) or ``"identity"``.
+        log_offset: The constant added inside the log transform. ``1e-3``, the
+            published value, keeps R parity; it sets how much empty bins weigh
+            and has never been tuned (plan 18.23).
         inactive: Boolean array over models to pin at zero, for example from
             external TSS evidence.
         initial: Starting abundance. Defaults to zeros, matching the reference.
@@ -258,6 +266,8 @@ def fit_locus(
         A `LocusFit`. On failure the abundance is all-NaN, never zeros.
     """
     n_bins, n_models = models.shape
+    if not log_offset > 0:
+        raise ValueError(f"log_offset must be positive, got {log_offset}")
 
     # Only genuine failures skip the fit. An upstream ALL_ZERO must still
     # produce zeros rather than NaN, or a quiet locus would be reported as a
@@ -294,7 +304,9 @@ def fit_locus(
         return LocusFit(
             abundance=np.zeros(n_models),
             status=FitStatus.ALL_ZERO,
-            objective=objective(np.zeros(n_models), models, observed, transform),
+            objective=objective(
+                np.zeros(n_models), models, observed, transform, log_offset=log_offset
+            ),
             gradient_norm=0.0,
             iterations=0,
             converged=True,
@@ -303,9 +315,11 @@ def fit_locus(
 
     if n_models == 1 and not pinned[0] and initial is None:
         estimate, value, iterations, converged, message = _fit_single_model(
-            models, observed, transform
+            models, observed, transform, log_offset
         )
-        gradient_norm = float(np.abs(gradient(estimate, models, observed, transform)).max())
+        gradient_norm = float(
+            np.abs(gradient(estimate, models, observed, transform, log_offset=log_offset)).max()
+        )
         return LocusFit(
             abundance=estimate,
             status=FitStatus.OK if converged else FitStatus.NONCONVERGED,
@@ -327,7 +341,7 @@ def fit_locus(
         # us slower than R on many small loci (plan section 14.2). Verified
         # bit-identical in test_lean_driver_matches_scipy_minimize.
         abundance, value, final_gradient, iterations, converged, message = minimize_bounded(
-            _value_and_grad(models, observed, transform),
+            _value_and_grad(models, observed, transform, log_offset),
             start,
             np.zeros(n_models),
             upper,
@@ -339,7 +353,7 @@ def fit_locus(
     # Pinned models may drift by the tiny bound; snap them back.
     abundance[pinned] = 0.0
     if pinned.any():
-        final_gradient = gradient(abundance, models, observed, transform)
+        final_gradient = gradient(abundance, models, observed, transform, log_offset=log_offset)
     gradient_norm = float(np.abs(final_gradient).max()) if n_models else 0.0
 
     if not np.all(np.isfinite(abundance)):

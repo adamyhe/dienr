@@ -408,6 +408,8 @@ def collect_results(
         "annotation_digest": design.annotation_digest,
         "design_digest": design.digest,
         # getattr: designs pickled before these fields existed lack them.
+        "shape_digest": getattr(design, "shape_digest", None),
+        "runon_digest": getattr(design, "runon_digest", None),
         "contig_map": dict(getattr(design, "contig_map", None) or ()) or None,
         "bin_size": design.config.bin_size,
         "distance": design.config.effective_distance,

@@ -46,6 +46,7 @@ from .diagnostics import LocusConditioning, assess
 from .loci import assign_loci, locus_table
 from .pipeline import fit, status_report
 from .results import SCHEMA_VERSION, FitResult, RunSummary, collect_results
+from .runon import RunonConfig, RunonTail, apply_runon_tail, fit_runon_tail
 from .shape import (
     ShapeConfig,
     ShapeProfile,
@@ -76,6 +77,8 @@ __all__ = [
     "LocusFit",
     "Penalty",
     "RunSummary",
+    "RunonConfig",
+    "RunonTail",
     "SampleCounts",
     "SignalFile",
     "StrandCheck",
@@ -86,6 +89,7 @@ __all__ = [
     "ShapeProfile",
     "__version__",
     "applied_dynamic_range",
+    "apply_runon_tail",
     "apply_shape_profile",
     "assess",
     "assign_loci",
@@ -96,6 +100,7 @@ __all__ = [
     "declared_contigs",
     "fit",
     "fit_locus",
+    "fit_runon_tail",
     "fit_shape_profile",
     "is_failure",
     "inference",

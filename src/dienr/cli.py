@@ -27,8 +27,11 @@ from .counts import VALUE_KINDS, SignalFile, count_sample, declared_contigs
 from .design import Design, build_design
 from .pipeline import fit, status_report
 from .results import FitResult
+from .runon import RunonConfig, RunonTail, apply_runon_tail
+from .runon import fit_runon_tail as _fit_runon_tail
 from .shape import ShapeConfig, ShapeProfile, applied_dynamic_range, apply_shape_profile
 from .shape import fit_shape_profile as _fit_shape_profile
+from .solvers.legacy import LOG_OFFSET
 from .solvers.penalties import Penalty
 from .strand import check_strand_orientation
 
@@ -40,6 +43,9 @@ COUNTS_FILENAME = "counts.pkl"
 
 #: Filename for a serialized `ShapeProfile` inside a profile directory.
 SHAPE_FILENAME = "shape_profile.pkl"
+
+#: Filename for a serialized `RunonTail` inside a run-on directory.
+RUNON_FILENAME = "runon_tail.pkl"
 
 
 def _add_design_options(parser: argparse.ArgumentParser) -> None:
@@ -111,9 +117,22 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "directory from 'dienr shape-profile'. Reweights every model "
-            "column by measured relative density, which yields a new design "
-            "digest because an abundance then means something different"
+            "NOT RECOMMENDED. Directory from 'dienr shape-profile'. Reweights "
+            "every model column by measured relative density. In validation "
+            "this was a wash on simulated data, did not improve on a run-on "
+            "tail, and made held-out fit 16%% worse on real PRO-seq (plan "
+            "18.8, 18.13, 18.14). Fit a profile to inspect it; use "
+            "--runon-tail to change the design"
+        ),
+    )
+    design.add_argument(
+        "--runon-tail",
+        type=Path,
+        default=None,
+        help=(
+            "EXPERIMENTAL, not recommended. Directory from 'dienr runon-tail'. "
+            "Adds the fitted read-through signal past each model's PAS; it made "
+            "isoform calls worse on real data (plan 18.26)"
         ),
     )
     _add_design_options(design)
@@ -167,6 +186,15 @@ def build_parser() -> argparse.ArgumentParser:
     fit_parser.add_argument("--counts", required=True, type=Path)
     fit_parser.add_argument("--output", required=True, type=Path)
     fit_parser.add_argument(
+        "--log-offset",
+        type=float,
+        default=LOG_OFFSET,
+        help=(
+            "EXPERIMENTAL. Constant c in the legacy log transform log(y + c), on "
+            "the scale of --summary (default 0.001, DENR's; keep it for R parity)"
+        ),
+    )
+    fit_parser.add_argument(
         "--jobs",
         type=_positive_int,
         default=_default_jobs(),
@@ -191,17 +219,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--likelihood",
         choices=("legacy", "poisson", "quasi_poisson"),
         default="legacy",
-        help="legacy least squares (default, the only one with R parity); "
-        "poisson; or quasi_poisson, which gives identical abundances to poisson "
-        "with standard errors scaled by a pooled dispersion and is the "
-        "recommended choice for overdispersed counts",
+        help="legacy least squares (default: DENR's objective, with R parity); "
+        "EXPERIMENTAL: poisson, or quasi_poisson, which gives the same abundances "
+        "as poisson with standard errors scaled by a pooled dispersion",
     )
     fit_parser.add_argument("--transform", choices=("log", "identity"), default="log")
     fit_parser.add_argument(
         "--penalty",
         choices=("none", "ridge", "lasso", "elastic_net"),
         default="none",
-        help="count likelihoods only; recorded in the output",
+        help="EXPERIMENTAL and unvalidated; count likelihoods only",
     )
     fit_parser.add_argument("--lambda1", type=float, default=0.0, help="L1 weight")
     fit_parser.add_argument("--lambda2", type=float, default=0.0, help="L2 weight")
@@ -225,7 +252,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     shape = subparsers.add_parser(
         "shape-profile",
-        help="fit an empirical relative-density profile from isolated genes",
+        help=(
+            "measure relative polymerase density along isolated genes "
+            "(for inspection; applying it to a design isn't recommended)"
+        ),
     )
     shape.add_argument("--gtf", required=True, type=Path, help="GTF/GFF annotation")
     _add_contig_map_argument(shape)
@@ -282,11 +312,51 @@ def build_parser() -> argparse.ArgumentParser:
         help="accept genes shorter than head + tail, which contribute no body positions",
     )
 
+    runon = subparsers.add_parser(
+        "runon-tail",
+        help="(experimental) fit a shared read-through tail past the PAS from isolated genes",
+    )
+    runon.add_argument("--gtf", required=True, type=Path, help="GTF/GFF annotation")
+    _add_contig_map_argument(runon)
+    runon.add_argument("--bigwig-plus", required=True, type=Path)
+    runon.add_argument("--bigwig-minus", required=True, type=Path)
+    runon.add_argument("--output", required=True, type=Path, help="output directory")
+    defaults = RunonConfig()
+    runon.add_argument("--bin-size", type=int, default=defaults.bin_size)
+    runon.add_argument(
+        "--tail-bases",
+        type=int,
+        default=defaults.tail_bases,
+        help="tail length past the PAS, a multiple of --bin-size (default 15 kb)",
+    )
+    runon.add_argument(
+        "--buffer-bases",
+        type=int,
+        default=defaults.buffer_bases,
+        help="training genes need no other same-strand transcript this close",
+    )
+    runon.add_argument("--min-length", type=int, default=defaults.min_length)
+    runon.add_argument(
+        "--min-body-signal",
+        type=float,
+        default=defaults.min_body_signal,
+        help="minimum mean summed signal per body bin for a training gene",
+    )
+    runon.add_argument("--threads", type=_positive_int, default=8)
+
     validate = subparsers.add_parser("validate", help="check a results directory")
     validate.add_argument("--results", required=True, type=Path)
     validate.add_argument("--max-failure-fraction", type=float, default=1.0)
 
     return parser
+
+
+def _load_design(directory: Path) -> Design:
+    path = directory / DESIGN_FILENAME
+    if not path.exists():
+        raise SystemExit(f"{directory}: no {DESIGN_FILENAME}; run 'dienr build-design' first")
+    with path.open("rb") as handle:
+        return pickle.load(handle)
 
 
 def _default_jobs() -> int:
@@ -305,14 +375,6 @@ def _blas_threads(value: str) -> int | None:
     if number < 1:
         raise argparse.ArgumentTypeError("--blas-threads must be >= 1 or 'auto'")
     return number
-
-
-def _load_design(directory: Path) -> Design:
-    path = directory / DESIGN_FILENAME
-    if not path.exists():
-        raise SystemExit(f"{directory}: no {DESIGN_FILENAME}; run 'dienr build-design' first")
-    with path.open("rb") as handle:
-        return pickle.load(handle)
 
 
 def _add_contig_map_argument(parser: argparse.ArgumentParser) -> None:
@@ -408,6 +470,56 @@ def cmd_shape_profile(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_runon_tail(directory: Path) -> RunonTail:
+    path = directory / RUNON_FILENAME
+    if not path.exists():
+        raise SystemExit(f"{directory}: no {RUNON_FILENAME}; run 'dienr runon-tail' first")
+    with path.open("rb") as handle:
+        tail: RunonTail = pickle.load(handle)
+    return tail
+
+
+def cmd_runon_tail(args: argparse.Namespace) -> int:
+    annotation = _read_annotation(args)
+    try:
+        config = RunonConfig(
+            bin_size=args.bin_size,
+            tail_bases=args.tail_bases,
+            buffer_bases=args.buffer_bases,
+            min_length=args.min_length,
+            min_body_signal=args.min_body_signal,
+        )
+        tail = _fit_runon_tail(
+            annotation,
+            (
+                SignalFile(path=args.bigwig_plus, strand="+"),
+                SignalFile(path=args.bigwig_minus, strand="-"),
+            ),
+            config=config,
+            n_jobs=args.threads,
+        )
+    except ValueError as error:
+        raise SystemExit(f"error: {error}") from error
+
+    args.output.mkdir(parents=True, exist_ok=True)
+    with (args.output / RUNON_FILENAME).open("wb") as handle:
+        pickle.dump(tail, handle)
+    tail.table().write_parquet(args.output / "runon_tail.parquet")
+    print(
+        f"run-on tail {tail.digest}: {tail.n_genes} training genes, "
+        f"mass {tail.mass:.1f} body-bins, peak {tail.values.max():.2f}x"
+    )
+    dropped = ", ".join(f"{reason}={count}" for reason, count in tail.rejected.items() if count)
+    if dropped:
+        print(f"  genes dropped: {dropped}")
+    # Print the curve so an empty or implausible tail is visible without plotting.
+    step = max(tail.values.size // 8, 1)
+    marks = range(0, tail.values.size, step)
+    print("  kb past PAS " + " ".join(f"{(d + 0.5) * args.bin_size / 1000:5.2f}" for d in marks))
+    print("  density     " + " ".join(f"{tail.values[d]:5.2f}" for d in marks))
+    return 0
+
+
 def cmd_build_design(args: argparse.Namespace) -> int:
     annotation = _read_annotation(args)
     design = build_design(
@@ -423,6 +535,12 @@ def cmd_build_design(args: argparse.Namespace) -> int:
     if args.shape_profile is not None:
         profile = _load_shape_profile(args.shape_profile)
         design = apply_shape_profile(design, profile)
+    if args.runon_tail is not None:
+        tail = _load_runon_tail(args.runon_tail)
+        try:
+            design = apply_runon_tail(design, tail)
+        except ValueError as error:
+            raise SystemExit(f"error: {error}") from error
 
     args.output.mkdir(parents=True, exist_ok=True)
     with (args.output / DESIGN_FILENAME).open("wb") as handle:
@@ -438,6 +556,13 @@ def cmd_build_design(args: argparse.Namespace) -> int:
     if design.shape_digest is not None:
         applied = applied_dynamic_range(design)
         print(f"  reshaped by profile {design.shape_digest}; applied range {applied:.2f}x")
+        print(
+            "warning: applying a shape profile is not recommended. It did not "
+            "improve accuracy on simulated data and made held-out fit 16% worse "
+            "on real PRO-seq (plan 18.8, 18.14); --runon-tail is the validated "
+            "design change",
+            file=sys.stderr,
+        )
         if applied < 1.2:
             print(
                 f"warning: only {applied:.3f}x of the profile's grading survives in "
@@ -445,6 +570,20 @@ def cmd_build_design(args: argparse.Namespace) -> int:
                 "bins -- the pausing peak is the biggest thing the profile measures "
                 "and the first thing a mask removes. Reduce --mask-tss/"
                 "--mask-start-bins if the profile is meant to do work",
+                file=sys.stderr,
+            )
+    if design.runon_digest is not None:
+        print(f"  run-on tail {design.runon_digest} added past each model's PAS")
+        print(
+            "warning: a run-on tail improves the fit to signal but made dominant-isoform "
+            "calls worse against K562 long-read data in every configuration tried "
+            "(plan 18.26). Leave it out to call isoforms",
+            file=sys.stderr,
+        )
+        if design.shape_digest is not None:
+            print(
+                "warning: a shape profile and a run-on tail together did not beat the "
+                "tail alone in validation (plan 18.13); drop the profile",
                 file=sys.stderr,
             )
     heavy = design.heavily_masked_loci(threshold=0.5)
@@ -564,6 +703,13 @@ def cmd_fit(args: argparse.Namespace) -> int:
             if line.strip()
         }
 
+    if args.likelihood == "legacy" and getattr(design, "runon_digest", None) is not None:
+        print(
+            "warning: this design has a run-on tail, and fitting it with the legacy "
+            "least-squares objective made dominant-isoform calls worse against K562 "
+            "long reads (plan 18.21). The tail was validated with --likelihood poisson",
+            file=sys.stderr,
+        )
     result = fit(
         design,
         samples,
@@ -574,6 +720,7 @@ def cmd_fit(args: argparse.Namespace) -> int:
         inactive_transcripts=inactive,
         blas_threads=args.blas_threads,
         n_jobs=args.jobs,
+        log_offset=args.log_offset,
     )
     result.write(args.output)
     return _report(result, args.max_failure_fraction)
@@ -611,6 +758,7 @@ def main(argv: list[str] | None = None) -> int:
         "build-design": cmd_build_design,
         "count": cmd_count,
         "fit": cmd_fit,
+        "runon-tail": cmd_runon_tail,
         "shape-profile": cmd_shape_profile,
         "validate": cmd_validate,
     }

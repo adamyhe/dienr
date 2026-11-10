@@ -525,10 +525,9 @@ def count_sample(
             statuses[locus_id] = FitStatus.MISSING_CONTIG
             continue
 
-        # Bins are anchored at the locus start, so no lookup is needed. Taking
-        # this from the bins frame would also mean an unguarded `.min()` that
-        # returns None for an empty selection.
-        window_start = int(locus["start"])
+        # The window's own start: the locus start, unless a run-on tail
+        # extended a minus-strand window downstream (`Design.window_start`).
+        window_start = design.window_start(locus_id)
         window_end = window_start + n_bins * bin_size
         if window_end <= headers[strand][contig]:
             batched[strand].append((locus_id, (contig, window_start, n_bins)))
