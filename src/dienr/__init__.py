@@ -31,6 +31,8 @@ Coordinates are 0-based half-open throughout; see `dienr.annotation` for the
 single conversion point.
 """
 
+from importlib import metadata as _metadata
+
 from .annotation import Annotation, read_annotation
 from .contigs import ContigMap, check_contigs, rename_contigs
 from .counts import (
@@ -62,7 +64,11 @@ from .solvers.penalties import NO_PENALTY, Penalty
 from .status import FitStatus, is_failure
 from .strand import StrandCheck, check_strand_orientation
 
-__version__ = "0.1.0.dev0"
+try:
+    # pyproject.toml is the only place the version is written.
+    __version__ = _metadata.version("dienr")
+except _metadata.PackageNotFoundError:  # imported from a source tree, not installed
+    __version__ = "0+unknown"
 
 __all__ = [
     "SCHEMA_VERSION",

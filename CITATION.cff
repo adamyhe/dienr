@@ -13,7 +13,7 @@ authors:
   - family-names: He
     given-names: Adam Youlin
     email: ayhe@stanford.edu
-version: 0.1.0.dev0
+version: 0.1.0
 license: MIT
 repository-code: "https://github.com/adamyhe/dienr"
 keywords:
