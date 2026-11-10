@@ -193,6 +193,7 @@ def test_fit_exits_nonzero_when_failures_exceed_threshold(annotation_gtf, tmp_pa
             str(samples),
             "--output",
             str(counts_dir),
+            "--allow-contig-mismatch",
         ]
     )
 

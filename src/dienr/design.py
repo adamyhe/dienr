@@ -156,6 +156,9 @@ class Design:
             matrices happen to hold non-integer values.
         digest: Digest over annotation, config and resulting geometry. A change
             to any input yields a new value.
+        contig_map: The ``(old, new)`` contig renaming applied to the
+            annotation, or None. Already reflected in `annotation_digest` (the
+            contig names changed); kept here so results can record it.
     """
 
     bins: pl.DataFrame
@@ -170,6 +173,7 @@ class Design:
     annotation_digest: str
     digest: str
     shape_digest: str | None = None
+    contig_map: tuple[tuple[str, str], ...] | None = None
 
     @property
     def n_loci(self) -> int:
@@ -418,6 +422,7 @@ def _build(annotation: Annotation, config: DesignConfig) -> Design:
         config=config,
         annotation_digest=annotation.digest,
         digest=_design_digest(annotation.digest, config, model_table),
+        contig_map=annotation.contig_map,
     )
 
 
