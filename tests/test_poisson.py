@@ -604,3 +604,119 @@ def test_poisson_efficiency_gain_needs_a_graded_design():
     graded = np.linspace(0.02, 1.0, 200)
     assert variance_ratio(flat) == pytest.approx(1.0)
     assert 1.05 < variance_ratio(graded) < 1.2
+
+
+# --- starting point ----------------------------------------------------------
+
+
+def _graded_design(entry_scale: float) -> np.ndarray:
+    """Two overlapping, front-loaded columns: an exact-density style design."""
+    rng = np.random.default_rng(3)
+    matrix = np.zeros((60, 2))
+    matrix[0:40, 0] = rng.gamma(2.0, 1.0, 40) + np.r_[np.full(4, 8.0), np.zeros(36)]
+    matrix[15:60, 1] = rng.gamma(2.0, 1.0, 45) + np.r_[np.full(4, 8.0), np.zeros(41)]
+    return matrix * entry_scale
+
+
+def test_moment_start_is_the_single_model_poisson_mle():
+    """Alone, a model's start is sum(y on its support) / sum(scale * M)."""
+    from dienr.solvers._glm import moment_initialization
+
+    matrix = _graded_design(1.0)
+    observed = simulate(matrix, np.array([3.0, 0.5]), seed=1)
+    scale = np.full(matrix.shape[0], 2.0)
+    start = moment_initialization(matrix, observed, scale, np.zeros(matrix.shape[0]))
+    for k in range(2):
+        support = matrix[:, k] > 0
+        assert start[k] == pytest.approx(observed[support].sum() / (2.0 * matrix[:, k].sum()))
+
+
+@pytest.mark.parametrize("entry_scale", [1.0, 500.0])
+def test_fit_is_invariant_to_column_scale(entry_scale):
+    """Regression (plan 18.10): large design entries collapsed every abundance to 0.
+
+    The old start, ``M'y / M'1``, was the M-weighted mean of y -- ~entry_scale^2
+    too high -- and from there L-BFGS-B ran onto the zero bound and reported
+    ``invalid_mean`` at 493/910 nascentRNASim loci with exact-density columns.
+    Scaling a column by ``s`` must scale its abundance by exactly ``1/s``.
+    """
+    unit = _graded_design(1.0)
+    observed = simulate(unit, np.array([0.8, 0.3]), seed=2)
+    reference = poisson.fit_locus(unit, observed)
+    scaled = poisson.fit_locus(unit * entry_scale, observed)
+    assert reference.status is FitStatus.OK
+    assert scaled.status is FitStatus.OK
+    np.testing.assert_allclose(scaled.abundance * entry_scale, reference.abundance, rtol=1e-4)
+
+
+# --------------------------------------------------------------------------
+# Single-model fast path (plan 14.4)
+# --------------------------------------------------------------------------
+
+FAST_MESSAGE = "closed-form single-model Poisson MLE"
+
+
+def _single_columns():
+    binary = np.ones((64, 1))
+    binary[:4] = 0.0
+    graded = binary.copy()
+    graded[40:, 0] = np.linspace(1.4, 0.15, 24)  # a run-on-like tail
+    return {"binary": binary, "graded": graded}
+
+
+@pytest.mark.parametrize("kind", ["binary", "graded"])
+@pytest.mark.parametrize("scale", [None, "bins"])
+def test_single_model_fast_path_matches_general_optimizer(kind, scale):
+    """Same answer as L-BFGS-B, which is routed to by a pinned dummy column."""
+    column = _single_columns()[kind]
+    rng = np.random.default_rng(1)
+    observed = rng.poisson(6.0 * column[:, 0]).astype(float)
+    exposure = Exposure() if scale is None else Exposure(bin_exposure=rng.uniform(0.5, 1.5, 64))
+
+    fast = poisson.fit_locus(column, observed, exposure=exposure)
+    general = poisson.fit_locus(
+        np.hstack([column, column]),
+        observed,
+        exposure=exposure,
+        inactive=np.array([False, True]),
+    )
+    assert fast.message == FAST_MESSAGE
+    assert general.message != FAST_MESSAGE
+    assert fast.status is FitStatus.OK
+    np.testing.assert_allclose(fast.abundance[0], general.abundance[0], rtol=1e-9)
+    assert fast.objective == pytest.approx(general.objective, rel=1e-12)
+    assert fast.gradient_norm < 1e-8 * observed.sum()
+
+
+def test_single_model_fast_path_is_the_closed_form():
+    column = _single_columns()["graded"]
+    observed = np.random.default_rng(2).poisson(4.0 * column[:, 0]).astype(float)
+    fast = poisson.fit_locus(column, observed)
+    keep = column[:, 0] > 0
+    assert fast.abundance[0] == pytest.approx(observed[keep].sum() / column[keep, 0].sum())
+
+
+def test_single_model_fast_path_is_skipped_when_it_would_be_wrong():
+    """Penalty, background, a supplied start, or a binding mu floor: general path."""
+    column = _single_columns()["binary"]
+    observed = np.random.default_rng(3).poisson(5.0 * column[:, 0]).astype(float)
+    cases = [
+        poisson.fit_locus(column, observed, penalty=penalties.ridge(1.0)),
+        poisson.fit_locus(column, observed, exposure=Exposure(background=np.full(64, 0.1))),
+        poisson.fit_locus(column, observed, initial=np.array([1.0])),
+    ]
+    tiny = column.copy()
+    tiny[10, 0] = 1e-14  # a*m there sits below MU_FLOOR, so the floor binds
+    sparse = observed.copy()
+    sparse[10] = 0.0  # with counts there, the general path rightly says invalid_mean
+    cases.append(poisson.fit_locus(tiny, sparse))
+    for fit in cases:
+        assert fit.message != FAST_MESSAGE
+        assert fit.status is FitStatus.OK
+
+
+def test_single_model_fast_path_leaves_short_circuits_alone():
+    column = _single_columns()["binary"]
+    assert poisson.fit_locus(column, np.zeros(64)).status is FitStatus.ALL_ZERO
+    pinned = poisson.fit_locus(column, np.ones(64), inactive=np.array([True]))
+    assert pinned.status is FitStatus.INSUFFICIENT_BINS

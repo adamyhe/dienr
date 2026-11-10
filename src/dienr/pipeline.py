@@ -7,11 +7,18 @@ so a workflow engine can cache each stage independently (plan section 11).
 
 from __future__ import annotations
 
-from dataclasses import replace
+import multiprocessing as mp
+import threading
+import warnings
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import nullcontext
+from dataclasses import dataclass, replace
+from itertools import repeat
 from typing import Any, Literal
 
 import numpy as np
 import polars as pl
+from threadpoolctl import threadpool_limits
 
 from .counts import COUNT_LIKELIHOODS, SampleCounts, require_count_equivalent
 from .design import Design
@@ -41,6 +48,8 @@ def fit(
     max_iterations: int = 15_000,
     min_unmasked_bins: int = 1,
     provenance: dict[str, Any] | None = None,
+    blas_threads: int | None = 1,
+    n_jobs: int = 1,
 ) -> FitResult:
     """Fit every locus of every sample and assemble the output tables.
 
@@ -73,6 +82,17 @@ def fit(
         max_iterations: Optimizer iteration cap per locus.
         min_unmasked_bins: Minimum bins with model support to attempt a fit.
         provenance: Extra manifest fields.
+        blas_threads: Threads BLAS may use while fitting; None leaves the
+            library's own setting alone. Defaults to 1 because every locus is
+            a tiny independent problem: on a whole-genome run, multithreaded
+            BLAS made fitting 1.26-1.46x *slower* (plan 14.4). Results do not
+            depend on it.
+        n_jobs: Worker processes fitting loci in parallel. Every locus is an
+            independent problem fitted by the same function either way, so the
+            results are identical for any value; 1 fits in this process. If
+            other Python threads are running when `fit` is called, workers
+            start by `forkserver` and a calling script needs an
+            ``if __name__ == "__main__":`` guard (see `_start_context`).
 
     Returns:
         A `FitResult` covering all samples.
@@ -81,6 +101,48 @@ def fit(
         ValueError: For an unknown likelihood, a penalty on the legacy solver,
             or count-likelihood input that is not count-equivalent.
     """
+    if blas_threads is not None and blas_threads < 1:
+        raise ValueError(f"blas_threads must be >= 1 or None, got {blas_threads}")
+    limit = (
+        threadpool_limits(limits=blas_threads, user_api="blas")
+        if blas_threads is not None
+        else nullcontext()
+    )
+    with limit:
+        return _fit(
+            design,
+            counts,
+            likelihood=likelihood,
+            transform=transform,
+            penalty=penalty,
+            use_bin_exposure=use_bin_exposure,
+            inactive_transcripts=inactive_transcripts,
+            max_iterations=max_iterations,
+            min_unmasked_bins=min_unmasked_bins,
+            provenance=provenance,
+            blas_threads=blas_threads,
+            n_jobs=n_jobs,
+        )
+
+
+def _fit(
+    design: Design,
+    counts: SampleCounts | list[SampleCounts],
+    *,
+    likelihood: Likelihood,
+    transform: Transform,
+    penalty: Penalty,
+    use_bin_exposure: bool,
+    inactive_transcripts: set[str] | None,
+    max_iterations: int,
+    min_unmasked_bins: int,
+    provenance: dict[str, Any] | None,
+    blas_threads: int | None,
+    n_jobs: int,
+) -> FitResult:
+    """`fit`'s body, run inside its BLAS limit; workers apply the same limit."""
+    if n_jobs < 1:
+        raise ValueError(f"n_jobs must be >= 1, got {n_jobs}")
     samples = [counts] if isinstance(counts, SampleCounts) else list(counts)
     if likelihood != "legacy" and likelihood not in COUNT_LIKELIHOODS:
         raise ValueError(
@@ -113,42 +175,33 @@ def fit(
 
     pinned = _pinned_models(design, inactive_transcripts)
 
-    fitted: list[tuple[SampleCounts, list[LocusFit]]] = []
-    for sample in samples:
-        fits = []
-        for locus_id in range(design.n_loci):
-            models = design.models[locus_id]
-            observed = sample.values[locus_id]
-            inactive = pinned[locus_id]
-            prior = sample.locus_status[locus_id]
-
-            if likelihood == "legacy":
-                fits.append(
-                    fit_locus(
-                        models,
-                        observed,
-                        transform=transform,
-                        inactive=inactive,
-                        max_iterations=max_iterations,
-                        min_unmasked_bins=min_unmasked_bins,
-                        prior_status=prior,
-                    )
-                )
-                continue
-
-            fits.append(
-                poisson.fit_locus(
-                    models,
-                    observed,
-                    exposure=_sample_exposure(design, sample, locus_id, use_bin_exposure),
-                    penalty=penalty,
-                    inactive=inactive,
-                    max_iterations=max_iterations,
-                    min_unmasked_bins=min_unmasked_bins,
-                    prior_status=prior,
-                )
-            )
-        fitted.append((sample, fits))
+    options = _FitOptions(
+        likelihood=likelihood,
+        transform=transform,
+        penalty=penalty,
+        max_iterations=max_iterations,
+        min_unmasked_bins=min_unmasked_bins,
+    )
+    tasks = [
+        _LocusTask(
+            models=design.models[locus_id],
+            observed=sample.values[locus_id],
+            inactive=pinned[locus_id],
+            prior=sample.locus_status[locus_id],
+            exposure=(
+                _sample_exposure(design, sample, locus_id, use_bin_exposure)
+                if likelihood != "legacy"
+                else None
+            ),
+        )
+        for sample in samples
+        for locus_id in range(design.n_loci)
+    ]
+    results = _run_tasks(tasks, options, n_jobs=n_jobs, blas_threads=blas_threads)
+    fitted: list[tuple[SampleCounts, list[LocusFit]]] = [
+        (sample, results[index * design.n_loci : (index + 1) * design.n_loci])
+        for index, sample in enumerate(samples)
+    ]
 
     dispersion_record: dict[str, Any] = {}
     if likelihood in COUNT_LIKELIHOODS:
@@ -179,6 +232,121 @@ def fit(
     if provenance:
         merged.update(provenance)
     return collect_results(design, fitted, provenance=merged)
+
+
+@dataclass(frozen=True)
+class _FitOptions:
+    """Everything a locus fit needs besides its own data. Picklable."""
+
+    likelihood: str
+    transform: Transform
+    penalty: Penalty
+    max_iterations: int
+    min_unmasked_bins: int
+
+
+@dataclass(frozen=True)
+class _LocusTask:
+    models: np.ndarray
+    observed: np.ndarray
+    inactive: np.ndarray | None
+    prior: FitStatus
+    exposure: Exposure | None
+
+
+def _fit_task(task: _LocusTask, options: _FitOptions) -> LocusFit:
+    if options.likelihood == "legacy":
+        return fit_locus(
+            task.models,
+            task.observed,
+            transform=options.transform,
+            inactive=task.inactive,
+            max_iterations=options.max_iterations,
+            min_unmasked_bins=options.min_unmasked_bins,
+            prior_status=task.prior,
+        )
+    return poisson.fit_locus(
+        task.models,
+        task.observed,
+        exposure=task.exposure,
+        penalty=options.penalty,
+        inactive=task.inactive,
+        max_iterations=options.max_iterations,
+        min_unmasked_bins=options.min_unmasked_bins,
+        prior_status=task.prior,
+    )
+
+
+def _fit_chunk(
+    tasks: list[_LocusTask], options: _FitOptions, blas_threads: int | None
+) -> list[LocusFit]:
+    """Worker entry point: fit a chunk of loci under the same BLAS limit."""
+    if blas_threads is None:
+        return [_fit_task(task, options) for task in tasks]
+    with threadpool_limits(limits=blas_threads, user_api="blas"):
+        return [_fit_task(task, options) for task in tasks]
+
+
+#: Chunks per worker. More than one lets fast workers take up the slack of
+#: slow ones (a few loci with thousands of bins and dozens of models dominate
+#: the cost); many more would spend the time pickling instead.
+_CHUNKS_PER_WORKER = 8
+
+
+def _run_tasks(
+    tasks: list[_LocusTask], options: _FitOptions, *, n_jobs: int, blas_threads: int | None
+) -> list[LocusFit]:
+    """Fit every task, in order, in this process or across `n_jobs` workers.
+
+    Each locus's data is sent to exactly one worker, once; the design is never
+    copied whole. Chunks are contiguous runs of tasks balanced by an estimate
+    of their cost (bins x models^2), and results come back in task order.
+    """
+    if n_jobs == 1 or len(tasks) < 2:
+        return [_fit_task(task, options) for task in tasks]
+    cost = np.array([t.models.shape[0] * max(t.models.shape[1], 1) ** 2 for t in tasks], float)
+    n_chunks = min(len(tasks), n_jobs * _CHUNKS_PER_WORKER)
+    edges = np.searchsorted(np.cumsum(cost), np.linspace(0, cost.sum(), n_chunks + 1)[1:-1])
+    bounds = [0, *sorted(set(int(e) + 1 for e in edges)), len(tasks)]
+    chunks = [tasks[a:b] for a, b in zip(bounds[:-1], bounds[1:], strict=True) if b > a]
+    with warnings.catch_warnings():
+        # Python 3.12+ warns before any fork in a process with more than one OS
+        # thread, and NumPy's OpenBLAS starts idle worker threads at import, so
+        # it would fire on every call. `_start_context` only forks when no
+        # other *Python* thread exists; the native pools left are OpenBLAS's,
+        # which reinitializes itself in the child via pthread_atfork, and the
+        # workers never call numba or figwig.
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*use of fork\(\) may lead to deadlocks",
+            category=DeprecationWarning,
+        )
+        with ProcessPoolExecutor(max_workers=n_jobs, mp_context=_start_context()) as pool:
+            parts = list(pool.map(_fit_chunk, chunks, repeat(options), repeat(blas_threads)))
+    return [fit for part in parts for fit in part]
+
+
+def _start_context() -> mp.context.BaseContext:
+    """How to start fitting workers.
+
+    `fork` when it is safe, because it is the only method that doesn't
+    re-import the caller's ``__main__``: with `forkserver` or `spawn`, a script
+    calling ``fit(n_jobs=4)`` without an ``if __name__ == "__main__":`` guard
+    crashes as soon as the pool starts. Forking while another thread is mid-work
+    can deadlock the child (Python 3.14 stopped defaulting to it for that
+    reason), so it is used only when every other Python thread is a
+    `concurrent.futures` pool worker. In practice those are figwig's: it keeps
+    a shared reader pool between reads, so any session that counted before
+    fitting still has it. Its workers are idle once `count` returns, the
+    fitting workers never call figwig, and figwig rebuilds its pool in a new
+    process (it is keyed by PID). Otherwise `forkserver` (or `spawn`), and the
+    caller needs the guard. The `dienr fit` command never loads figwig at all.
+    """
+    methods = mp.get_all_start_methods()
+    others = [t for t in threading.enumerate() if t is not threading.current_thread()]
+    if "fork" in methods and all(t.name.startswith("ThreadPoolExecutor-") for t in others):
+        return mp.get_context("fork")
+    return mp.get_context("forkserver" if "forkserver" in methods else "spawn")
 
 
 def _sample_exposure(

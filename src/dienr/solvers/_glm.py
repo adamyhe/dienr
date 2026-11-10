@@ -149,9 +149,18 @@ def moment_initialization(
     collapses to the background and the Poisson gradient is dominated by the
     ``y / mu`` term, so starting there wastes the first several iterations
     climbing away from a degenerate point.
+
+    That abundance is ``sum(y over the support) / sum(scale * M)``, the Poisson
+    MLE of a model fitted alone. The numerator counts each supported bin's
+    signal once, *not* weighted by ``M``: the weighted form ``M'y / M'scale``
+    agrees only for a 0/1 column, and for a column of scale ``s`` it starts
+    ``~s^2`` too high. On graded designs with large entries (an exact-density
+    column sums expected reads, ~10^2 per bin) that start put ``mu`` ~500x above
+    the data, and L-BFGS-B collapsed every abundance onto the zero bound -- 493
+    of 910 loci on one nascentRNASim seed (plan 18.10).
     """
     residual = np.maximum(observed - offset, 0.0)
-    numerator = models.T @ residual
+    numerator = (models > 0).T.astype(np.float64) @ residual
     denominator = models.T @ scale
     with np.errstate(divide="ignore", invalid="ignore"):
         start = np.where(denominator > 0, numerator / denominator, 0.0)
