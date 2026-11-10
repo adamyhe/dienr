@@ -97,4 +97,20 @@ same node**: node-to-node differences of 4x have been seen at every stage.
 ## Pull requests
 
 Keep a pull request to one purpose, describe what changed and how it was
-checked, and include the plan section it touches, if any.
+checked, and include the plan section it touches, if any. CI
+(`.github/workflows/ci.yml`) runs the four checks above on Python 3.11–3.14,
+on macOS, and with the `compat` extra, with `uv.lock` enforced (`UV_LOCKED`):
+run `uv lock` after changing dependencies. It also builds both distributions
+and smoke-tests the wheel in a clean environment.
+
+## Releasing
+
+1. Bump `version` in `pyproject.toml` and `CITATION.cff`.
+2. Optionally, run the *Publish* workflow by hand to upload to TestPyPI.
+3. Publish a GitHub release tagged `v<version>`. `.github/workflows/publish.yml`
+   checks the tag against the package version, builds, and uploads to PyPI by
+   trusted publishing; there is no API token.
+
+One-time setup: register this repository as a trusted publisher on pypi.org and
+test.pypi.org (workflow `publish.yml`, environments `pypi` and `testpypi`) and
+create both environments under Settings → Environments.

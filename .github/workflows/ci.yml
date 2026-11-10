@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Fail rather than silently re-resolve when uv.lock is out of date.
+  UV_LOCKED: "1"
+
+jobs:
+  lint:
+    name: Lint and types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+      - run: uv sync --group dev
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy
+
+  test:
+    name: Tests (${{ matrix.os }}, Python ${{ matrix.python }}${{ matrix.extra && format(', {0}', matrix.extra) || '' }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.11", "3.12", "3.13", "3.14"]
+        extra: [""]
+        include:
+          - os: macos-latest
+            python: "3.13"
+            extra: ""
+          # Polars' compatibility runtime (pre-AVX2 CPUs); polars prefers it once installed.
+          - os: ubuntu-latest
+            python: "3.13"
+            extra: compat
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - run: uv sync --group dev ${{ matrix.extra && format('--extra {0}', matrix.extra) || '' }}
+      - name: Report runtime versions
+        run: uv run python -c "import sys, numpy, scipy, polars; print(sys.version); print('numpy', numpy.__version__, 'scipy', scipy.__version__, 'polars', polars.__version__)"
+      # _reference/ is absent here, so tests that need the R package's
+      # extdata skip; the committed parity goldens still run.
+      - run: uv run pytest -q
+
+  build:
+    name: Build and smoke-test the distributions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+      - run: uv build
+      - name: Install the wheel into a clean environment
+        run: |
+          uv venv --no-project /tmp/smoke
+          uv pip install --python /tmp/smoke/bin/python dist/*.whl
+          /tmp/smoke/bin/dienr --help
+          /tmp/smoke/bin/python -c "import dienr; print(dienr.__name__)"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7
