@@ -21,14 +21,16 @@ import numpy as np
 import polars as pl
 
 from . import __version__
-from .annotation import read_annotation
-from .counts import VALUE_KINDS, SignalFile, count_sample
+from .annotation import Annotation, read_annotation
+from .contigs import ContigMap, check_contigs, rename_contigs
+from .counts import VALUE_KINDS, SignalFile, count_sample, declared_contigs
 from .design import Design, build_design
 from .pipeline import fit, status_report
 from .results import FitResult
 from .shape import ShapeConfig, ShapeProfile, applied_dynamic_range, apply_shape_profile
 from .shape import fit_shape_profile as _fit_shape_profile
 from .solvers.penalties import Penalty
+from .strand import check_strand_orientation
 
 #: Filename for a serialized `Design` inside a design directory.
 DESIGN_FILENAME = "design.pkl"
@@ -102,6 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
         "build-design", help="build reusable locus geometry from an annotation"
     )
     design.add_argument("--gtf", required=True, type=Path, help="GTF/GFF annotation")
+    _add_contig_map_argument(design)
     design.add_argument("--output", required=True, type=Path, help="output directory")
     design.add_argument(
         "--shape-profile",
@@ -139,6 +142,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=8,
         help="threads for reading and binning each BigWig (default 8). Samples "
         "are counted one after another; this parallelizes within a sample.",
+    )
+    count.add_argument(
+        "--allow-contig-mismatch",
+        action="store_true",
+        help=(
+            "count even if no locus's contig is in the BigWigs (every locus is then "
+            "missing_contig). By default that is refused, since it almost always means "
+            "the annotation and BigWigs use different naming; see --contig-map"
+        ),
+    )
+    count.add_argument(
+        "--allow-strand-mismatch",
+        action="store_true",
+        help=(
+            "count even if the plus/minus files look swapped. By default each sample's "
+            "gene-body signal is checked for being mostly in the declared-sense file, "
+            "and a sample that fails is refused"
+        ),
     )
 
     fit_parser = subparsers.add_parser("fit", help="estimate abundances")
@@ -207,6 +228,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="fit an empirical relative-density profile from isolated genes",
     )
     shape.add_argument("--gtf", required=True, type=Path, help="GTF/GFF annotation")
+    _add_contig_map_argument(shape)
     shape.add_argument("--bigwig-plus", required=True, type=Path)
     shape.add_argument(
         "--bigwig-minus",
@@ -293,6 +315,32 @@ def _load_design(directory: Path) -> Design:
         return pickle.load(handle)
 
 
+def _add_contig_map_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--contig-map",
+        default=None,
+        metavar="FILE|PRESET",
+        help=(
+            "rename annotation contigs to match the BigWigs: a two-column "
+            "old<TAB>new file, or a preset (ensembl-to-ucsc, ucsc-to-ensembl; "
+            "primary chromosomes only). Recorded in the design and results"
+        ),
+    )
+
+
+def _read_annotation(args: argparse.Namespace) -> Annotation:
+    annotation = read_annotation(args.gtf)
+    if args.contig_map is None:
+        return annotation
+    try:
+        contig_map = ContigMap.load(args.contig_map)
+        annotation, report = rename_contigs(annotation, contig_map)
+    except ValueError as error:
+        raise SystemExit(f"error: {error}") from error
+    print(f"contig map {contig_map.source} ({contig_map.digest}): {report.message()}")
+    return annotation
+
+
 def _load_shape_profile(directory: Path) -> ShapeProfile:
     path = directory / SHAPE_FILENAME
     if not path.exists():
@@ -303,7 +351,7 @@ def _load_shape_profile(directory: Path) -> ShapeProfile:
 
 
 def cmd_shape_profile(args: argparse.Namespace) -> int:
-    annotation = read_annotation(args.gtf)
+    annotation = _read_annotation(args)
     config = ShapeConfig(
         bin_size=args.bin_size,
         head_bases=args.head_bases,
@@ -361,7 +409,7 @@ def cmd_shape_profile(args: argparse.Namespace) -> int:
 
 
 def cmd_build_design(args: argparse.Namespace) -> int:
-    annotation = read_annotation(args.gtf)
+    annotation = _read_annotation(args)
     design = build_design(
         annotation,
         bin_size=args.bin_size,
@@ -452,16 +500,46 @@ def cmd_count(args: argparse.Namespace) -> int:
             SignalFile(row["bigwig_plus"], "+", value_kind=kind),  # type: ignore[arg-type]
             SignalFile(row["bigwig_minus"], "-", value_kind=kind),  # type: ignore[arg-type]
         )
-        collected.append(
-            count_sample(
-                design,
-                row["sample_id"],
-                signal,
-                summary=args.summary,
-                exposure=float(row.get("exposure") or 1.0),
-                n_jobs=args.threads,
-            )
+        contigs = check_contigs(
+            design.loci["contig"].to_list(),
+            set().union(*(declared_contigs(f.path) for f in signal)),
         )
+        if contigs.none_match and not args.allow_contig_mismatch:
+            raise SystemExit(
+                f"error: sample {row['sample_id']!r}: {contigs.message()}. "
+                "Pass --allow-contig-mismatch to count anyway."
+            )
+        if contigs.missing:
+            print(
+                f"warning: sample {row['sample_id']!r}: {contigs.message()}; those loci "
+                "will be reported as missing_contig",
+                file=sys.stderr,
+            )
+        check = check_strand_orientation(design, signal, n_jobs=args.threads)
+        print(f"{row['sample_id']}: {check.message()}")
+        if check.verdict == "swapped" and not args.allow_strand_mismatch:
+            raise SystemExit(
+                f"error: sample {row['sample_id']!r}: most gene-body signal is in the "
+                "opposite-strand file, so bigwig_plus and bigwig_minus look swapped. "
+                "Single-end PRO-seq reads are the reverse complement of the RNA; check how "
+                "the BigWigs were made. Pass --allow-strand-mismatch to count anyway."
+            )
+        if check.verdict in ("low", "swapped", "insufficient"):
+            print(
+                f"warning: sample {row['sample_id']!r}: strand orientation is "
+                f"{check.verdict}; check the plus/minus assignment",
+                file=sys.stderr,
+            )
+        counts = count_sample(
+            design,
+            row["sample_id"],
+            signal,
+            summary=args.summary,
+            exposure=float(row.get("exposure") or 1.0),
+            n_jobs=args.threads,
+        )
+        counts.provenance.update(check.describe())
+        collected.append(counts)
 
     args.output.mkdir(parents=True, exist_ok=True)
     with (args.output / COUNTS_FILENAME).open("wb") as handle:

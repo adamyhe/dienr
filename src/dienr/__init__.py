@@ -32,6 +32,7 @@ single conversion point.
 """
 
 from .annotation import Annotation, read_annotation
+from .contigs import ContigMap, check_contigs, rename_contigs
 from .counts import (
     SampleCounts,
     SignalFile,
@@ -58,6 +59,7 @@ from .solvers._glm import Exposure
 from .solvers.legacy import LocusFit, fit_locus
 from .solvers.penalties import NO_PENALTY, Penalty
 from .status import FitStatus, is_failure
+from .strand import StrandCheck, check_strand_orientation
 
 __version__ = "0.1.0.dev0"
 
@@ -76,6 +78,10 @@ __all__ = [
     "RunSummary",
     "SampleCounts",
     "SignalFile",
+    "StrandCheck",
+    "ContigMap",
+    "check_contigs",
+    "rename_contigs",
     "ShapeConfig",
     "ShapeProfile",
     "__version__",
@@ -84,6 +90,7 @@ __all__ = [
     "assess",
     "assign_loci",
     "build_design",
+    "check_strand_orientation",
     "collect_results",
     "count_sample",
     "declared_contigs",

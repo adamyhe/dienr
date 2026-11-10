@@ -61,11 +61,15 @@ class Annotation:
         digest: Content-derived identifier. Any change to the transcript table
             produces a new digest, which in turn invalidates a `Design`.
         source: Provenance string, normally the input path.
+        contig_map: The ``(old, new)`` contig renaming applied by
+            `dienr.contigs.rename_contigs`, if any, so it can be recorded
+            downstream. Renamed contigs are already in `transcripts`.
     """
 
     transcripts: pl.DataFrame
     digest: str
     source: str
+    contig_map: tuple[tuple[str, str], ...] | None = None
 
     def __post_init__(self) -> None:
         got = self.transcripts.schema
@@ -141,7 +145,9 @@ def read_annotation(
             comment_prefix="#",
             has_header=False,
             new_columns=_GXF_COLUMNS,
-            schema_overrides={"start": pl.Int64, "end": pl.Int64},
+            # Contig must be a string: Ensembl names ("1", "2", ...) would
+            # otherwise be inferred as integers and fail at "X".
+            schema_overrides={"contig": pl.String, "start": pl.Int64, "end": pl.Int64},
             truncate_ragged_lines=False,
         )
         .filter(pl.col("feature").is_in(span_features))

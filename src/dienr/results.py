@@ -407,6 +407,8 @@ def collect_results(
         "schema_version": SCHEMA_VERSION,
         "annotation_digest": design.annotation_digest,
         "design_digest": design.digest,
+        # getattr: designs pickled before these fields existed lack them.
+        "contig_map": dict(getattr(design, "contig_map", None) or ()) or None,
         "bin_size": design.config.bin_size,
         "distance": design.config.effective_distance,
         "mask_start_bins": list(design.config.mask_start_bins),
