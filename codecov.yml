@@ -1,0 +1,12 @@
+# Coverage is reported, not enforced: a drop never fails a PR.
+coverage:
+  status:
+    project:
+      default:
+        informational: true
+    patch:
+      default:
+        informational: true
+comment:
+  layout: "diff, files"
+  require_changes: true

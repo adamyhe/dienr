@@ -99,7 +99,8 @@ same node**: node-to-node differences of 4x have been seen at every stage.
 Keep a pull request to one purpose, describe what changed and how it was
 checked, and include the plan section it touches, if any. CI
 (`.github/workflows/ci.yml`) runs the four checks above on Python 3.11–3.14,
-on macOS, and with the `compat` extra, with `uv.lock` enforced (`UV_LOCKED`):
+on macOS, and with the `compat` extra (coverage goes to Codecov from one
+job; it is reported, never enforced — `codecov.yml`), with `uv.lock` enforced (`UV_LOCKED`):
 run `uv lock` after changing dependencies. It also builds both distributions
 and smoke-tests the wheel in a clean environment.
 

@@ -59,6 +59,14 @@ packages = ["src/dienr"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
+[tool.coverage.run]
+source = ["dienr"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
 [tool.ruff]
 line-length = 100
 src = ["src", "tests"]
