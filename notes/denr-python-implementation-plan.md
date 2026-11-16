@@ -1810,6 +1810,8 @@ forgets a correction, is the shape of the defect.
 
 ### 18.8 Is a shape profile worth applying? Mostly not
 
+*Caveat (18.28): every shape profile here was fitted with training genes not isolated from short neighbours; not re-run since the fix.*
+
 `scripts/validate_shape_usefulness.py`, five 1500-locus simulations, scored on
 multi-model loci only (the profile is pure loss where there is nothing to
 apportion), paired at the same locus and likelihood, calibrated within the
@@ -2184,6 +2186,8 @@ order of value:
    an isoform's own (6% of loci); only after (1), since real tails vary more.
 
 ### 18.14 Real data: the run-on tail predicts held-out K562 signal better
+
+*Caveat (18.28): every shape profile here was fitted with training genes not isolated from short neighbours; not re-run since the fix.*
 
 `scripts/k562_runon_check.py`. GEO `GSE96869` (Dukler et al. 2017 -- the data
 nascentRNASim's archetypes come from), K562 0 min, two replicates, `primary`
@@ -2770,6 +2774,33 @@ Improvement work stops here. What remains in scope is replicating DENR well:
 correctness, bug fixes, input checks, speed, packaging. Open items that would
 reopen method work -- TSS evidence from PINTS/dREG calls, a second cell line
 for the long-read comparison -- are deferred, not planned.
+
+### 18.28 Correctness audit: which recorded results the fixes touch
+
+November 2026, after 14.6. Three reviewers audited the package by area, each
+required to reproduce a finding before reporting it; every finding below was
+reproduced again before fixing, and each fix has a test that fails on the old
+code. Commits are on the `parallel-serial-tail` branch. **None was re-run
+against K562 or nascentRNASim** -- this records which conclusions rest on
+affected code, not new numbers.
+
+| bug | touches recorded results? |
+|---|---|
+| Training genes not isolated from neighbours shorter than `min_length` (`shape._select_training_genes`) | **Yes -- every fitted shape profile** (18.6-18.8, 18.13, 18.14) |
+| Window past a contig end binned at the wrong width (`count_sample`) | **Slightly** -- loci near contig ends; with an extended tail (18.26) the last plus-strand locus on each contig |
+| Run-on extension left unmasked; tail at a class representative's PAS | Only tail arms *with a PAS mask*; tailed designs without one are bit-identical to before, which covers 18.26's abundance runs. 18.20's `runon_4_4` predates the extension |
+| Quasi-Poisson dispersion ignored exposure, and pinned models | No: every run used unit exposure and no `inactive` |
+| Poisson multi-model fits broke at large exposure | No: unit exposure |
+| Shape profile applied in the profile's bin size | No: bin sizes always matched |
+| Unestimable models given a value; `locus_qc` fitted totals; `penalty_value`; `gradient_norm` with pins; status columns; manifest; `dienr count` exposure and contig check; min/max on signed files | No: output, QC or CLI paths no analysis read |
+
+So the **shape-profile verdicts (18.8 "mostly not worth applying"; 18.14 "+16%
+worse on real data") were measured with contaminated training sets.** The
+direction of a correction is unknown: cleaner genes could sharpen the profile
+or merely change which genes enter it. They stand as recorded but should be
+re-run under the fixed selection before being cited as settled. Nothing else
+in 17 or 18 depends on the affected paths, and 18.27's scope decision does not
+rest on any number that moves.
 
 ## 19. Definition of done for version 1.0
 
