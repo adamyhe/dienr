@@ -1198,3 +1198,33 @@ def test_shape_head_covers_head_bases_whatever_the_two_bin_sizes(profile_bin, de
     reshaped = apply_shape_profile(build_design(annotation, bin_size=design_bin), profile)
     head_bins = int((reshaped.models[0][:, 0] > 2).sum())
     assert head_bins * design_bin == 10_000
+
+
+@pytest.mark.parametrize(
+    ("neighbour", "accepted"),
+    [
+        ({"gene_id": "other", "start": 110_000, "end": 115_000}, False),  # nested gene
+        ({"gene_id": "other", "start": 125_000, "end": 139_000}, False),  # overlaps the end
+        ({"gene_id": "long", "start": 100_000, "end": 105_000}, True),  # its own isoform
+        ({"gene_id": "other", "start": 140_000, "end": 145_000}, True),  # separate locus
+    ],
+)
+def test_training_genes_are_isolated_from_short_neighbours(neighbour, accepted):
+    """Neighbours shorter than `min_length` must still count against isolation.
+
+    They were dropped before loci were formed, so a 30 kb gene with a nested
+    5 kb gene and a 14 kb partly overlapping one was accepted as isolated.
+    """
+    from dienr.annotation import Annotation
+
+    frame = pl.DataFrame(
+        [
+            {"transcript_id": "long_tx", "gene_id": "long", "contig": "c",
+             "start": 100_000, "end": 130_000, "strand": "+"},
+            {"transcript_id": "neighbour_tx", "contig": "c", "strand": "+", **neighbour},
+        ]
+    )  # fmt: skip
+    config = ShapeConfig(head_bases=10_000, tail_bases=5_000)
+    selected, rejected = _select_training_genes(Annotation.from_frame(frame), config)
+    assert ("long_tx" in selected["transcript_id"].to_list()) is accepted
+    assert sum(rejected.values()) + len(selected) == len(frame)

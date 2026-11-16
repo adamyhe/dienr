@@ -627,6 +627,9 @@ def _index_by_strand(
     return by_strand
 
 
+_TRAINING_COLUMNS = ["transcript_id", "contig", "start", "end", "strand"]
+
+
 def _select_training_genes(
     annotation: Annotation,
     config: ShapeConfig,
@@ -637,37 +640,48 @@ def _select_training_genes(
     """
     transcripts = annotation.transcripts
     rejected: dict[str, int] = {}
+    is_long = (pl.col("end") - pl.col("start")) >= config.effective_min_length
+    rejected["too_short"] = int(transcripts.select(is_long.not_().sum()).item())
+    if rejected["too_short"] == len(transcripts):
+        return transcripts.head(0).select(_TRAINING_COLUMNS), rejected
 
-    long_enough = transcripts.filter(
-        (pl.col("end") - pl.col("start")) >= config.effective_min_length
-    )
-    rejected["too_short"] = len(transcripts) - len(long_enough)
-    if not len(long_enough):
-        return long_enough, rejected
-
-    # Group at zero distance: any two transcripts that touch share a locus, so
-    # a gene whose locus it does not nearly fill has a neighbour whose signal
-    # would contaminate it.
-    grouped = assign_loci(long_enough, distance=0)
+    # Group *every* transcript at zero distance: any two that touch share a
+    # locus, so a gene whose locus it does not nearly fill has a neighbour
+    # whose signal would contaminate it. Short transcripts must take part --
+    # filtering by length first let a 30 kb gene through with a nested 5 kb
+    # gene and a 14 kb partly overlapping one, neither of which entered a locus.
+    grouped = assign_loci(transcripts, distance=0)
+    if "gene_id" not in grouped.columns:
+        grouped = grouped.with_columns(gene_id=pl.lit(None, dtype=pl.String))
     with_width = grouped.with_columns(_width=pl.col("end") - pl.col("start"))
     # The longest transcript of each locus, ties broken by id for determinism.
     longest = (
         with_width.sort(["locus_id", "_width", "transcript_id"], descending=[False, True, False])
         .group_by("locus_id", maintain_order=True)
         .first()
+        .filter(is_long)
     )
-    rejected["not_longest_in_locus"] = len(with_width) - len(longest)
+    rejected["not_longest_in_locus"] = int(with_width.select(is_long.sum()).item()) - len(longest)
 
     locus_extent = grouped.group_by("locus_id").agg(
-        _locus_start=pl.col("start").min(), _locus_end=pl.col("end").max()
+        _locus_start=pl.col("start").min(),
+        _locus_end=pl.col("end").max(),
+        _genes=pl.col("gene_id").drop_nulls().unique(),
     )
     joined = longest.join(locus_extent, on="locus_id", how="left").with_columns(
-        _fraction=pl.col("_width") / (pl.col("_locus_end") - pl.col("_locus_start"))
+        _fraction=pl.col("_width") / (pl.col("_locus_end") - pl.col("_locus_start")),
+        # Another gene in the locus contaminates it even when nested inside, where
+        # the extent can't show it. Isoforms of the gene itself are allowed, and
+        # without gene identifiers only the extent can be judged.
+        _other_gene=pl.col("_genes").list.set_difference(pl.concat_list("gene_id")).list.len()
+        > 0,
     )
-    isolated = joined.filter(pl.col("_fraction") >= config.min_locus_fraction)
+    isolated = joined.filter(
+        (pl.col("_fraction") >= config.min_locus_fraction) & ~pl.col("_other_gene")
+    )
     rejected["overlapping_neighbour"] = len(joined) - len(isolated)
 
-    return isolated.select("transcript_id", "contig", "start", "end", "strand"), rejected
+    return isolated.select(_TRAINING_COLUMNS), rejected
 
 
 def _local_linear(
