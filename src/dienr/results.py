@@ -359,10 +359,20 @@ def collect_results(
                 rss = float("nan")
                 total_observed = float("nan")
             else:
-                # NaN marks a model with no unmasked bins: its column is zero.
+                # A count-likelihood fit reports its own, on the exposure it
+                # was fitted under; otherwise the mean is plain ``M a``. NaN
+                # marks a model with no unmasked bins: its column is zero.
                 estimate = np.nan_to_num(fit.abundance, nan=0.0)
-                total_fitted = float((models @ estimate).sum())
-                rss = residual_sum_of_squares(models, estimate, observed)
+                total_fitted = (
+                    fit.fitted_total
+                    if fit.fitted_total is not None
+                    else float((models @ estimate).sum())
+                )
+                rss = (
+                    fit.residual_sum_of_squares
+                    if fit.residual_sum_of_squares is not None
+                    else residual_sum_of_squares(models, estimate, observed)
+                )
                 # Signal in the bins the fit actually used. Masked bins are
                 # already zeroed in `observed`, so this is not locus coverage;
                 # `total_observed_all_bins` alongside it is.

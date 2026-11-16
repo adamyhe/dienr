@@ -23,6 +23,8 @@ term and no pseudocount is introduced anywhere.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 from scipy.special import xlogy
 
@@ -248,6 +250,47 @@ def fit_locus(
     Returns:
         A `LocusFit`. Failures carry NaN abundance and a reason, never zeros.
     """
+    fit = _fit_locus(
+        models,
+        observed,
+        exposure=exposure,
+        penalty=penalty,
+        inactive=inactive,
+        initial=initial,
+        max_iterations=max_iterations,
+        min_unmasked_bins=min_unmasked_bins,
+        prior_status=prior_status,
+    )
+    if is_failure(fit.status) or fit.fitted_total is not None:
+        return fit
+    # Report the fitted signal on the scale of the counts. `collect_results`
+    # used to compute it as ``M a``, which ignores the exposure: 1/c of the
+    # observed total at sample scale c, 1/250 with 250 bp bin exposure.
+    exposure = exposure or Exposure()
+    n_bins = models.shape[0]
+    estimate = np.nan_to_num(fit.abundance, nan=0.0)
+    fitted = exposure.scale(n_bins) * (models @ estimate) + exposure.offset(n_bins)
+    residual = observed - fitted
+    return replace(
+        fit,
+        fitted_total=float(fitted.sum()),
+        residual_sum_of_squares=float(residual @ residual),
+    )
+
+
+def _fit_locus(
+    models: np.ndarray,
+    observed: np.ndarray,
+    *,
+    exposure: Exposure | None = None,
+    penalty: Penalty = NO_PENALTY,
+    inactive: np.ndarray | None = None,
+    initial: np.ndarray | None = None,
+    max_iterations: int = 15_000,
+    min_unmasked_bins: int = 1,
+    prior_status: FitStatus | None = None,
+) -> LocusFit:
+    """`fit_locus` without the fitted-signal summary."""
     exposure = exposure or Exposure()
     n_bins, n_models = models.shape
 

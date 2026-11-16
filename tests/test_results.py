@@ -858,3 +858,22 @@ def test_model_with_no_unmasked_bins_is_nan_and_spares_the_others(likelihood):
             estimated["abundance_standard_error"], reference["abundance_standard_error"], rtol=1e-9
         )
         assert estimated["abundance_standard_error"].is_not_nan().all()
+
+
+@pytest.mark.parametrize("likelihood", ["poisson", "quasi_poisson"])
+def test_fitted_signal_in_qc_is_on_the_scale_of_the_counts(design, likelihood):
+    """`total_fitted` and the RSS must use the mean the fit used, ``c e M a``.
+
+    They were computed as ``M a``: 1/c of the observed total at sample scale c.
+    At a power-of-two exposure the fit is exactly the unit fit rescaled, so the
+    fitted signal must be identical to the unit-exposure run's.
+    """
+    rng = np.random.default_rng(2)
+    values = [rng.poisson(m @ np.full(m.shape[1], 40.0)).astype(np.float64) for m in design.models]
+    base = replace(synthetic_counts(design), values=values, provenance={"summary": "sum"})
+    unit = fit(design, base, likelihood=likelihood).locus_qc
+    scaled = fit(design, replace(base, exposure=8.0), likelihood=likelihood).locus_qc
+    for column in ("total_fitted", "residual_sum_of_squares"):
+        np.testing.assert_array_equal(scaled[column], unit[column])
+    ratio = (unit["total_fitted"] / unit["total_observed"]).to_numpy()
+    np.testing.assert_allclose(ratio, 1.0, rtol=0.05)

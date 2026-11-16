@@ -64,6 +64,11 @@ class LocusFit:
             so any error derived from it would be inventing one. NaN entries
             mean the error is undefined for that model -- see
             `dienr.solvers.inference.standard_errors`.
+        fitted_total: Sum of the fitted mean over the locus's bins, set by a
+            solver whose mean is not plain ``M a`` (Poisson: ``c e M a + b``).
+            None means ``M a``, which `dienr.results.collect_results` computes.
+        residual_sum_of_squares: ``sum (y - mu)^2`` against that same mean;
+            None under the same convention.
     """
 
     abundance: np.ndarray
@@ -75,6 +80,8 @@ class LocusFit:
     message: str
     failure_reason: str | None = None
     standard_error: np.ndarray | None = None
+    fitted_total: float | None = None
+    residual_sum_of_squares: float | None = None
 
 
 def predict(models: np.ndarray, abundance: np.ndarray) -> np.ndarray:
@@ -432,8 +439,7 @@ def fit_supported_models(
         abundance=abundance,
         standard_error=errors,
         message=(
-            f"{reduced.message}; {n_dropped} model(s) with no unmasked bins "
-            "not estimated (NaN)"
+            f"{reduced.message}; {n_dropped} model(s) with no unmasked bins not estimated (NaN)"
         ),
     )
 
