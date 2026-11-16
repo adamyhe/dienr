@@ -359,8 +359,10 @@ def collect_results(
                 rss = float("nan")
                 total_observed = float("nan")
             else:
-                total_fitted = float((models @ fit.abundance).sum())
-                rss = residual_sum_of_squares(models, fit.abundance, observed)
+                # NaN marks a model with no unmasked bins: its column is zero.
+                estimate = np.nan_to_num(fit.abundance, nan=0.0)
+                total_fitted = float((models @ estimate).sum())
+                rss = residual_sum_of_squares(models, estimate, observed)
                 # Signal in the bins the fit actually used. Masked bins are
                 # already zeroed in `observed`, so this is not locus coverage;
                 # `total_observed_all_bins` alongside it is.
@@ -413,7 +415,9 @@ def collect_results(
                         "abundance_normalized": None,
                         "normalization_method": None,
                         "equivalence_class_size": class_sizes[key],
-                        "solver_status": str(fit.status),
+                        # The same qualified status as the locus's QC row:
+                        # the raw one said `ok` where QC said `rank_deficient`.
+                        "solver_status": _qualified_status(fit.status, locus_conditioning),
                         "objective": fit.objective,
                         "penalty_value": 0.0,
                         "iterations": fit.iterations,

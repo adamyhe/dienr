@@ -811,3 +811,50 @@ def test_pinned_models_do_not_inflate_the_pooled_dispersion(design):
     for result in (free, pinned):
         noise = result.provenance["dispersion_standard_error"]
         assert abs(result.provenance["dispersion"] - 1.0) < 4 * noise
+
+
+@pytest.mark.parametrize("likelihood", ["legacy", "poisson", "quasi_poisson"])
+def test_model_with_no_unmasked_bins_is_nan_and_spares_the_others(likelihood):
+    """A transcript entirely inside masked bins has no estimate, not a made-up one.
+
+    It used to come back as Poisson's start (2.8e-5) or legacy's 0.0 with status
+    ``ok``, and as an interior parameter it made the information matrix
+    singular, so the identifiable models lost their standard errors.
+    """
+    frame = pl.DataFrame(
+        {
+            "transcript_id": ["a", "b", "masked"],
+            "gene_id": ["g", "g", "g"],
+            "contig": ["chr1", "chr1", "chr1"],
+            "start": [0, 0, 0],
+            "end": [5000, 8000, 250],
+            "strand": ["+", "+", "+"],
+        }
+    )
+    with_masked = build_design(Annotation.from_frame(frame), bin_size=250, mask_start_bins=(1, 1))
+    without = build_design(
+        Annotation.from_frame(frame.head(2)), bin_size=250, mask_start_bins=(1, 1)
+    )
+    assert with_masked.unsupported_models.height == 1
+    rng = np.random.default_rng(1)
+    observed = rng.poisson(without.models[0] @ np.array([20.0, 15.0])).astype(np.float64)
+
+    def run(design):
+        counts = replace(synthetic_counts(design), values=[observed], provenance={"summary": "sum"})
+        return fit(design, counts, likelihood=likelihood).model_abundance.sort("model_index")
+
+    full, reference = run(with_masked), run(without)
+    masked_row = full.join(
+        with_masked.model_table.filter(~pl.col("has_support")).select("model_index"),
+        on="model_index",
+    )
+    assert masked_row["abundance_raw"].is_nan().all()
+    estimated = full.filter(pl.col("abundance_raw").is_not_nan())
+    # Same fit up to BLAS summation order (the reduced matrix is a fresh copy).
+    np.testing.assert_allclose(estimated["abundance_raw"], reference["abundance_raw"], rtol=1e-12)
+    assert (estimated["solver_status"] == "ok").all()
+    if likelihood != "legacy":
+        np.testing.assert_allclose(
+            estimated["abundance_standard_error"], reference["abundance_standard_error"], rtol=1e-9
+        )
+        assert estimated["abundance_standard_error"].is_not_nan().all()

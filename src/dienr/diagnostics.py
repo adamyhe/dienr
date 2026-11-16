@@ -25,7 +25,9 @@ class LocusConditioning:
         condition_number: Ratio of largest to smallest singular value, or
             infinity when the smallest is zero.
         smallest_singular_value: Smallest singular value.
-        rank_deficient: True when `matrix_rank` is below `n_models`.
+        rank_deficient: True when `matrix_rank` is below the number of models
+            occupying any unmasked bin. A model with none is not estimated at
+            all (NaN), so it doesn't make the others unidentifiable.
         ill_conditioned: True when `condition_number` exceeds the threshold.
     """
 
@@ -59,6 +61,13 @@ def assess(
     """
     n_bins, n_models = models.shape
     usable = models if mask is None else models[~mask, :]
+    # A model with no unmasked bins is reported unestimated (NaN) by the
+    # solvers, so it says nothing about whether the *estimated* models are
+    # identifiable; judge rank and conditioning on the others.
+    supported = usable.any(axis=0)
+    if supported.any() and not supported.all():
+        usable = usable[:, supported]
+    n_estimated = int(usable.shape[1])
 
     if usable.size == 0 or n_models == 0:
         return LocusConditioning(
@@ -87,7 +96,7 @@ def assess(
         matrix_rank=rank,
         condition_number=condition,
         smallest_singular_value=smallest,
-        rank_deficient=rank < n_models,
+        rank_deficient=rank < n_estimated,
         ill_conditioned=condition > condition_threshold,
     )
 

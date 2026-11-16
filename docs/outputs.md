@@ -12,7 +12,7 @@ back to its inputs. Read it back with `dienr.FitResult.read(directory)`.
 | `sample_id` | str | |
 | `locus_id`, `model_index` | u32 | the model's position in the design |
 | `model_id` | str | stable model identifier |
-| `abundance_raw` | f64 | the estimate; `NaN` for any failed fit |
+| `abundance_raw` | f64 | the estimate; `NaN` for any failed fit, and for a model with no unmasked bin (`has_support` false in the transcript map), which no data can estimate |
 | `abundance_standard_error` | f64 | `quasi_poisson`/`poisson` only; `NaN` where a Wald error is undefined; null for `legacy` |
 | `abundance_normalized`, `normalization_method` | f64, str | filled only by an explicit normalization step |
 | `equivalence_class_size` | u32 | transcripts sharing this model |

@@ -36,7 +36,13 @@ from ._glm import (
     usable_bins,
 )
 from ._lbfgsb import minimize_bounded
-from .legacy import _FREE_UPPER, _INACTIVE_UPPER, LocusFit, _short_circuit
+from .legacy import (
+    _FREE_UPPER,
+    _INACTIVE_UPPER,
+    LocusFit,
+    _short_circuit,
+    fit_supported_models,
+)
 from .penalties import NO_PENALTY, Penalty
 
 #: Threshold for declaring the fitted mean collapsed. An order of magnitude
@@ -249,6 +255,20 @@ def fit_locus(
         return _short_circuit(n_models, prior_status)
     if n_models == 0:
         return _short_circuit(0, FitStatus.INSUFFICIENT_BINS, "locus has no models")
+    unsupported = ~models.any(axis=0)
+    if unsupported.any() and not unsupported.all():
+        return fit_supported_models(
+            fit_locus,
+            models,
+            observed,
+            unsupported,
+            inactive=inactive,
+            initial=initial,
+            exposure=exposure,
+            penalty=penalty,
+            max_iterations=max_iterations,
+            min_unmasked_bins=min_unmasked_bins,
+        )
     if not np.all(np.isfinite(observed)):
         return _short_circuit(
             n_models, FitStatus.NUMERICAL_ERROR, "observed signal contains non-finite values"

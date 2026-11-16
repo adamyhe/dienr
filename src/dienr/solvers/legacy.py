@@ -20,8 +20,8 @@ what allows a numerical failure to be mistaken for a biological zero.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Literal
+from dataclasses import dataclass, replace
+from typing import Any, Literal
 
 import numpy as np
 from scipy import optimize
@@ -278,6 +278,21 @@ def fit_locus(
     if n_models == 0:
         return _short_circuit(0, FitStatus.INSUFFICIENT_BINS, "locus has no models")
 
+    unsupported = ~models.any(axis=0)
+    if unsupported.any() and not unsupported.all():
+        return fit_supported_models(
+            fit_locus,
+            models,
+            observed,
+            unsupported,
+            inactive=inactive,
+            initial=initial,
+            transform=transform,
+            max_iterations=max_iterations,
+            min_unmasked_bins=min_unmasked_bins,
+            log_offset=log_offset,
+        )
+
     if not np.all(np.isfinite(observed)):
         return _short_circuit(
             n_models, FitStatus.NUMERICAL_ERROR, "observed signal contains non-finite values"
@@ -370,6 +385,56 @@ def fit_locus(
         converged=converged,
         message=message,
         failure_reason=None if converged else message,
+    )
+
+
+def fit_supported_models(
+    fit: Callable[..., LocusFit],
+    models: np.ndarray,
+    observed: np.ndarray,
+    unsupported: np.ndarray,
+    *,
+    inactive: np.ndarray | None,
+    initial: np.ndarray | None,
+    **options: Any,
+) -> LocusFit:
+    """Fit only the models that occupy an unmasked bin; NaN for the rest.
+
+    A model whose every bin is masked (or rounded away) has an all-zero
+    column: any abundance fits it equally well. Fitted alongside the others it
+    came back as the optimizer's start (Poisson) or zero (legacy) with status
+    ``ok``, and as an interior parameter it made the information matrix
+    singular, so every other model at the locus lost its standard error.
+    Dropping a zero column changes no objective, so the others' fit is the
+    one they would get anyway. `Design.unsupported_models` lists these.
+    """
+    n_models = models.shape[1]
+    keep = ~unsupported
+    for name, array in (("inactive", inactive), ("initial", initial)):
+        if array is not None and np.shape(array) != (n_models,):
+            raise ValueError(f"{name} must have shape ({n_models},), got {np.shape(array)}")
+    reduced = fit(
+        models[:, keep],
+        observed,
+        inactive=None if inactive is None else np.asarray(inactive, dtype=bool)[keep],
+        initial=None if initial is None else np.asarray(initial, dtype=np.float64)[keep],
+        **options,
+    )
+    abundance = np.full(n_models, np.nan)
+    abundance[keep] = reduced.abundance
+    errors = None
+    if reduced.standard_error is not None:
+        errors = np.full(n_models, np.nan)
+        errors[keep] = reduced.standard_error
+    n_dropped = int(unsupported.sum())
+    return replace(
+        reduced,
+        abundance=abundance,
+        standard_error=errors,
+        message=(
+            f"{reduced.message}; {n_dropped} model(s) with no unmasked bins "
+            "not estimated (NaN)"
+        ),
     )
 
 

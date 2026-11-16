@@ -170,6 +170,8 @@ def dispersion_term(
     usable = usable_bins(models, exposure, pinned)
     if not usable.any():
         return None
+    # NaN marks a model with no unmasked bins; its column is zero.
+    abundance = np.nan_to_num(abundance, nan=0.0)
     fitted = mean(abundance, models, exposure.scale(n_bins), exposure.offset(n_bins))
     residuals = pearson_residuals(observed, fitted, usable)
     return DispersionTerm(
@@ -266,11 +268,16 @@ def standard_errors(
     abundance = np.asarray(abundance, dtype=np.float64)
     n_models = abundance.size
     errors = np.full(n_models, np.nan)
-    if n_models == 0 or not np.all(np.isfinite(abundance)):
+    # A NaN entry is a model with no unmasked bins (an all-zero column, not
+    # estimated); it carries no information and is left out like a boundary
+    # one. Anything else non-finite means the fit itself is unusable.
+    estimated = ~np.isnan(abundance)
+    if n_models == 0 or not estimated.any() or not np.all(np.isfinite(abundance[estimated])):
         return errors
+    abundance = np.where(estimated, abundance, 0.0)
 
-    largest = float(np.max(abundance)) if n_models else 0.0
-    interior = abundance > max(largest, 1.0) * BOUNDARY_RELATIVE_TOLERANCE
+    largest = float(np.max(abundance[estimated]))
+    interior = estimated & (abundance > max(largest, 1.0) * BOUNDARY_RELATIVE_TOLERANCE)
     if not interior.any():
         return errors
 
