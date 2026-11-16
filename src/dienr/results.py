@@ -429,7 +429,11 @@ def collect_results(
                         # the raw one said `ok` where QC said `rank_deficient`.
                         "solver_status": _qualified_status(fit.status, locus_conditioning),
                         "objective": fit.objective,
-                        "penalty_value": 0.0,
+                        # The penalty's share of `objective`; it was hard-coded
+                        # to 0.0 even under ridge or lasso.
+                        "penalty_value": (
+                            float("nan") if is_failure(fit.status) else fit.penalty_value
+                        ),
                         "iterations": fit.iterations,
                         "converged": fit.converged,
                     }

@@ -276,6 +276,7 @@ def fit_locus(
         fit,
         fitted_total=float(fitted.sum()),
         residual_sum_of_squares=float(residual @ residual),
+        penalty_value=penalty.value(estimate),
     )
 
 

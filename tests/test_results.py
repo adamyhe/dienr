@@ -877,3 +877,20 @@ def test_fitted_signal_in_qc_is_on_the_scale_of_the_counts(design, likelihood):
         np.testing.assert_array_equal(scaled[column], unit[column])
     ratio = (unit["total_fitted"] / unit["total_observed"]).to_numpy()
     np.testing.assert_allclose(ratio, 1.0, rtol=0.05)
+
+
+def test_penalty_value_reports_the_penalty_term(design):
+    """It was hard-coded to 0.0, even under ridge; `objective` includes it."""
+    from dienr.solvers import penalties
+
+    rng = np.random.default_rng(3)
+    values = [rng.poisson(m @ np.full(m.shape[1], 40.0)).astype(np.float64) for m in design.models]
+    counts = replace(synthetic_counts(design), values=values, provenance={"summary": "sum"})
+    penalty = penalties.ridge(0.01)
+    result = fit(design, counts, likelihood="poisson", penalty=penalty).model_abundance
+    for _, rows in result.group_by("locus_id"):
+        expected = penalty.value(rows.sort("model_index")["abundance_raw"].to_numpy())
+        assert expected > 0
+        assert (rows["penalty_value"] == expected).all()
+    unpenalized = fit(design, counts, likelihood="poisson").model_abundance
+    assert (unpenalized["penalty_value"] == 0.0).all()

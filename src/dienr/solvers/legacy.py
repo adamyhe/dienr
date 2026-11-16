@@ -69,6 +69,8 @@ class LocusFit:
             None means ``M a``, which `dienr.results.collect_results` computes.
         residual_sum_of_squares: ``sum (y - mu)^2`` against that same mean;
             None under the same convention.
+        penalty_value: The penalty term included in `objective`; 0.0 for an
+            unpenalized fit.
     """
 
     abundance: np.ndarray
@@ -82,6 +84,7 @@ class LocusFit:
     standard_error: np.ndarray | None = None
     fitted_total: float | None = None
     residual_sum_of_squares: float | None = None
+    penalty_value: float = 0.0
 
 
 def predict(models: np.ndarray, abundance: np.ndarray) -> np.ndarray:
