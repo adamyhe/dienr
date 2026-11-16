@@ -376,7 +376,7 @@ def fit_locus(
     abundance[pinned] = 0.0
     if pinned.any():
         final_gradient = gradient(abundance, models, observed, transform, log_offset=log_offset)
-    gradient_norm = float(np.abs(final_gradient).max()) if n_models else 0.0
+    gradient_norm = free_gradient_norm(final_gradient, pinned)
 
     if not np.all(np.isfinite(abundance)):
         return _short_circuit(
@@ -393,6 +393,16 @@ def fit_locus(
         message=message,
         failure_reason=None if converged else message,
     )
+
+
+def free_gradient_norm(final_gradient: np.ndarray, pinned: np.ndarray) -> float:
+    """Infinity norm of the gradient over the models the fit was free to move.
+
+    A pinned model sits at its bound by construction, so its gradient says
+    nothing about convergence; included, a converged fit reported 1.6e14.
+    """
+    free = final_gradient[~pinned]
+    return float(np.abs(free).max()) if free.size else 0.0
 
 
 def fit_supported_models(

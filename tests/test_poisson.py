@@ -429,6 +429,8 @@ def test_pinned_model_does_not_abort_the_locus(design):
     assert result.abundance[1] > 0.0
     # The surviving model is estimated from the bins it actually covers.
     assert result.abundance[1] == pytest.approx(60.0, rel=0.25)
+    # Converged: the pinned model's gradient is not part of the norm.
+    assert result.gradient_norm < 1e-3
 
 
 def test_pinning_every_model_leaves_nothing_to_fit(design):

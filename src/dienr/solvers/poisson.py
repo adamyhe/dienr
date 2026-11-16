@@ -44,6 +44,7 @@ from .legacy import (
     LocusFit,
     _short_circuit,
     fit_supported_models,
+    free_gradient_norm,
 )
 from .penalties import NO_PENALTY, Penalty
 
@@ -426,7 +427,7 @@ def _fit_locus(
         abundance=abundance,
         status=FitStatus.OK if converged else FitStatus.NONCONVERGED,
         objective=value,
-        gradient_norm=float(np.abs(final_gradient).max()) if n_models else 0.0,
+        gradient_norm=free_gradient_norm(final_gradient, pinned),
         iterations=iterations,
         converged=converged,
         message=message,
