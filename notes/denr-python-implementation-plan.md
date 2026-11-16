@@ -1146,7 +1146,8 @@ One job is unchanged within noise for one sample, and faster with several
 remainder is `collect_results`' row assembly, 0.12 s; the standard-error pass
 takes 0.11 s on the workers. What's left is the fitting pass's own efficiency
 -- 0.58 s against 0.36 s for perfect 4-way scaling -- pool start, pickling and
-chunk imbalance. Not yet re-timed on K562 on one Slurm node.
+chunk imbalance. Not yet re-timed on K562 on one Slurm node. [Re-timed in
+14.7: 1.18x / 1.33x for quasi-Poisson at 4 / 8 jobs, but one job got slower.]
 
 **A bug found while moving it: the pooled dispersion ignored exposure.**
 `pipeline._dispersion_inputs` took `use_bin_exposure` and never used it, and
@@ -1161,6 +1162,76 @@ which covers every recorded validation run (`validate_likelihoods.py` calls
 the solvers directly). Fixed in a separate commit from the refactor, which
 kept the bug so its 90-table identity check stayed meaningful; pinned by
 `test_pooled_dispersion_is_one_for_poisson_counts_under_any_exposure`.
+
+### 14.7 Re-timed on K562: one job paid for the 0.2.0 fixes (November 2026)
+
+K562 protein-coding (GRCh37.87, 18,967 loci), rep1, one sample, on cbsubscb20.
+Two cases: legacy at the defaults, and quasi-Poisson with `summary="sum"` and
+`mask_start_bins=(1, 1)` (18.26's abundance configuration, no tail). Best of 3
+per cell; 0.1.0 (`f13a26e`) and the branch interleaved twice in one job, and
+the rounds agree within 2% (`build/audit/time_fit.py`, jobs 4122205, 4122246).
+Every `n_jobs` gave output identical to `n_jobs=1` on every version.
+
+| fit, s | 0.1.0 | 0.2.0 before 14.7 | 0.2.0 | 0.2.0 vs 0.1.0 |
+|---|---|---|---|---|
+| legacy, 1 job | 7.53 | 8.29 | 8.10 | **0.93x** |
+| legacy, 2 | 4.74 | 4.88 | 4.78 | 0.99x |
+| legacy, 4 | 2.98 | 2.96 | 2.83 | 1.05x |
+| legacy, 8 | 2.41 | 2.25 | 2.17 | 1.11x |
+| quasi-Poisson, 1 job | 6.13 | 7.84 | 7.26 | **0.84x** |
+| quasi-Poisson, 2 | 4.55 | 4.95 | 4.66 | 0.98x |
+| quasi-Poisson, 4 | 3.45 | 3.04 | 2.78 | **1.24x** |
+| quasi-Poisson, 8 | 3.17 | 2.29 | 2.16 | **1.47x** |
+
+14.6 pays off on real data at the CLI default (4 jobs) and above. **One job --
+the library default -- got slower**, and nothing in 14.6's laptop timings showed
+it ("one job is unchanged within noise").
+
+**Where it came from.** Each commit between 0.1.0 and the branch head, timed at
+one job on the same node (job 4122222, best of 3; steps under ~0.1 s are noise):
+
+| commit | legacy | quasi-Poisson |
+|---|---|---|
+| `32cd20e` serial work onto the workers (14.6) | +0.53 s | +0.37 s |
+| `e9e54ae` dispersion at the fitted exposure | ~0 | +0.15 |
+| `657106e` Poisson invariant to exposure scale | ~0 | +0.38 |
+| `defc652` NaN for models with no unmasked bins | +0.05 | +0.50 |
+| `2c0f106` `locus_qc` fitted signal at the fit's exposure | +0.24 | +0.50 |
+| `285f3f5` `gradient_norm` over free models | +0.13 | +0.10 |
+| rest | ~0 | ~0 |
+
+No single culprit: each correctness fix added a little per-locus bookkeeping,
+and at ~19k loci a few tens of microseconds per locus is a second. Parallel runs
+hide it; one job doesn't. cProfile (job 4122232) put the largest pieces in
+`np.nan_to_num` -- 54k calls, three per locus, four passes each (NaN, +inf,
+-inf, dtype limits) on vectors that are almost never anything but finite -- and
+`abundance_unit`, computed twice per general-path Poisson locus (once in
+`_fit_locus`, again inside `moment_initialization`).
+
+**Fixed:** `_glm.nan_to_zero` returns an all-finite vector unchanged and
+otherwise calls `np.nan_to_num(x, nan=0.0)`, at all three call sites;
+`moment_initialization(unit=)` takes the unit `_fit_locus` already has. Output
+identical (`model_abundance`, `locus_qc`, both cases), pinned by
+`test_nan_to_zero_matches_nan_to_num` and
+`test_moment_initialization_with_precomputed_unit_is_identical`. It recovered
+**25% (legacy) and 34% (quasi-Poisson)** of the one-job loss, less than the
+half to two-thirds the profile suggested: cProfile inflates cheap per-call
+functions most.
+
+**What is left, and what is not worth taking now.** ~30 us (legacy) and ~60 us
+(quasi-Poisson) per locus. The arithmetic the fixes require -- one more
+matrix-vector product for the fitted total, the fitted mean for the dispersion,
+one pass over `M` for the unit -- is a few microseconds at a median 64 x 1-3
+locus, ~0.1-0.2 s per fit; the rest is overhead. Two candidates, neither done:
+(1) after a Poisson fit `mu` is computed up to four times for the same locus
+(`_fit_locus`'s collapse check, `fit_locus`'s fitted total, `dispersion_term`,
+`fisher_information`), each rebuilding `exposure.scale`/`offset`; computing it
+once would remove most of the quasi-Poisson-specific cost. (2) `n_jobs=1` still
+goes through 14.6's task packaging; a direct serial path would recover most of
+`32cd20e`'s share, though that commit has not been profiled on its own.
+Estimated together: one job within ~2-5% of 0.1.0. Shipped without them in
+0.2.0 -- 0.6-1.1 s on an ~8 s whole-genome fit, and only for library callers who
+keep `n_jobs=1`.
 
 ## 15. Normalization and downstream inference
 

@@ -35,6 +35,7 @@ from ._glm import (
     abundance_unit,
     mean,
     moment_initialization,
+    nan_to_zero,
     usable_bins,
 )
 from ._lbfgsb import minimize_bounded
@@ -269,7 +270,7 @@ def fit_locus(
     # observed total at sample scale c, 1/250 with 250 bp bin exposure.
     exposure = exposure or Exposure()
     n_bins = models.shape[0]
-    estimate = np.nan_to_num(fit.abundance, nan=0.0)
+    estimate = nan_to_zero(fit.abundance)
     fitted = exposure.scale(n_bins) * (models @ estimate) + exposure.offset(n_bins)
     residual = observed - fitted
     return replace(
@@ -376,15 +377,15 @@ def _fit_locus(
         if single is not None:
             return single
 
+    unit = abundance_unit(models, scale)
     if initial is None:
-        start = moment_initialization(models, observed, scale, offset)
+        start = moment_initialization(models, observed, scale, offset, unit=unit)
     else:
         start = np.array(initial, dtype=np.float64)
     start[pinned] = 0.0
     upper = np.where(pinned, _INACTIVE_UPPER, _FREE_UPPER)
 
     fused = _value_and_grad(models, observed, exposure, penalty, pinned)
-    unit = abundance_unit(models, scale)
     driven = fused
     if unit != 1.0:
         # Optimize b = a * unit, so the problem L-BFGS-B sees is O(1) whatever

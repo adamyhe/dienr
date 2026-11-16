@@ -140,6 +140,8 @@ def moment_initialization(
     observed: np.ndarray,
     scale: np.ndarray,
     offset: np.ndarray,
+    *,
+    unit: float | None = None,
 ) -> np.ndarray:
     """A strictly positive starting abundance, by method of moments.
 
@@ -169,7 +171,24 @@ def moment_initialization(
     # abundance units -- counts per unit of exposure -- or at a large exposure
     # (abundance ~ y / c) the floor alone sat far above the answer.
     typical = float(np.mean(residual)) if residual.size else 0.0
-    return np.maximum(start, max(typical, 1.0) * 1e-6 / abundance_unit(models, scale))
+    if unit is None:
+        unit = abundance_unit(models, scale)
+    return np.maximum(start, max(typical, 1.0) * 1e-6 / unit)
+
+
+def nan_to_zero(abundance: np.ndarray) -> np.ndarray:
+    """``np.nan_to_num(abundance, nan=0.0)``, without its cost when nothing changes.
+
+    NaN marks a model with no unmasked bins, whose column is zero, so it
+    predicts nothing. Almost every abundance vector is all finite, and
+    `np.nan_to_num` runs four passes (NaN, +inf, -inf, dtype limits) on each
+    call: ~19k calls per K562 fit, three per locus, cost more than the rest of
+    the post-fit bookkeeping (plan 14.7). An all-finite input is returned as
+    is, not copied; callers must not modify the result in place.
+    """
+    if np.isfinite(abundance).all():
+        return abundance
+    return np.nan_to_num(abundance, nan=0.0)
 
 
 def abundance_unit(models: np.ndarray, scale: np.ndarray) -> float:

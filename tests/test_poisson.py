@@ -6,7 +6,14 @@ import numpy as np
 import pytest
 
 from dienr.solvers import penalties, poisson
-from dienr.solvers._glm import MU_FLOOR, Exposure, usable_bins
+from dienr.solvers._glm import (
+    MU_FLOOR,
+    Exposure,
+    abundance_unit,
+    moment_initialization,
+    nan_to_zero,
+    usable_bins,
+)
 from dienr.status import FitStatus, is_failure
 
 
@@ -754,3 +761,37 @@ def test_single_model_fast_path_leaves_short_circuits_alone():
     assert poisson.fit_locus(column, np.zeros(64)).status is FitStatus.ALL_ZERO
     pinned = poisson.fit_locus(column, np.ones(64), inactive=np.array([True]))
     assert pinned.status is FitStatus.INSUFFICIENT_BINS
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        [1.0, 2.5, 0.0],
+        [np.nan, 2.0, np.nan],
+        [np.inf, np.nan, -np.inf, 3.0],
+        [],
+    ],
+)
+def test_nan_to_zero_matches_nan_to_num(values):
+    """The fast path must be `np.nan_to_num(x, nan=0.0)` exactly (plan 14.7)."""
+    x = np.array(values, dtype=np.float64)
+    np.testing.assert_array_equal(nan_to_zero(x), np.nan_to_num(x, nan=0.0))
+
+
+def test_nan_to_zero_returns_finite_input_uncopied():
+    x = np.array([1.0, 2.0])
+    assert nan_to_zero(x) is x
+
+
+def test_moment_initialization_with_precomputed_unit_is_identical():
+    """`_fit_locus` passes the unit it already computed; the start must not move."""
+    rng = np.random.default_rng(3)
+    models = rng.uniform(0, 40, size=(30, 3)) * (rng.uniform(size=(30, 3)) > 0.4)
+    observed = rng.poisson(20, size=30).astype(np.float64)
+    scale = np.full(30, 250.0)
+    offset = np.zeros(30)
+    unit = abundance_unit(models, scale)
+    np.testing.assert_array_equal(
+        moment_initialization(models, observed, scale, offset, unit=unit),
+        moment_initialization(models, observed, scale, offset),
+    )

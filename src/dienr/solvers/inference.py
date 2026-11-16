@@ -34,7 +34,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from ._glm import MU_FLOOR, Exposure, mean, pearson_residuals, usable_bins
+from ._glm import MU_FLOOR, Exposure, mean, nan_to_zero, pearson_residuals, usable_bins
 
 #: Abundance at or below which a model counts as sitting on the boundary.
 #: Scaled against the largest estimate in the locus, so it adapts to the count
@@ -175,7 +175,7 @@ def dispersion_term(
     if not usable.any():
         return None
     # NaN marks a model with no unmasked bins; its column is zero.
-    abundance = np.nan_to_num(abundance, nan=0.0)
+    abundance = nan_to_zero(abundance)
     fitted = mean(abundance, models, exposure.scale(n_bins), exposure.offset(n_bins))
     residuals = pearson_residuals(observed, fitted, usable)
     return DispersionTerm(

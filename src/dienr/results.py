@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 import polars as pl
 
+from .solvers._glm import nan_to_zero
 from .status import FitStatus, is_failure
 
 if TYPE_CHECKING:
@@ -387,7 +388,7 @@ def collect_results(
                 # A count-likelihood fit reports its own, on the exposure it
                 # was fitted under; otherwise the mean is plain ``M a``. NaN
                 # marks a model with no unmasked bins: its column is zero.
-                estimate = np.nan_to_num(fit.abundance, nan=0.0)
+                estimate = nan_to_zero(fit.abundance)
                 total_fitted = (
                     fit.fitted_total
                     if fit.fitted_total is not None
