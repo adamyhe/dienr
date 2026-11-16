@@ -1882,6 +1882,7 @@ forgets a correction, is the shape of the defect.
 ### 18.8 Is a shape profile worth applying? Mostly not
 
 *Caveat (18.28): every shape profile here was fitted with training genes not isolated from short neighbours; not re-run since the fix.*
+**Re-run in 18.29 under the fixed selection: the verdict stands** (still a wash; fewer zeros still 5 of 5 seeds; the pooled-rho gain is now 4 of 5).
 
 `scripts/validate_shape_usefulness.py`, five 1500-locus simulations, scored on
 multi-model loci only (the profile is pure loss where there is nothing to
@@ -2259,6 +2260,7 @@ order of value:
 ### 18.14 Real data: the run-on tail predicts held-out K562 signal better
 
 *Caveat (18.28): every shape profile here was fitted with training genes not isolated from short neighbours; not re-run since the fix.*
+**Re-run in 18.29 under the fixed selection: unchanged** (shape +15.7% / +15.9% held-out deviance; run-on -5.5% / -5.4%).
 
 `scripts/k562_runon_check.py`. GEO `GSE96869` (Dukler et al. 2017 -- the data
 nascentRNASim's archetypes come from), K562 0 min, two replicates, `primary`
@@ -2872,6 +2874,86 @@ or merely change which genes enter it. They stand as recorded but should be
 re-run under the fixed selection before being cited as settled. Nothing else
 in 17 or 18 depends on the affected paths, and 18.27's scope decision does not
 rest on any number that moves.
+
+**Re-run (18.29):** 18.8 and 18.14 under the fixed selection. Both verdicts
+stand; the fix moves no conclusion.
+
+### 18.29 18.8 and 18.14 re-run under the fixed training-gene selection
+
+November 2026, for 0.2.0. Each was run twice on the same inputs: at the branch
+head, and at `7e7e9cd` (`592a4bb^`, the commit just before the selection fix).
+The analysis scripts are identical across that range, so **head vs pre-fix is
+the selection fix alone**; a comparison with the recorded numbers would also
+carry the branch's other fixes (18.28's table). Five 1500-locus nascentRNASim
+seeds 5, 17, 29, 41, 53 (job 4122276); K562 GSE96869 0 min, each replicate
+scored with tail and profile from the other (job 4122216). Outputs in
+`build/audit/`.
+
+**Three harness defects first, all from `defc652`** (NaN for unestimable
+models, and `model_abundance.solver_status` carrying the conditioning
+qualifier). Each was caught because a number moved that the selection fix
+could not have moved:
+
+- `validate_shape_usefulness.py` kept NaN abundances: `rankdata` made pooled
+  Spearman NaN on seed 41, and `NaN > 0` is false, so NaN models counted as
+  *zeros* -- in the one row 18.8 says replicates. Now excluded and counted
+  (`n_unestimated`: one model, seed 41, every arm).
+- It kept `solver_status == "ok"`, which since `defc652` excludes
+  `rank_deficient` and `ill_conditioned` loci. That dropped ~185 models per
+  seed from the **binary arms only** -- reshaping breaks exact collinearity, so
+  shape keeps them -- and scored the arms on different loci: binary looked
+  better unpaired (0.772 vs 0.759) and the paired comparison lost the loci where
+  shape might help (discordant loci 48 -> 39 per seed). Now keeps every
+  converged fit, as the recorded run effectively did. **A first reading of this
+  re-run -- "shape now loses dominant accuracy to binary on 5 of 5 seeds" -- was
+  this artifact and is withdrawn.** `benchmark_shape_accuracy.py`,
+  `oracle_shape_ceiling.py`, `runon_trial.py`, `runon_overlap_trial.py` and
+  `shape_runon_trial.py` filter the same way and were not re-run; **fix them
+  before re-running any of 18.6, 18.9-18.13**.
+- `k562_runon_check.py` multiplied a NaN abundance (a model with no training
+  bin in a fold) into the held-out prediction, so every such locus failed the
+  finite filter: **8,358 -> 4,804 scored loci on rep1**. Now predicts zero for
+  it, as the package's own fitted signal does.
+
+With the fixes, the pre-fix run reproduces the recorded one: binary/legacy_log
+dominant 0.757 (recorded 0.757), shape/legacy_log 0.761 (0.761), Poisson
+discordant win share 0.538 (0.536); rep1 scores 8,358 loci (8,358).
+
+**18.8, simulation.** The fix removes ~5% of training genes per seed (377 ->
+360 on seed 5) and leaves the profile's dynamic range within 0.2x (4.52 ->
+4.61). Means over five seeds, multi-model loci:
+
+| | pre-fix | fixed | replicates (fixed) |
+|---|---|---|---|
+| shape wins at discordant loci, Poisson / log | 0.538 / 0.559 | 0.508 / 0.542 | wash |
+| shape has lower error, Poisson / log | 0.481 / 0.479 | 0.473 / 0.472 | wash |
+| dominant accuracy, shape - binary, Poisson | +0.010 | +0.003 | 2 of 5 seeds |
+| dominant accuracy, shape - binary, log | +0.004 | +0.002 | 3 of 5 seeds |
+| pooled rho incl. zeros, shape - binary, log / Poisson | +0.021 / +0.024 | +0.017 / +0.019 | 4 of 5 each |
+| expressed models at exactly zero, Poisson, binary -> shape | 18.7% -> 17.1% | 18.7% -> 17.3% | **5 of 5** |
+
+**The 18.8 verdict stands**: no dominant-isoform or magnitude gain, fewer
+spurious zeros the only effect that replicates on every seed. Cleaner training
+genes made every shape metric slightly *worse* (by less than seed-to-seed
+noise), so the contaminated selection was not hiding a benefit.
+
+**18.14, K562.** The fix removes 287 / 291 of ~6,260 profile genes; dynamic
+range 1.518 -> 1.521 (rep1), 1.499 -> 1.501 (rep2).
+
+| scored (profile from) | loci | shape vs binary, pre-fix | fixed | recorded |
+|---|---|---|---|---|
+| rep1 (rep2) | 8,358 | +15.64%, wins 0.629 | **+15.66%, 0.627** | +15.9%, 0.628 |
+| rep2 (rep1) | 8,265 | +15.88%, 0.561 | **+15.86%, 0.561** | +16.0%, 0.562 |
+
+Run-on vs binary, which uses no profile: -5.55% / -5.39%, wins 0.570 / 0.573
+(recorded -5.5% / -5.4%, 0.572 / 0.574). **18.14 stands.** The scored set on
+rep2 differs by a few loci between versions (8,259 pre-fix) because the finite
+filter includes the shape arm.
+
+**Lesson for the record:** a change to output *status semantics* is a change to
+every harness that filters on status. `solver_status` became qualified in
+`defc652`, a correctness fix with a test, and no test could see the scripts.
+When status or NaN conventions change, grep `scripts/` for the column.
 
 ## 19. Definition of done for version 1.0
 
