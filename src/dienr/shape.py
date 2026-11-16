@@ -321,6 +321,7 @@ def rescale_position(
     config: ShapeConfig,
     *,
     allow_short: bool | None = None,
+    bin_size: int | None = None,
 ) -> np.ndarray:
     """Map `n_bins` bins onto ``[0, 1]`` under the tripartite rescaling.
 
@@ -341,6 +342,10 @@ def rescale_position(
         allow_short: Override `ShapeConfig.allow_short_genes`. When the head
             and tail together need more bins than the gene has, they are
             shrunk proportionally; with this false, that raises instead.
+        bin_size: Width of the `n_bins` bins, if not `config.bin_size`. The
+            head and tail are lengths in bases, so they must be counted in the
+            bins actually being mapped: a profile fitted at 250 bp applied to a
+            100 bp design put a 10 kb head on 3.9 kb.
 
     Returns:
         A float64 array of length `n_bins`.
@@ -356,8 +361,9 @@ def rescale_position(
         return np.zeros(1)
 
     permit_short = config.allow_short_genes if allow_short is None else allow_short
-    head_bins = -(-config.head_bases // config.bin_size)  # ceil
-    tail_bins = -(-config.tail_bases // config.bin_size)
+    width = config.bin_size if bin_size is None else bin_size
+    head_bins = -(-config.head_bases // width)  # ceil
+    tail_bins = -(-config.tail_bases // width)
 
     if head_bins + tail_bins > n_bins:
         if not permit_short:
@@ -574,7 +580,9 @@ def apply_shape_profile(design: Design, profile: ShapeProfile) -> Design:
             if first < 0:
                 continue  # no occupied bin even before masking
             n_span = last - first + 1
-            positions = rescale_position(n_span, profile.config, allow_short=True)
+            positions = rescale_position(
+                n_span, profile.config, allow_short=True, bin_size=design.config.bin_size
+            )
             weights = profile.evaluate(positions)
             if minus:
                 # Positions run 5' to 3'; bin index runs along the genome.

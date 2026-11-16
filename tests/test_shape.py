@@ -1164,3 +1164,37 @@ def test_read_binned_returns_n_bins_past_a_contig_end(tmp_path):
     assert values.shape == (n_bins,)
     assert np.all(np.isfinite(values))
     assert np.all(values >= 0)
+
+
+@pytest.mark.parametrize("profile_bin", [100, 250, 1000])
+@pytest.mark.parametrize("design_bin", [100, 250])
+def test_shape_head_covers_head_bases_whatever_the_two_bin_sizes(profile_bin, design_bin):
+    """The head is a length in bases, so it must be counted in the design's bins.
+
+    `apply_shape_profile` used the profile's bin size: a 10 kb head became
+    3.9 kb (profile 250 bp, design 100 bp) or 24.75 kb (100 bp on 250 bp).
+    """
+    from dienr.annotation import Annotation
+    from dienr.design import build_design
+
+    annotation = Annotation.from_frame(
+        pl.DataFrame(
+            {"transcript_id": ["t"], "contig": ["c"], "start": [0], "end": [40_000],
+             "strand": ["+"]}
+        )
+    )  # fmt: skip
+    grid = np.linspace(0, 1, 2001)
+    config = ShapeConfig(bin_size=profile_bin, head_bases=10_000, head_fraction=0.2)
+    profile = ShapeProfile(
+        grid=grid,
+        values=np.where(grid <= 0.2, 5.0, 1.0),  # a step: 5 across the head, 1 after
+        config=config,
+        n_genes=1,
+        n_observations=1,
+        n_floored=0,
+        rejected={},
+        digest="step",
+    )
+    reshaped = apply_shape_profile(build_design(annotation, bin_size=design_bin), profile)
+    head_bins = int((reshaped.models[0][:, 0] > 2).sum())
+    assert head_bins * design_bin == 10_000
