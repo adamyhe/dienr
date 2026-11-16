@@ -16,13 +16,14 @@ import os
 import pickle
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import polars as pl
 
 from . import __version__
 from .annotation import Annotation, read_annotation
-from .contigs import ContigMap, check_contigs, rename_contigs
+from .contigs import ContigMap, check_stranded_contigs, rename_contigs
 from .counts import VALUE_KINDS, SignalFile, count_sample, declared_contigs
 from .design import Design, build_design
 from .pipeline import fit, status_report
@@ -619,6 +620,24 @@ def _positive_int(text: str) -> int:
     return value
 
 
+def _sample_exposure(row: dict[str, Any], source: Path) -> float:
+    """The sample sheet's `exposure`, 1.0 when the column or cell is empty.
+
+    Only a blank means "unit": ``row.get("exposure") or 1.0`` also turned an
+    explicit 0 into 1.0, fitting at unit exposure a sample that should have
+    been reported `invalid_exposure`.
+    """
+    value = row.get("exposure")
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return 1.0
+    try:
+        return float(value)
+    except ValueError:
+        raise SystemExit(
+            f"{source}: sample {row['sample_id']!r} has exposure {value!r}, expected a number"
+        ) from None
+
+
 def cmd_count(args: argparse.Namespace) -> int:
     design = _load_design(args.design)
     table = pl.read_csv(args.samples)
@@ -639,9 +658,10 @@ def cmd_count(args: argparse.Namespace) -> int:
             SignalFile(row["bigwig_plus"], "+", value_kind=kind),  # type: ignore[arg-type]
             SignalFile(row["bigwig_minus"], "-", value_kind=kind),  # type: ignore[arg-type]
         )
-        contigs = check_contigs(
+        contigs = check_stranded_contigs(
             design.loci["contig"].to_list(),
-            set().union(*(declared_contigs(f.path) for f in signal)),
+            design.loci["strand"].to_list(),
+            {f.strand: set(declared_contigs(f.path)) for f in signal},
         )
         if contigs.none_match and not args.allow_contig_mismatch:
             raise SystemExit(
@@ -674,7 +694,7 @@ def cmd_count(args: argparse.Namespace) -> int:
             row["sample_id"],
             signal,
             summary=args.summary,
-            exposure=float(row.get("exposure") or 1.0),
+            exposure=_sample_exposure(row, args.samples),
             n_jobs=args.threads,
         )
         counts.provenance.update(check.describe())

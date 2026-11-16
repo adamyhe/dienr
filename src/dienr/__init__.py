@@ -34,7 +34,7 @@ single conversion point.
 from importlib import metadata as _metadata
 
 from .annotation import Annotation, read_annotation
-from .contigs import ContigMap, check_contigs, rename_contigs
+from .contigs import ContigMap, check_contigs, check_stranded_contigs, rename_contigs
 from .counts import (
     SampleCounts,
     SignalFile,
@@ -90,6 +90,7 @@ __all__ = [
     "StrandCheck",
     "ContigMap",
     "check_contigs",
+    "check_stranded_contigs",
     "rename_contigs",
     "ShapeConfig",
     "ShapeProfile",

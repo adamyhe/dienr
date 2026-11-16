@@ -207,3 +207,30 @@ def check_contigs(design_contigs: list[str], bigwig_contigs: set[str]) -> Contig
                 hint = f"rebuild the design with --contig-map {name} (or your own map)"
                 break
     return ContigCheck(missing=missing, n_loci=len(design_contigs), hint=hint)
+
+
+def check_stranded_contigs(
+    design_contigs: list[str],
+    design_strands: list[str],
+    bigwig_contigs: dict[str, set[str]],
+) -> ContigCheck:
+    """`check_contigs`, each locus against its own strand's BigWig.
+
+    `count_sample` reads a locus from its strand's file only, so a contig that
+    is in the minus file but not the plus one is missing for every plus-strand
+    locus on it. Checking against the union of both headers missed that: the
+    warning and the "no contig matches" refusal said nothing while those loci
+    came back `missing_contig`.
+    """
+    missing: dict[str, int] = {}
+    for contig, strand in zip(design_contigs, design_strands, strict=True):
+        if contig not in bigwig_contigs.get(strand, set()):
+            missing[contig] = missing.get(contig, 0) + 1
+    union = set().union(*bigwig_contigs.values()) if bigwig_contigs else set()
+    hint = None
+    if missing:
+        for name, mapping in PRESETS.items():
+            if any(mapping.get(c) in union for c in missing):
+                hint = f"rebuild the design with --contig-map {name} (or your own map)"
+                break
+    return ContigCheck(missing=missing, n_loci=len(design_contigs), hint=hint)
