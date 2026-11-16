@@ -481,6 +481,7 @@ def test_bin_exposure_is_passed_through(design):
     assert result.summary.n_failures == 0
 
 
+@pytest.mark.filterwarnings("ignore:design predates per-transcript coordinates")
 def test_ill_conditioned_locus_is_escalated_from_ok():
     """The conditioning escalation for near-collinear, full-rank designs.
 
@@ -912,3 +913,14 @@ def test_manifest_is_strict_json(design, tmp_path):
     text = (out / "manifest.json").read_text()
     manifest = json.loads(text, parse_constant=lambda name: pytest.fail(f"non-strict {name}"))
     assert manifest["dispersion_standard_error"] is None
+
+
+def test_transcript_map_carries_each_transcripts_own_coordinates(design):
+    """One row per transcript, so its span -- not the locus span, as it was."""
+    result = fit(design, synthetic_counts(design))
+    spans = {
+        row["transcript_id"]: (row["start"], row["end"])
+        for row in result.transcript_model_map.iter_rows(named=True)
+    }
+    # The fixture's transcripts, 0-based half-open: a and b share locus 0.
+    assert spans == {"a": (0, 2000), "b": (0, 4000), "c": (500_000, 502_000)}

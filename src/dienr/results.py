@@ -11,6 +11,7 @@ factors live in their own table; nothing here silently rescales an estimate.
 from __future__ import annotations
 
 import json
+import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -265,11 +266,32 @@ def _empty(schema: Schema) -> pl.DataFrame:
 
 
 def build_transcript_model_map(design: Design) -> pl.DataFrame:
-    """Join design coordinates onto the transcript-to-model mapping."""
-    coordinates = design.loci.select("locus_id", "contig", "strand", pl.col("start"), pl.col("end"))
+    """The transcript-to-model mapping with each transcript's own coordinates.
+
+    One row per transcript, so `start`/`end` are that transcript's 0-based
+    half-open span -- as DENR keeps each transcript's own range alongside its
+    group and model. They used to be the *locus* span, repeated for every
+    transcript in it. A design pickled before `Design.transcripts` existed
+    has no per-transcript coordinates and still gets the locus span, with a
+    warning.
+    """
+    transcripts = getattr(design, "transcripts", None)
+    if transcripts is not None:
+        spans = transcripts.select("transcript_id", "start", "end")
+        loci = design.loci.select("locus_id", "contig", "strand")
+        joined = design.transcript_map.join(spans, on="transcript_id", how="left").join(
+            loci, on="locus_id", how="left"
+        )
+    else:
+        warnings.warn(
+            "design predates per-transcript coordinates; transcript_model_map "
+            "start/end are the locus span. Rebuild the design to get each transcript's.",
+            stacklevel=3,
+        )
+        loci = design.loci.select("locus_id", "contig", "strand", "start", "end")
+        joined = design.transcript_map.join(loci, on="locus_id", how="left")
     return (
-        design.transcript_map.join(coordinates, on="locus_id", how="left")
-        .select(
+        joined.select(
             "transcript_id",
             "gene_id",
             "locus_id",

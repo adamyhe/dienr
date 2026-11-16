@@ -23,7 +23,7 @@ back to its inputs. Read it back with `dienr.FitResult.read(directory)`.
 ## `transcript_model_map.parquet`: one row per transcript
 
 `transcript_id`, `gene_id`, `locus_id`, `model_id`, `contig`, `start`, `end`
-(0-based, half-open), `strand`, `equivalence_class_size`,
+(the transcript's own span, 0-based, half-open), `strand`, `equivalence_class_size`,
 `exactly_identifiable`, `has_support` (whether the model occupies any bin at
 this bin size).
 
