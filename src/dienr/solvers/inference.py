@@ -156,11 +156,18 @@ def dispersion_term(
     abundance: np.ndarray,
     *,
     exposure: Exposure | None = None,
+    pinned: np.ndarray | None = None,
 ) -> DispersionTerm | None:
-    """One completed Poisson fit's Pearson statistic, or None if it has no usable bins."""
+    """One completed Poisson fit's Pearson statistic, or None if it has no usable bins.
+
+    `pinned` must be the models the fit held at zero: the fit excluded bins
+    only they reach, and so must this. Counting them put ``mu = MU_FLOOR``
+    against real counts, and one pinned model took a pooled phi of 0.91 to
+    1.5e14 -- and with it every standard error in the run.
+    """
     exposure = exposure or Exposure()
     n_bins = models.shape[0]
-    usable = usable_bins(models, exposure)
+    usable = usable_bins(models, exposure, pinned)
     if not usable.any():
         return None
     fitted = mean(abundance, models, exposure.scale(n_bins), exposure.offset(n_bins))

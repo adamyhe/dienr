@@ -794,3 +794,20 @@ def test_pooled_dispersion_is_one_for_poisson_counts_under_any_exposure(
     noise = result.provenance["dispersion_standard_error"]
     assert result.provenance["dispersion_degrees_of_freedom"] >= 20
     assert abs(dispersion - 1.0) < 4 * noise
+
+
+def test_pinned_models_do_not_inflate_the_pooled_dispersion(design):
+    """Bins only a pinned model reaches were excluded from the fit, so from phi too.
+
+    Counting them, with ``mu = MU_FLOOR`` against real counts, took phi from
+    0.91 to 1.5e14 and every standard error in the run with it (plan 14.6).
+    """
+    rng = np.random.default_rng(5)
+    values = [rng.poisson(m @ np.full(m.shape[1], 40.0)).astype(np.float64) for m in design.models]
+    counts = replace(synthetic_counts(design), values=values, provenance={"summary": "sum"})
+    free = fit(design, counts, likelihood="quasi_poisson")
+    # "b" alone reaches the 2-4 kb bins, so pinning it leaves them unexplained.
+    pinned = fit(design, counts, likelihood="quasi_poisson", inactive_transcripts={"b"})
+    for result in (free, pinned):
+        noise = result.provenance["dispersion_standard_error"]
+        assert abs(result.provenance["dispersion"] - 1.0) < 4 * noise

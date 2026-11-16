@@ -351,7 +351,11 @@ def _fit_task(task: _LocusTask, options: _FitOptions) -> _TaskOutput:
         # measured the fit against the wrong mean, inflating phi ~c-fold for a
         # sample scale c and ~bin-length-fold with bin exposure (plan 14.6).
         term = inference.dispersion_term(
-            task.models, task.observed, fit.abundance, exposure=task.exposure
+            task.models,
+            task.observed,
+            fit.abundance,
+            exposure=task.exposure,
+            pinned=task.inactive,
         )
     return _TaskOutput(
         fit=fit,
