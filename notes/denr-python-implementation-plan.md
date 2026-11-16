@@ -1095,6 +1095,182 @@ multi-sample runs, and would move results by solver tolerance (single-model
 loci already take the closed form). Next to the above it isn't worth the
 change in outputs.
 
+### 14.6 The serial tail of a parallel fit (November 2026)
+
+14.5 left ~2.5 s of a K562 fit serial. A fresh profile (synthetic, 30,000
+transcripts / 9,423 loci, one sample, TSS mask 1 bin; Apple M4 laptop, not
+Slurm -- ratios, not absolute times) showed where. Quasi-Poisson at
+`n_jobs=4`: 0.49 s fitting in workers, then **0.67 s serial** in the main
+process: 0.28 s of standard errors (`_attach_standard_errors`), 0.10 s of
+pooled dispersion, 0.29 s in `collect_results`, two thirds of it one SVD per
+locus *per sample* in `diagnostics.assess`. Legacy: 0.30 s serial of 1.0 s.
+Half the parallel quasi-Poisson fit wasn't parallel.
+
+The JIT question was re-asked and the answer is unchanged (14.3): the fused
+closures are still 50-68% of fitting, but at 4 workers a ~2x closure saves
+~0.25 s, about half what moving the serial work does, with none of 14.3's
+costs.
+
+Three changes, every output bit-identical:
+
+- **Dispersion terms come back from the workers.** `inference.dispersion_term`
+  is one locus's Pearson chi-squared, usable bins and free parameters;
+  `pool_dispersion` sums them in task order, which is the order
+  `estimate_quasi_poisson_dispersion` always summed in (it is now defined
+  through the two).
+- **Standard errors are a second pass on the same pool.** They need the pooled
+  dispersion, so they can't be computed during the fit, but they can be split
+  across the same workers once it is known (`pipeline._Workers` keeps the pool
+  alive across both passes). Rescaling unit-dispersion errors by `sqrt(phi)`
+  would have saved the second pass but is not exact: `fisher_information`
+  floors the variance at `MU_FLOOR`.
+- **Conditioning is assessed once per locus**, in the worker that fits the
+  first sample's copy of it, and handed to `collect_results(conditioning=)`.
+  Called without it, `collect_results` still assesses once per locus, not once
+  per locus per sample.
+
+Checked against the previous code on the dense, sparse and 30k datasets x
+legacy log, legacy identity, Poisson, quasi-Poisson, quasi-Poisson with bin
+exposure x `n_jobs` 1 and 4, with non-unit sample exposures: 90 of 90 output
+tables and dispersion records identical. Fit time, best of 3:
+
+| dataset, likelihood | jobs 1 | jobs 4 | jobs 8 |
+|---|---|---|---|
+| 30k, legacy | 2.41 -> 2.48 s | 1.02 -> 0.87 s (1.17x) | 0.81 -> 0.67 s (1.20x) |
+| 30k, quasi-Poisson | 2.11 -> 2.16 s | 1.17 -> 0.88 s (1.33x) | 1.04 -> 0.71 s (1.47x) |
+| dense (3 samples), legacy | 0.68 -> 0.60 s | 0.40 -> 0.28 s (1.41x) | 0.34 -> 0.23 s (1.49x) |
+| dense (3 samples), quasi-Poisson | 0.63 -> 0.55 s | 0.39 -> 0.30 s (1.32x) | 0.37 -> 0.27 s (1.40x) |
+
+One job is unchanged within noise for one sample, and faster with several
+(the SVDs no longer repeat). On the 30k quasi-Poisson fit at 4 jobs the serial
+remainder is `collect_results`' row assembly, 0.12 s; the standard-error pass
+takes 0.11 s on the workers. What's left is the fitting pass's own efficiency
+-- 0.58 s against 0.36 s for perfect 4-way scaling -- pool start, pickling and
+chunk imbalance. Not yet re-timed on K562 on one Slurm node. [Re-timed in
+14.7: 1.18x / 1.33x for quasi-Poisson at 4 / 8 jobs, but one job got slower.]
+
+**A bug found while moving it: the pooled dispersion ignored exposure.**
+`pipeline._dispersion_inputs` took `use_bin_exposure` and never used it, and
+passed no exposures to `estimate_quasi_poisson_dispersion`, so Pearson
+residuals were taken against `M a` while the fit and the standard errors used
+`c e M a`. On exactly-Poisson counts (500 two-model loci): phi 0.99 at unit
+exposure, **22.3 at sample scale 3, 299,565 with 250 bp bin exposure** -- the
+correct values are 1.004 and 0.996. Every quasi-Poisson standard error was too
+large by `sqrt` of that, ~550x in the bin-exposure case. Point estimates were
+unaffected, and so was any run at unit exposure without `--use-bin-exposure`,
+which covers every recorded validation run (`validate_likelihoods.py` calls
+the solvers directly). Fixed in a separate commit from the refactor, which
+kept the bug so its 90-table identity check stayed meaningful; pinned by
+`test_pooled_dispersion_is_one_for_poisson_counts_under_any_exposure`.
+
+### 14.7 Re-timed on K562: one job paid for the 0.2.0 fixes (November 2026)
+
+K562 protein-coding (GRCh37.87, 18,967 loci), rep1, one sample, on cbsubscb20.
+Two cases: legacy at the defaults, and quasi-Poisson with `summary="sum"` and
+`mask_start_bins=(1, 1)` (18.26's abundance configuration, no tail). Best of 3
+per cell; 0.1.0 (`f13a26e`) and the branch interleaved twice in one job, and
+the rounds agree within 2% (`build/audit/time_fit.py`, jobs 4122205, 4122246).
+Every `n_jobs` gave output identical to `n_jobs=1` on every version.
+
+| fit, s | 0.1.0 | 0.2.0 before 14.7 | 0.2.0 | 0.2.0 vs 0.1.0 |
+|---|---|---|---|---|
+| legacy, 1 job | 7.53 | 8.29 | 8.10 | **0.93x** |
+| legacy, 2 | 4.74 | 4.88 | 4.78 | 0.99x |
+| legacy, 4 | 2.98 | 2.96 | 2.83 | 1.05x |
+| legacy, 8 | 2.41 | 2.25 | 2.17 | 1.11x |
+| quasi-Poisson, 1 job | 6.13 | 7.84 | 7.26 | **0.84x** |
+| quasi-Poisson, 2 | 4.55 | 4.95 | 4.66 | 0.98x |
+| quasi-Poisson, 4 | 3.45 | 3.04 | 2.78 | **1.24x** |
+| quasi-Poisson, 8 | 3.17 | 2.29 | 2.16 | **1.47x** |
+
+14.6 pays off on real data at the CLI default (4 jobs) and above. **One job --
+the library default -- got slower**, and nothing in 14.6's laptop timings showed
+it ("one job is unchanged within noise").
+
+**Where it came from.** Each commit between 0.1.0 and the branch head, timed at
+one job on the same node (job 4122222, best of 3; steps under ~0.1 s are noise):
+
+| commit | legacy | quasi-Poisson |
+|---|---|---|
+| `32cd20e` serial work onto the workers (14.6) | +0.53 s | +0.37 s |
+| `e9e54ae` dispersion at the fitted exposure | ~0 | +0.15 |
+| `657106e` Poisson invariant to exposure scale | ~0 | +0.38 |
+| `defc652` NaN for models with no unmasked bins | +0.05 | +0.50 |
+| `2c0f106` `locus_qc` fitted signal at the fit's exposure | +0.24 | +0.50 |
+| `285f3f5` `gradient_norm` over free models | +0.13 | +0.10 |
+| rest | ~0 | ~0 |
+
+No single culprit: each correctness fix added a little per-locus bookkeeping,
+and at ~19k loci a few tens of microseconds per locus is a second. Parallel runs
+hide it; one job doesn't. cProfile (job 4122232) put the largest pieces in
+`np.nan_to_num` -- 54k calls, three per locus, four passes each (NaN, +inf,
+-inf, dtype limits) on vectors that are almost never anything but finite -- and
+`abundance_unit`, computed twice per general-path Poisson locus (once in
+`_fit_locus`, again inside `moment_initialization`).
+
+**Fixed:** `_glm.nan_to_zero` returns an all-finite vector unchanged and
+otherwise calls `np.nan_to_num(x, nan=0.0)`, at all three call sites;
+`moment_initialization(unit=)` takes the unit `_fit_locus` already has. Output
+identical (`model_abundance`, `locus_qc`, both cases), pinned by
+`test_nan_to_zero_matches_nan_to_num` and
+`test_moment_initialization_with_precomputed_unit_is_identical`. It recovered
+**25% (legacy) and 34% (quasi-Poisson)** of the one-job loss, less than the
+half to two-thirds the profile suggested: cProfile inflates cheap per-call
+functions most.
+
+**What is left, and what is not worth taking now.** *Corrected below: the
+second candidate's mechanism was wrong, and both were taken before release.*
+~30 us (legacy) and ~60 us
+(quasi-Poisson) per locus. The arithmetic the fixes require -- one more
+matrix-vector product for the fitted total, the fitted mean for the dispersion,
+one pass over `M` for the unit -- is a few microseconds at a median 64 x 1-3
+locus, ~0.1-0.2 s per fit; the rest is overhead. Two candidates, neither done:
+(1) after a Poisson fit `mu` is computed up to four times for the same locus
+(`_fit_locus`'s collapse check, `fit_locus`'s fitted total, `dispersion_term`,
+`fisher_information`), each rebuilding `exposure.scale`/`offset`; computing it
+once would remove most of the quasi-Poisson-specific cost. (2) `n_jobs=1` still
+goes through 14.6's task packaging; a direct serial path would recover most of
+`32cd20e`'s share, though that commit has not been profiled on its own.
+Estimated together: one job within ~2-5% of 0.1.0. Shipped without them in
+0.2.0 -- 0.6-1.1 s on an ~8 s whole-genome fit, and only for library callers who
+keep `n_jobs=1`.
+
+**Both taken after all; the estimate was wrong on both counts.** Timed as above
+(job 4122294, two interleaved rounds, one-job cells within 1% between rounds;
+the 2-4 job cells moved 10-20% between rounds on a busy node and are not read):
+
+| one job, s | 0.1.0 | 0.2.0 as above | + one `mu` | + `assess` as its own pass |
+|---|---|---|---|---|
+| legacy | 7.57 | 8.32 | 8.27 | **8.02 (0.94x)** |
+| quasi-Poisson | 6.24 | 7.49 | 7.36 | **7.04 (0.89x)** |
+
+- **One `mu` per Poisson locus** (`poisson.fit_locus_with_mean`,
+  `FittedMean`): the general path keeps the unfloored `c e (M a) + beta` and its
+  usable mask; the fitted total reuses it and `dispersion_term(fitted=,
+  usable=)` takes both. Not a `LocusFit` field, so nothing more is pickled.
+  Worth **0.13 s**, not "most of the quasi-Poisson-specific cost": the
+  standard-error pass, which is in a separate pass and still rebuilds its own,
+  was most of it.
+- **There was no packaging to skip at one job.** 0.1.0 already fitted through
+  a task list, and `32cd20e` adds *no calls* at one job for legacy -- the same
+  call counts for every hot function, each 1-17% slower in self time (job
+  4122288; `gc.disable()` changed nothing). What it changed was *order*: the
+  conditioning SVD ran interleaved with every locus's fit instead of in a loop
+  afterwards. Moving it back to its own pass at `n_jobs=1` (with workers it
+  stays on them, where it parallelizes) recovered **0.25 s / 0.32 s** of
+  `32cd20e`'s +0.37-0.41 s. The likeliest reading is cache locality -- LAPACK's
+  SVD and L-BFGS-B's working set evicting each other -- but that is inferred
+  from "same calls, slower", not measured.
+
+Output identical for both (`model_abundance`, `locus_qc`, both cases, vs 0.2.0
+as above); pinned by `test_fit_locus_with_mean_hands_on_exactly_what_would_be_recomputed`
+(four exposure kinds, with and without pinning) and by
+`test_parallel_fit_is_identical_to_serial`, which now compares the two
+conditioning paths. What remains at one job -- ~0.45 s legacy, ~0.8 s
+quasi-Poisson -- is the correctness fixes' own work plus the standard-error
+pass's recomputation. **Lesson: when the call counts don't change and time
+does, look at order before overhead.**
+
 ## 15. Normalization and downstream inference
 
 Fitting and between-sample normalization must be separate operations.
@@ -1743,6 +1919,9 @@ forgets a correction, is the shape of the defect.
 
 ### 18.8 Is a shape profile worth applying? Mostly not
 
+*Caveat (18.28): every shape profile here was fitted with training genes not isolated from short neighbours; not re-run since the fix.*
+**Re-run in 18.29 under the fixed selection: the verdict stands** (still a wash; fewer zeros still 5 of 5 seeds; the pooled-rho gain is now 4 of 5).
+
 `scripts/validate_shape_usefulness.py`, five 1500-locus simulations, scored on
 multi-model loci only (the profile is pure loss where there is nothing to
 apportion), paired at the same locus and likelihood, calibrated within the
@@ -2117,6 +2296,9 @@ order of value:
    an isoform's own (6% of loci); only after (1), since real tails vary more.
 
 ### 18.14 Real data: the run-on tail predicts held-out K562 signal better
+
+*Caveat (18.28): every shape profile here was fitted with training genes not isolated from short neighbours; not re-run since the fix.*
+**Re-run in 18.29 under the fixed selection: unchanged** (shape +15.7% / +15.9% held-out deviance; run-on -5.5% / -5.4%).
 
 `scripts/k562_runon_check.py`. GEO `GSE96869` (Dukler et al. 2017 -- the data
 nascentRNASim's archetypes come from), K562 0 min, two replicates, `primary`
@@ -2703,6 +2885,113 @@ Improvement work stops here. What remains in scope is replicating DENR well:
 correctness, bug fixes, input checks, speed, packaging. Open items that would
 reopen method work -- TSS evidence from PINTS/dREG calls, a second cell line
 for the long-read comparison -- are deferred, not planned.
+
+### 18.28 Correctness audit: which recorded results the fixes touch
+
+November 2026, after 14.6. Three reviewers audited the package by area, each
+required to reproduce a finding before reporting it; every finding below was
+reproduced again before fixing, and each fix has a test that fails on the old
+code. Commits are on the `parallel-serial-tail` branch. **None was re-run
+against K562 or nascentRNASim** -- this records which conclusions rest on
+affected code, not new numbers.
+
+| bug | touches recorded results? |
+|---|---|
+| Training genes not isolated from neighbours shorter than `min_length` (`shape._select_training_genes`) | **Yes -- every fitted shape profile** (18.6-18.8, 18.13, 18.14) |
+| Window past a contig end binned at the wrong width (`count_sample`) | **Slightly** -- loci near contig ends; with an extended tail (18.26) the last plus-strand locus on each contig |
+| Run-on extension left unmasked; tail at a class representative's PAS | Only tail arms *with a PAS mask*; tailed designs without one are bit-identical to before, which covers 18.26's abundance runs. 18.20's `runon_4_4` predates the extension |
+| Quasi-Poisson dispersion ignored exposure, and pinned models | No: every run used unit exposure and no `inactive` |
+| Poisson multi-model fits broke at large exposure | No: unit exposure |
+| Shape profile applied in the profile's bin size | No: bin sizes always matched |
+| Unestimable models given a value; `locus_qc` fitted totals; `penalty_value`; `gradient_norm` with pins; status columns; manifest; `dienr count` exposure and contig check; min/max on signed files | No: output, QC or CLI paths no analysis read |
+
+So the **shape-profile verdicts (18.8 "mostly not worth applying"; 18.14 "+16%
+worse on real data") were measured with contaminated training sets.** The
+direction of a correction is unknown: cleaner genes could sharpen the profile
+or merely change which genes enter it. They stand as recorded but should be
+re-run under the fixed selection before being cited as settled. Nothing else
+in 17 or 18 depends on the affected paths, and 18.27's scope decision does not
+rest on any number that moves.
+
+**Re-run (18.29):** 18.8 and 18.14 under the fixed selection. Both verdicts
+stand; the fix moves no conclusion.
+
+### 18.29 18.8 and 18.14 re-run under the fixed training-gene selection
+
+November 2026, for 0.2.0. Each was run twice on the same inputs: at the branch
+head, and at `7e7e9cd` (`592a4bb^`, the commit just before the selection fix).
+The analysis scripts are identical across that range, so **head vs pre-fix is
+the selection fix alone**; a comparison with the recorded numbers would also
+carry the branch's other fixes (18.28's table). Five 1500-locus nascentRNASim
+seeds 5, 17, 29, 41, 53 (job 4122276); K562 GSE96869 0 min, each replicate
+scored with tail and profile from the other (job 4122216). Outputs in
+`build/audit/`.
+
+**Three harness defects first, all from `defc652`** (NaN for unestimable
+models, and `model_abundance.solver_status` carrying the conditioning
+qualifier). Each was caught because a number moved that the selection fix
+could not have moved:
+
+- `validate_shape_usefulness.py` kept NaN abundances: `rankdata` made pooled
+  Spearman NaN on seed 41, and `NaN > 0` is false, so NaN models counted as
+  *zeros* -- in the one row 18.8 says replicates. Now excluded and counted
+  (`n_unestimated`: one model, seed 41, every arm).
+- It kept `solver_status == "ok"`, which since `defc652` excludes
+  `rank_deficient` and `ill_conditioned` loci. That dropped ~185 models per
+  seed from the **binary arms only** -- reshaping breaks exact collinearity, so
+  shape keeps them -- and scored the arms on different loci: binary looked
+  better unpaired (0.772 vs 0.759) and the paired comparison lost the loci where
+  shape might help (discordant loci 48 -> 39 per seed). Now keeps every
+  converged fit, as the recorded run effectively did. **A first reading of this
+  re-run -- "shape now loses dominant accuracy to binary on 5 of 5 seeds" -- was
+  this artifact and is withdrawn.** `benchmark_shape_accuracy.py`,
+  `oracle_shape_ceiling.py`, `runon_trial.py`, `runon_overlap_trial.py` and
+  `shape_runon_trial.py` filter the same way and were not re-run; **fix them
+  before re-running any of 18.6, 18.9-18.13**.
+- `k562_runon_check.py` multiplied a NaN abundance (a model with no training
+  bin in a fold) into the held-out prediction, so every such locus failed the
+  finite filter: **8,358 -> 4,804 scored loci on rep1**. Now predicts zero for
+  it, as the package's own fitted signal does.
+
+With the fixes, the pre-fix run reproduces the recorded one: binary/legacy_log
+dominant 0.757 (recorded 0.757), shape/legacy_log 0.761 (0.761), Poisson
+discordant win share 0.538 (0.536); rep1 scores 8,358 loci (8,358).
+
+**18.8, simulation.** The fix removes ~5% of training genes per seed (377 ->
+360 on seed 5) and leaves the profile's dynamic range within 0.2x (4.52 ->
+4.61). Means over five seeds, multi-model loci:
+
+| | pre-fix | fixed | replicates (fixed) |
+|---|---|---|---|
+| shape wins at discordant loci, Poisson / log | 0.538 / 0.559 | 0.508 / 0.542 | wash |
+| shape has lower error, Poisson / log | 0.481 / 0.479 | 0.473 / 0.472 | wash |
+| dominant accuracy, shape - binary, Poisson | +0.010 | +0.003 | 2 of 5 seeds |
+| dominant accuracy, shape - binary, log | +0.004 | +0.002 | 3 of 5 seeds |
+| pooled rho incl. zeros, shape - binary, log / Poisson | +0.021 / +0.024 | +0.017 / +0.019 | 4 of 5 each |
+| expressed models at exactly zero, Poisson, binary -> shape | 18.7% -> 17.1% | 18.7% -> 17.3% | **5 of 5** |
+
+**The 18.8 verdict stands**: no dominant-isoform or magnitude gain, fewer
+spurious zeros the only effect that replicates on every seed. Cleaner training
+genes made every shape metric slightly *worse* (by less than seed-to-seed
+noise), so the contaminated selection was not hiding a benefit.
+
+**18.14, K562.** The fix removes 287 / 291 of ~6,260 profile genes; dynamic
+range 1.518 -> 1.521 (rep1), 1.499 -> 1.501 (rep2).
+
+| scored (profile from) | loci | shape vs binary, pre-fix | fixed | recorded |
+|---|---|---|---|---|
+| rep1 (rep2) | 8,358 | +15.64%, wins 0.629 | **+15.66%, 0.627** | +15.9%, 0.628 |
+| rep2 (rep1) | 8,265 | +15.88%, 0.561 | **+15.86%, 0.561** | +16.0%, 0.562 |
+
+Run-on vs binary, which uses no profile: -5.55% / -5.39%, wins 0.570 / 0.573
+(recorded -5.5% / -5.4%, 0.572 / 0.574). **18.14 stands.** The scored set on
+rep2 differs by a few loci between versions (8,259 pre-fix) because the finite
+filter includes the shape arm.
+
+**Lesson for the record:** a change to output *status semantics* is a change to
+every harness that filters on status. `solver_status` became qualified in
+`defc652`, a correctness fix with a test, and no test could see the scripts.
+When status or NaN conventions change, grep `scripts/` for the column.
 
 ## 19. Definition of done for version 1.0
 

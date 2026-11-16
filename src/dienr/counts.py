@@ -262,7 +262,10 @@ def read_binned(
         missing=np.nan,  # uncovered must stay distinguishable from a 0 interval
         oob=np.nan,  # past the contig end is uncovered, not zero
     )[0]
-    return np.abs(_summarize_bins(per_base, n_bins, summary))
+    # Magnitude per base, before summarizing: after it, a conventionally
+    # negative minus-strand file had `min` and `max` swapped.
+    np.abs(per_base, out=per_base)
+    return _summarize_bins(per_base, n_bins, summary)
 
 
 def _summarize_bins(per_base: np.ndarray, n_bins: int, summary: Summary) -> np.ndarray:
@@ -410,6 +413,7 @@ def read_loci_binned(
             ]
         )
         per_base = reader.read(contigs, starts, tile, n_jobs=n_jobs, missing=np.nan, oob=np.nan)
+        np.abs(per_base, out=per_base)  # magnitude per base, as in `read_binned`
         rows = per_base.reshape(-1, bin_size)
         # Binning a chunk costs about as much as reading it, single-threaded;
         # NumPy releases the GIL in these reductions, so split the rows across
@@ -419,7 +423,7 @@ def read_loci_binned(
             parts = [_summarize_rows(block, summary) for block in blocks]
         else:
             parts = list(pool.map(lambda block: _summarize_rows(block, summary), blocks))
-        binned = np.abs(np.concatenate(parts))
+        binned = np.concatenate(parts)
         first = 0
         for i, k in zip(chunk, tiles_per, strict=True):
             out[i] = binned[first : first + windows[i][2]].copy()
@@ -509,7 +513,11 @@ def count_sample(
 
     # Loci whose window lies inside the contig are batched per strand; that is
     # nearly all of them. A window running past the contig end is read alone
-    # through `read_binned`, clipped at the end, exactly as before batching.
+    # through `read_binned` over its *full* width: the bases past the end are
+    # uncovered (``oob=nan``), so every bin keeps the design's `bin_size`. It
+    # used to pass the contig length as the end with the same `n_bins`, which
+    # stretched the on-contig bases across every bin -- and run-on windows are
+    # allowed past contig ends, so that moved body signal into tail bins.
     batched: dict[str, list[tuple[int, tuple[str, int, int]]]] = {s: [] for s in by_strand}
     raws: dict[int, np.ndarray] = {}
     bin_size = design.config.bin_size
@@ -536,7 +544,7 @@ def count_sample(
             by_strand[strand].path,
             contig,
             window_start,
-            headers[strand][contig],
+            window_end,
             n_bins,
             summary=summary,
             reader=readers[strand],

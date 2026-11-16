@@ -140,6 +140,8 @@ def moment_initialization(
     observed: np.ndarray,
     scale: np.ndarray,
     offset: np.ndarray,
+    *,
+    unit: float | None = None,
 ) -> np.ndarray:
     """A strictly positive starting abundance, by method of moments.
 
@@ -165,9 +167,51 @@ def moment_initialization(
     with np.errstate(divide="ignore", invalid="ignore"):
         start = np.where(denominator > 0, numerator / denominator, 0.0)
     # A floor relative to the data keeps every mu strictly positive without
-    # biasing the answer; the optimizer moves off it immediately.
+    # biasing the answer; the optimizer moves off it immediately. It is in
+    # abundance units -- counts per unit of exposure -- or at a large exposure
+    # (abundance ~ y / c) the floor alone sat far above the answer.
     typical = float(np.mean(residual)) if residual.size else 0.0
-    return np.maximum(start, max(typical, 1.0) * 1e-6)
+    if unit is None:
+        unit = abundance_unit(models, scale)
+    return np.maximum(start, max(typical, 1.0) * 1e-6 / unit)
+
+
+def nan_to_zero(abundance: np.ndarray) -> np.ndarray:
+    """``np.nan_to_num(abundance, nan=0.0)``, without its cost when nothing changes.
+
+    NaN marks a model with no unmasked bins, whose column is zero, so it
+    predicts nothing. Almost every abundance vector is all finite, and
+    `np.nan_to_num` runs four passes (NaN, +inf, -inf, dtype limits) on each
+    call: ~19k calls per K562 fit, three per locus, cost more than the rest of
+    the post-fit bookkeeping (plan 14.7). An all-finite input is returned as
+    is, not copied; callers must not modify the result in place.
+    """
+    if np.isfinite(abundance).all():
+        return abundance
+    return np.nan_to_num(abundance, nan=0.0)
+
+
+def abundance_unit(models: np.ndarray, scale: np.ndarray) -> float:
+    """The exposure one unit of abundance typically buys, as a power of two.
+
+    The mean of ``scale * M`` over the design's nonzero entries: 1 for a 0/1
+    design at unit exposure, ``c`` at sample scale ``c``, ~bin length with bin
+    exposure. Abundance is ~``y / unit``, so the Poisson solver optimizes
+    ``a * unit`` instead of ``a``: L-BFGS-B's tolerances are absolute, and at
+    a large exposure the unscaled problem stopped after one iteration at a
+    wrong answer while reporting convergence. Rounding to a power of two makes
+    the rescaling exact in floating point and leaves it at exactly 1 -- the
+    fit bit-identical -- for binary unit-exposure designs and mean-normalized
+    shape profiles.
+    """
+    support = models != 0
+    count = int(np.count_nonzero(support))
+    if count == 0:
+        return 1.0
+    mean_entry = float((np.abs(models) * scale[:, None])[support].sum()) / count
+    if not np.isfinite(mean_entry) or mean_entry <= 0:
+        return 1.0
+    return float(2.0 ** round(np.log2(mean_entry)))
 
 
 def pearson_residuals(observed: np.ndarray, fitted: np.ndarray, usable: np.ndarray) -> np.ndarray:

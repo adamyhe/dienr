@@ -324,7 +324,10 @@ def test_pinned_model_gradient_is_recomputed():
     result = fit_locus(models, observed, inactive=np.array([True, False]))
     assert result.abundance[0] == 0.0
     expected = gradient(result.abundance, models, observed, "log")
-    assert result.gradient_norm == pytest.approx(float(np.abs(expected).max()))
+    # Over the free model only: the pinned one sits at its bound by design,
+    # and its gradient made converged fits look unconverged.
+    assert result.gradient_norm == pytest.approx(float(np.abs(expected[1])))
+    assert result.gradient_norm < 1e-4
 
 
 # --- the log offset as a parameter (plan 18.23) ---------------------------------

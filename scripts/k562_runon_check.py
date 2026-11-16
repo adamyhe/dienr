@@ -226,7 +226,10 @@ def held_out(designs: dict[str, dienr.Design], y_by_locus: list[np.ndarray]) -> 
                 if fit.status.value not in ("ok", "all_zero"):
                     total = np.nan
                     break
-                total += deviance(y[test], m[test] @ fit.abundance)
+                # NaN marks a model with no training bin in this fold; it
+                # predicts nothing, as in the package's own fitted signal.
+                # Without this every such locus dropped out (8,358 -> 4,804).
+                total += deviance(y[test], m[test] @ np.nan_to_num(fit.abundance, nan=0.0))
             scores[name] = total
         if all(np.isfinite(v) for v in scores.values()):
             for name, v in scores.items():

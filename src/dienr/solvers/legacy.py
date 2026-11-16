@@ -20,8 +20,8 @@ what allows a numerical failure to be mistaken for a biological zero.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Literal
+from dataclasses import dataclass, replace
+from typing import Any, Literal
 
 import numpy as np
 from scipy import optimize
@@ -64,6 +64,13 @@ class LocusFit:
             so any error derived from it would be inventing one. NaN entries
             mean the error is undefined for that model -- see
             `dienr.solvers.inference.standard_errors`.
+        fitted_total: Sum of the fitted mean over the locus's bins, set by a
+            solver whose mean is not plain ``M a`` (Poisson: ``c e M a + b``).
+            None means ``M a``, which `dienr.results.collect_results` computes.
+        residual_sum_of_squares: ``sum (y - mu)^2`` against that same mean;
+            None under the same convention.
+        penalty_value: The penalty term included in `objective`; 0.0 for an
+            unpenalized fit.
     """
 
     abundance: np.ndarray
@@ -75,6 +82,9 @@ class LocusFit:
     message: str
     failure_reason: str | None = None
     standard_error: np.ndarray | None = None
+    fitted_total: float | None = None
+    residual_sum_of_squares: float | None = None
+    penalty_value: float = 0.0
 
 
 def predict(models: np.ndarray, abundance: np.ndarray) -> np.ndarray:
@@ -278,6 +288,21 @@ def fit_locus(
     if n_models == 0:
         return _short_circuit(0, FitStatus.INSUFFICIENT_BINS, "locus has no models")
 
+    unsupported = ~models.any(axis=0)
+    if unsupported.any() and not unsupported.all():
+        return fit_supported_models(
+            fit_locus,
+            models,
+            observed,
+            unsupported,
+            inactive=inactive,
+            initial=initial,
+            transform=transform,
+            max_iterations=max_iterations,
+            min_unmasked_bins=min_unmasked_bins,
+            log_offset=log_offset,
+        )
+
     if not np.all(np.isfinite(observed)):
         return _short_circuit(
             n_models, FitStatus.NUMERICAL_ERROR, "observed signal contains non-finite values"
@@ -354,7 +379,7 @@ def fit_locus(
     abundance[pinned] = 0.0
     if pinned.any():
         final_gradient = gradient(abundance, models, observed, transform, log_offset=log_offset)
-    gradient_norm = float(np.abs(final_gradient).max()) if n_models else 0.0
+    gradient_norm = free_gradient_norm(final_gradient, pinned)
 
     if not np.all(np.isfinite(abundance)):
         return _short_circuit(
@@ -370,6 +395,65 @@ def fit_locus(
         converged=converged,
         message=message,
         failure_reason=None if converged else message,
+    )
+
+
+def free_gradient_norm(final_gradient: np.ndarray, pinned: np.ndarray) -> float:
+    """Infinity norm of the gradient over the models the fit was free to move.
+
+    A pinned model sits at its bound by construction, so its gradient says
+    nothing about convergence; included, a converged fit reported 1.6e14.
+    """
+    free = final_gradient[~pinned]
+    return float(np.abs(free).max()) if free.size else 0.0
+
+
+def fit_supported_models(
+    fit: Callable[..., LocusFit],
+    models: np.ndarray,
+    observed: np.ndarray,
+    unsupported: np.ndarray,
+    *,
+    inactive: np.ndarray | None,
+    initial: np.ndarray | None,
+    **options: Any,
+) -> LocusFit:
+    """Fit only the models that occupy an unmasked bin; NaN for the rest.
+
+    A model whose every bin is masked (or rounded away) has an all-zero
+    column: any abundance fits it equally well. Fitted alongside the others it
+    came back as the optimizer's start (Poisson) or zero (legacy) with status
+    ``ok``, and as an interior parameter it made the information matrix
+    singular, so every other model at the locus lost its standard error.
+    Dropping a zero column changes no objective, so the others' fit is the
+    one they would get anyway. `Design.unsupported_models` lists these.
+    """
+    n_models = models.shape[1]
+    keep = ~unsupported
+    for name, array in (("inactive", inactive), ("initial", initial)):
+        if array is not None and np.shape(array) != (n_models,):
+            raise ValueError(f"{name} must have shape ({n_models},), got {np.shape(array)}")
+    reduced = fit(
+        models[:, keep],
+        observed,
+        inactive=None if inactive is None else np.asarray(inactive, dtype=bool)[keep],
+        initial=None if initial is None else np.asarray(initial, dtype=np.float64)[keep],
+        **options,
+    )
+    abundance = np.full(n_models, np.nan)
+    abundance[keep] = reduced.abundance
+    errors = None
+    if reduced.standard_error is not None:
+        errors = np.full(n_models, np.nan)
+        errors[keep] = reduced.standard_error
+    n_dropped = int(unsupported.sum())
+    return replace(
+        reduced,
+        abundance=abundance,
+        standard_error=errors,
+        message=(
+            f"{reduced.message}; {n_dropped} model(s) with no unmasked bins not estimated (NaN)"
+        ),
     )
 
 

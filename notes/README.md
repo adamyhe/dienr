@@ -48,6 +48,10 @@ named.
 - **Stratify by something measured independently of the outcome.** Binning
   loci by the comparator arm's own held-out deviance invented a "harm at
   low-signal loci" by regression to the mean (18.17).
+- **A change to status or NaN conventions is a change to every harness.**
+  `defc652` qualified `solver_status` and reported unestimable models as NaN;
+  three scripts silently changed which loci they scored (18.29). Grep
+  `scripts/` for the column when its meaning changes.
 - **Heavy jobs run on the cluster.** Analysis scripts take paths and write
   JSON; aggregation is a separate `--aggregate` pass.
 
@@ -61,12 +65,12 @@ results.
 |---|---|
 | `validate_likelihoods.py` | 17 (Gate B) |
 | `benchmark_shape_accuracy.py` | 18.6 |
-| `validate_shape_usefulness.py` | 18.8, 18.11 |
+| `validate_shape_usefulness.py` | 18.8, 18.11, 18.29 |
 | `oracle_shape_ceiling.py`, `export_archetypes.R` | 18.9 |
 | `runon_trial.py`, `runon_diagnose.py` | 18.10 |
 | `runon_overlap_trial.py` | 18.12 |
 | `shape_runon_trial.py` | 18.13 |
-| `k562_runon_check.py` | 18.14 |
+| `k562_runon_check.py` | 18.14, 18.29 |
 | `k562_pergene_trial.py` | 18.17 |
 | `k562_pasmask_trial.py` | 18.18 |
 | `k562_tssmask_trial.py` | 18.19 |

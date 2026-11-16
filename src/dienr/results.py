@@ -11,6 +11,8 @@ factors live in their own table; nothing here silently rescales an estimate.
 from __future__ import annotations
 
 import json
+import warnings
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -18,11 +20,13 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 import polars as pl
 
+from .solvers._glm import nan_to_zero
 from .status import FitStatus, is_failure
 
 if TYPE_CHECKING:
     from .counts import SampleCounts
     from .design import Design
+    from .diagnostics import LocusConditioning
     from .solvers.legacy import LocusFit
 
 #: Bumped whenever an output schema changes incompatibly.
@@ -205,7 +209,10 @@ class FitResult:
             "n_fits": self.summary.n_fits,
             "n_failures": self.summary.n_failures,
         }
-        (out / MANIFEST_FILENAME).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        # Strict JSON: a non-finite float (no JSON spelling) is written as null
+        # rather than as the non-standard `Infinity`/`NaN` other readers reject.
+        text = json.dumps(_finite_or_null(manifest), indent=2, sort_keys=True, allow_nan=False)
+        (out / MANIFEST_FILENAME).write_text(text + "\n")
         return out
 
     @classmethod
@@ -260,11 +267,32 @@ def _empty(schema: Schema) -> pl.DataFrame:
 
 
 def build_transcript_model_map(design: Design) -> pl.DataFrame:
-    """Join design coordinates onto the transcript-to-model mapping."""
-    coordinates = design.loci.select("locus_id", "contig", "strand", pl.col("start"), pl.col("end"))
+    """The transcript-to-model mapping with each transcript's own coordinates.
+
+    One row per transcript, so `start`/`end` are that transcript's 0-based
+    half-open span -- as DENR keeps each transcript's own range alongside its
+    group and model. They used to be the *locus* span, repeated for every
+    transcript in it. A design pickled before `Design.transcripts` existed
+    has no per-transcript coordinates and still gets the locus span, with a
+    warning.
+    """
+    transcripts = getattr(design, "transcripts", None)
+    if transcripts is not None:
+        spans = transcripts.select("transcript_id", "start", "end")
+        loci = design.loci.select("locus_id", "contig", "strand")
+        joined = design.transcript_map.join(spans, on="transcript_id", how="left").join(
+            loci, on="locus_id", how="left"
+        )
+    else:
+        warnings.warn(
+            "design predates per-transcript coordinates; transcript_model_map "
+            "start/end are the locus span. Rebuild the design to get each transcript's.",
+            stacklevel=3,
+        )
+        loci = design.loci.select("locus_id", "contig", "strand", "start", "end")
+        joined = design.transcript_map.join(loci, on="locus_id", how="left")
     return (
-        design.transcript_map.join(coordinates, on="locus_id", how="left")
-        .select(
+        joined.select(
             "transcript_id",
             "gene_id",
             "locus_id",
@@ -287,6 +315,7 @@ def collect_results(
     samples: list[tuple[SampleCounts, list[LocusFit]]],
     *,
     provenance: dict[str, Any] | None = None,
+    conditioning: Sequence[LocusConditioning] | None = None,
 ) -> FitResult:
     """Assemble per-locus fits into the versioned output tables.
 
@@ -295,6 +324,10 @@ def collect_results(
         samples: One ``(counts, fits)`` pair per sample, where ``fits`` is
             indexed by ``locus_id``.
         provenance: Extra fields to merge into the manifest.
+        conditioning: ``assess(design.models[i], design.mask(i))`` for every
+            locus, if already computed (`dienr.pipeline.fit` does it in its
+            workers). Otherwise computed here, once per locus: it depends on
+            the design alone, so it is the same for every sample.
 
     Returns:
         A `FitResult`.
@@ -304,6 +337,17 @@ def collect_results(
             or if its fit list does not cover every locus.
     """
     from .diagnostics import assess, residual_sum_of_squares
+
+    if conditioning is None:
+        conditioning = (
+            [assess(design.models[i], design.mask(i)) for i in range(design.n_loci)]
+            if samples
+            else []
+        )
+    elif len(conditioning) != design.n_loci:
+        raise ValueError(
+            f"conditioning covers {len(conditioning)} loci, design has {design.n_loci}"
+        )
 
     abundance_rows: list[dict[str, Any]] = []
     qc_rows: list[dict[str, Any]] = []
@@ -334,15 +378,27 @@ def collect_results(
         for locus_id, fit in enumerate(fits):
             models = design.models[locus_id]
             observed = counts.values[locus_id]
-            conditioning = assess(models, design.mask(locus_id))
+            locus_conditioning = conditioning[locus_id]
 
             if is_failure(fit.status):
                 total_fitted = float("nan")
                 rss = float("nan")
                 total_observed = float("nan")
             else:
-                total_fitted = float((models @ fit.abundance).sum())
-                rss = residual_sum_of_squares(models, fit.abundance, observed)
+                # A count-likelihood fit reports its own, on the exposure it
+                # was fitted under; otherwise the mean is plain ``M a``. NaN
+                # marks a model with no unmasked bins: its column is zero.
+                estimate = nan_to_zero(fit.abundance)
+                total_fitted = (
+                    fit.fitted_total
+                    if fit.fitted_total is not None
+                    else float((models @ estimate).sum())
+                )
+                rss = (
+                    fit.residual_sum_of_squares
+                    if fit.residual_sum_of_squares is not None
+                    else residual_sum_of_squares(models, estimate, observed)
+                )
                 # Signal in the bins the fit actually used. Masked bins are
                 # already zeroed in `observed`, so this is not locus coverage;
                 # `total_observed_all_bins` alongside it is.
@@ -353,12 +409,12 @@ def collect_results(
                     "sample_id": counts.sample_id,
                     "locus_id": locus_id,
                     "locus_name": locus_names[locus_id],
-                    "n_bins": conditioning.n_bins,
-                    "n_unmasked_bins": conditioning.n_unmasked_bins,
+                    "n_bins": locus_conditioning.n_bins,
+                    "n_unmasked_bins": locus_conditioning.n_unmasked_bins,
                     "n_models_before_collapse": before_collapse[locus_id],
-                    "n_models_after_collapse": conditioning.n_models,
-                    "matrix_rank": conditioning.matrix_rank,
-                    "condition_number": conditioning.condition_number,
+                    "n_models_after_collapse": locus_conditioning.n_models,
+                    "matrix_rank": locus_conditioning.matrix_rank,
+                    "condition_number": locus_conditioning.condition_number,
                     "total_observed": total_observed,
                     "total_observed_all_bins": (
                         counts.totals_all_bins[locus_id]
@@ -369,7 +425,7 @@ def collect_results(
                     "total_fitted": total_fitted,
                     "residual_sum_of_squares": rss,
                     "gradient_norm": fit.gradient_norm,
-                    "solver_status": _qualified_status(fit.status, conditioning),
+                    "solver_status": _qualified_status(fit.status, locus_conditioning),
                     "failure_reason": fit.failure_reason,
                 }
             )
@@ -395,9 +451,15 @@ def collect_results(
                         "abundance_normalized": None,
                         "normalization_method": None,
                         "equivalence_class_size": class_sizes[key],
-                        "solver_status": str(fit.status),
+                        # The same qualified status as the locus's QC row:
+                        # the raw one said `ok` where QC said `rank_deficient`.
+                        "solver_status": _qualified_status(fit.status, locus_conditioning),
                         "objective": fit.objective,
-                        "penalty_value": 0.0,
+                        # The penalty's share of `objective`; it was hard-coded
+                        # to 0.0 even under ridge or lasso.
+                        "penalty_value": (
+                            float("nan") if is_failure(fit.status) else fit.penalty_value
+                        ),
                         "iterations": fit.iterations,
                         "converged": fit.converged,
                     }
@@ -438,6 +500,17 @@ def collect_results(
         normalization_factors=_empty(NORMALIZATION_FACTORS_SCHEMA),
         provenance=manifest,
     )
+
+
+def _finite_or_null(value: Any) -> Any:
+    """`value` with every non-finite float, at any depth, replaced by None."""
+    if isinstance(value, float):
+        return value if np.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _finite_or_null(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_finite_or_null(item) for item in value]
+    return value
 
 
 def _qualified_status(status: FitStatus, conditioning: Any) -> str:

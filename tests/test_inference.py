@@ -199,3 +199,78 @@ def test_non_finite_abundance_gives_nan():
 
 def test_empty_model_set_is_handled():
     assert inference.standard_errors(np.zeros((10, 0)), np.zeros(0)).size == 0
+
+
+def _graded_locus(seed: int, n_bins: int = 60, n_models: int = 3):
+    rng = np.random.default_rng(seed)
+    models = rng.uniform(0.2, 3.0, size=(n_bins, n_models))
+    models *= rng.uniform(size=(n_bins, n_models)) > 0.35
+    models[:5, 0] = 1.0  # every column keeps some support
+    models[-5:, -1] = 1.0
+    truth = rng.uniform(1.0, 8.0, size=n_models)
+    return models, rng, truth
+
+
+EXPOSURES = {
+    "unit": lambda n, rng: Exposure(),
+    "sample_scale": lambda n, rng: Exposure(sample_scale=3.0),
+    "bin_exposure": lambda n, rng: Exposure(bin_exposure=np.full(n, 250.0)),
+    "background": lambda n, rng: Exposure(sample_scale=2.0, background=rng.uniform(0.1, 1.0, n)),
+}
+
+
+@pytest.mark.parametrize("exposure_name", sorted(EXPOSURES))
+@pytest.mark.parametrize("pin", [False, True])
+def test_fit_locus_with_mean_hands_on_exactly_what_would_be_recomputed(exposure_name, pin):
+    """The kept mean must be bit-identical to rebuilding it (plan 14.7)."""
+    from dienr.solvers._glm import mean, usable_bins
+
+    models, rng, truth = _graded_locus(11)
+    n_bins, n_models = models.shape
+    exposure = EXPOSURES[exposure_name](n_bins, rng)
+    observed = rng.poisson(exposure.scale(n_bins) * (models @ truth) + exposure.offset(n_bins))
+    observed = observed.astype(np.float64)
+    inactive = np.array([False, True, False]) if pin else None
+
+    fit, kept = poisson.fit_locus_with_mean(models, observed, exposure=exposure, inactive=inactive)
+    assert kept is not None and fit.status.value == "ok"
+    scale, offset = exposure.scale(n_bins), exposure.offset(n_bins)
+    np.testing.assert_array_equal(kept.raw, scale * (models @ fit.abundance) + offset)
+    np.testing.assert_array_equal(kept.floored, mean(fit.abundance, models, scale, offset))
+    np.testing.assert_array_equal(kept.usable, usable_bins(models, exposure, inactive))
+
+    plain = poisson.fit_locus(models, observed, exposure=exposure, inactive=inactive)
+    np.testing.assert_array_equal(plain.abundance, fit.abundance)
+    assert plain.fitted_total == fit.fitted_total
+    assert plain.residual_sum_of_squares == fit.residual_sum_of_squares
+    assert plain.penalty_value == fit.penalty_value
+    assert plain.status is fit.status and plain.objective == fit.objective
+    assert plain.fitted_total == float((scale * (models @ fit.abundance) + offset).sum())
+
+    recomputed = inference.dispersion_term(
+        models, observed, fit.abundance, exposure=exposure, pinned=inactive
+    )
+    reused = inference.dispersion_term(
+        models,
+        observed,
+        fit.abundance,
+        exposure=exposure,
+        pinned=inactive,
+        fitted=kept.floored,
+        usable=kept.usable,
+    )
+    assert reused == recomputed
+
+
+def test_fit_locus_with_mean_keeps_nothing_on_shortcuts():
+    """Shortcut and failure paths carry no mean; callers recompute."""
+    models, rng, _ = _graded_locus(5)
+    single = models[:, :1]
+    _, kept = poisson.fit_locus_with_mean(single, rng.poisson(4.0, size=single.shape[0]) * 1.0)
+    assert kept is None  # single-model closed form
+    _, kept = poisson.fit_locus_with_mean(models, np.zeros(models.shape[0]))
+    assert kept is None  # all-zero locus
+    unsupported = models.copy()
+    unsupported[:, 1] = 0.0
+    _, kept = poisson.fit_locus_with_mean(unsupported, rng.poisson(4.0, size=models.shape[0]) * 1.0)
+    assert kept is None  # a model with no support goes through fit_supported_models

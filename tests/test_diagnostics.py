@@ -53,10 +53,21 @@ def test_all_masked_locus_is_flagged_not_crashed():
     assert result.n_unmasked_bins == 0
 
 
-def test_zero_column_is_rank_deficient():
-    """The all-zero model produced by a sub-bin transcript."""
-    models = np.zeros((4, 2))
+def test_zero_column_does_not_make_the_other_models_rank_deficient():
+    """The all-zero model of a sub-bin or fully masked transcript.
+
+    The solvers report it unestimated (NaN), so conditioning judges the models
+    that are estimated. It used to flag the locus rank-deficient, which made
+    every identifiable model's row read ``rank_deficient`` too.
+    """
+    models = np.zeros((4, 3))
     models[:, 0] = 1.0
+    models[2:, 1] = 1.0
+    result = assess(models)
+    assert result.n_models == 3
+    assert not result.rank_deficient
+    assert np.isfinite(result.condition_number)
+    models[:, 1] = models[:, 0]  # now genuinely collinear
     assert assess(models).rank_deficient
 
 

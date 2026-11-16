@@ -6,7 +6,14 @@ import numpy as np
 import pytest
 
 from dienr.solvers import penalties, poisson
-from dienr.solvers._glm import MU_FLOOR, Exposure, usable_bins
+from dienr.solvers._glm import (
+    MU_FLOOR,
+    Exposure,
+    abundance_unit,
+    moment_initialization,
+    nan_to_zero,
+    usable_bins,
+)
 from dienr.status import FitStatus, is_failure
 
 
@@ -136,6 +143,38 @@ def test_exposure_rescales_abundance_not_signal(design):
     np.testing.assert_allclose(with_exposure.abundance, truth, rtol=0.15)
     # Ignoring the exposure inflates the estimate by roughly that factor.
     np.testing.assert_allclose(without.abundance / scale, with_exposure.abundance, rtol=0.05)
+
+
+@pytest.mark.parametrize("power", [-6, 3, 13, 23, 33])
+def test_fit_is_exactly_equivariant_in_a_power_of_two_exposure(design, power):
+    """Exposure ``2**k`` must divide out of the estimate exactly.
+
+    The solver optimizes ``a * abundance_unit``, a power of two, so at such an
+    exposure it solves the unit-exposure problem bit for bit. Before, the
+    unscaled problem broke at large exposure: at 1e7 two models with truth
+    [22.25, 19.87] came back [59.0, 59.0] after one iteration, reported ``ok``.
+    """
+    observed = simulate(design, np.array([20.0, 35.0]), seed=2)
+    unit = poisson.fit_locus(design, observed)
+    scaled = poisson.fit_locus(design, observed, exposure=Exposure(sample_scale=2.0**power))
+    assert scaled.status is FitStatus.OK
+    np.testing.assert_array_equal(scaled.abundance * 2.0**power, unit.abundance)
+
+
+@pytest.mark.parametrize(
+    ("sample_scale", "bin_length"), [(1e7, None), (1e9, None), (1e4, 250.0), (30.0, 250.0)]
+)
+def test_large_exposure_recovers_the_unit_exposure_fit(design, sample_scale, bin_length):
+    """A library size in reads, or bin exposure, is a realistic exposure scale."""
+    observed = simulate(design, np.array([20.0, 35.0]), seed=2)
+    unit = poisson.fit_locus(design, observed)
+    bins = None if bin_length is None else np.full(design.shape[0], bin_length)
+    fit = poisson.fit_locus(
+        design, observed, exposure=Exposure(sample_scale=sample_scale, bin_exposure=bins)
+    )
+    assert fit.status is FitStatus.OK
+    total = sample_scale * (1.0 if bin_length is None else bin_length)
+    np.testing.assert_allclose(fit.abundance * total, unit.abundance, rtol=1e-4)
 
 
 def test_bin_exposure_accounts_for_partial_terminal_bins(design):
@@ -397,6 +436,8 @@ def test_pinned_model_does_not_abort_the_locus(design):
     assert result.abundance[1] > 0.0
     # The surviving model is estimated from the bins it actually covers.
     assert result.abundance[1] == pytest.approx(60.0, rel=0.25)
+    # Converged: the pinned model's gradient is not part of the norm.
+    assert result.gradient_norm < 1e-3
 
 
 def test_pinning_every_model_leaves_nothing_to_fit(design):
@@ -720,3 +761,37 @@ def test_single_model_fast_path_leaves_short_circuits_alone():
     assert poisson.fit_locus(column, np.zeros(64)).status is FitStatus.ALL_ZERO
     pinned = poisson.fit_locus(column, np.ones(64), inactive=np.array([True]))
     assert pinned.status is FitStatus.INSUFFICIENT_BINS
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        [1.0, 2.5, 0.0],
+        [np.nan, 2.0, np.nan],
+        [np.inf, np.nan, -np.inf, 3.0],
+        [],
+    ],
+)
+def test_nan_to_zero_matches_nan_to_num(values):
+    """The fast path must be `np.nan_to_num(x, nan=0.0)` exactly (plan 14.7)."""
+    x = np.array(values, dtype=np.float64)
+    np.testing.assert_array_equal(nan_to_zero(x), np.nan_to_num(x, nan=0.0))
+
+
+def test_nan_to_zero_returns_finite_input_uncopied():
+    x = np.array([1.0, 2.0])
+    assert nan_to_zero(x) is x
+
+
+def test_moment_initialization_with_precomputed_unit_is_identical():
+    """`_fit_locus` passes the unit it already computed; the start must not move."""
+    rng = np.random.default_rng(3)
+    models = rng.uniform(0, 40, size=(30, 3)) * (rng.uniform(size=(30, 3)) > 0.4)
+    observed = rng.poisson(20, size=30).astype(np.float64)
+    scale = np.full(30, 250.0)
+    offset = np.zeros(30)
+    unit = abundance_unit(models, scale)
+    np.testing.assert_array_equal(
+        moment_initialization(models, observed, scale, offset, unit=unit),
+        moment_initialization(models, observed, scale, offset),
+    )

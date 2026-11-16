@@ -570,9 +570,10 @@ way round and that the training genes are expressed.
 **Gene selection is geometric, not model-based.** The reference scored per-base
 agreement between the annotation and observed transcription
 (`percent_match`, `percent_transcribed`). `dienr` requires a training gene to
-be the longest in its locus and to fill at least `min_locus_fraction` of it,
-which excludes genes whose signal a neighbour would contaminate without needing
-a threshold on the signal itself. `min_covered_fraction` and `min_mean_signal`
+be the longest in its locus, to fill at least `min_locus_fraction` of it, and
+to share it with no other gene (its own shorter isoforms are allowed). Loci are
+formed from every transcript, however short. That excludes genes whose signal a
+neighbour would contaminate without needing a threshold on the signal itself. `min_covered_fraction` and `min_mean_signal`
 then require the gene to be expressed. Same intent, fewer knobs — but not the
 same selection, so a profile is not expected to match DENR's numerically even
 with every bug above fixed.

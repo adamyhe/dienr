@@ -29,11 +29,12 @@ likewise NaN.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import numpy as np
 
-from ._glm import MU_FLOOR, Exposure, mean, pearson_residuals, usable_bins
+from ._glm import MU_FLOOR, Exposure, mean, nan_to_zero, pearson_residuals, usable_bins
 
 #: Abundance at or below which a model counts as sitting on the boundary.
 #: Scaled against the largest estimate in the locus, so it adapts to the count
@@ -87,14 +88,18 @@ class DispersionEstimate:
         """
         return self.dispersion > 1.0 + z * self.standard_error
 
-    def describe(self) -> dict[str, float | str]:
+    def describe(self) -> dict[str, float | str | None]:
         """Provenance record, so a reported error is never unattributed."""
         return {
             "dispersion": self.dispersion,
             "dispersion_method": "quasi_poisson_pearson_pooled",
             "dispersion_n_bins": float(self.n_bins),
             "dispersion_degrees_of_freedom": float(self.degrees_of_freedom),
-            "dispersion_standard_error": self.standard_error,
+            # None, not infinity, when there are no degrees of freedom (the
+            # assumed Poisson dispersion): infinity is not valid strict JSON.
+            "dispersion_standard_error": (
+                self.standard_error if np.isfinite(self.standard_error) else None
+            ),
             "overdispersion_detected": float(self.is_overdispersed()),
         }
 
@@ -125,24 +130,87 @@ def estimate_quasi_poisson_dispersion(
         usable degrees of freedom, which is the correct answer: no evidence of
         overdispersion means no adjustment.
     """
+    return pool_dispersion(
+        dispersion_term(
+            models,
+            observed,
+            abundance,
+            exposure=exposures[index] if exposures is not None else None,
+        )
+        for index, (models, observed, abundance) in enumerate(loci)
+    )
+
+
+@dataclass(frozen=True)
+class DispersionTerm:
+    """One locus's contribution to the pooled dispersion.
+
+    Split out so each term can be computed where the locus was fitted -- in a
+    worker process -- and only these three numbers sent back for pooling.
+    """
+
+    chi_squared: float
+    n_bins: int
+    n_parameters: int
+
+
+def dispersion_term(
+    models: np.ndarray,
+    observed: np.ndarray,
+    abundance: np.ndarray,
+    *,
+    exposure: Exposure | None = None,
+    pinned: np.ndarray | None = None,
+    fitted: np.ndarray | None = None,
+    usable: np.ndarray | None = None,
+) -> DispersionTerm | None:
+    """One completed Poisson fit's Pearson statistic, or None if it has no usable bins.
+
+    `pinned` must be the models the fit held at zero: the fit excluded bins
+    only they reach, and so must this. Counting them put ``mu = MU_FLOOR``
+    against real counts, and one pinned model took a pooled phi of 0.91 to
+    1.5e14 -- and with it every standard error in the run.
+
+    `fitted` (the floored mean, as `_glm.mean` computes it) and `usable` may be
+    passed when the fit already has them -- `poisson.fit_locus_with_mean` does
+    -- and must then be exactly what this function would compute (plan 14.7).
+    """
+    exposure = exposure or Exposure()
+    n_bins = models.shape[0]
+    if usable is None:
+        usable = usable_bins(models, exposure, pinned)
+    if not usable.any():
+        return None
+    # NaN marks a model with no unmasked bins; its column is zero.
+    abundance = nan_to_zero(abundance)
+    if fitted is None:
+        fitted = mean(abundance, models, exposure.scale(n_bins), exposure.offset(n_bins))
+    residuals = pearson_residuals(observed, fitted, usable)
+    return DispersionTerm(
+        chi_squared=float(residuals @ residuals),
+        n_bins=int(usable.sum()),
+        # Free parameters, not columns: a model pinned at zero consumed no
+        # degree of freedom.
+        n_parameters=int(np.count_nonzero(abundance)),
+    )
+
+
+def pool_dispersion(terms: Iterable[DispersionTerm | None]) -> DispersionEstimate:
+    """Pool per-locus terms into one dispersion; see `estimate_quasi_poisson_dispersion`.
+
+    Terms are summed in the order given, so the same loci in the same order
+    give a bit-identical estimate wherever each term was computed.
+    """
     chi_squared = 0.0
     total_bins = 0
     total_parameters = 0
     contributing = 0
-
-    for index, (models, observed, abundance) in enumerate(loci):
-        exposure = exposures[index] if exposures is not None else Exposure()
-        n_bins = models.shape[0]
-        usable = usable_bins(models, exposure)
-        if not usable.any():
+    for term in terms:
+        if term is None:
             continue
-        fitted = mean(abundance, models, exposure.scale(n_bins), exposure.offset(n_bins))
-        residuals = pearson_residuals(observed, fitted, usable)
-        chi_squared += float(residuals @ residuals)
-        total_bins += int(usable.sum())
-        # Free parameters, not columns: a model pinned at zero consumed no
-        # degree of freedom.
-        total_parameters += int(np.count_nonzero(abundance))
+        chi_squared += term.chi_squared
+        total_bins += term.n_bins
+        total_parameters += term.n_parameters
         contributing += 1
 
     degrees_of_freedom = total_bins - total_parameters
@@ -212,11 +280,16 @@ def standard_errors(
     abundance = np.asarray(abundance, dtype=np.float64)
     n_models = abundance.size
     errors = np.full(n_models, np.nan)
-    if n_models == 0 or not np.all(np.isfinite(abundance)):
+    # A NaN entry is a model with no unmasked bins (an all-zero column, not
+    # estimated); it carries no information and is left out like a boundary
+    # one. Anything else non-finite means the fit itself is unusable.
+    estimated = ~np.isnan(abundance)
+    if n_models == 0 or not estimated.any() or not np.all(np.isfinite(abundance[estimated])):
         return errors
+    abundance = np.where(estimated, abundance, 0.0)
 
-    largest = float(np.max(abundance)) if n_models else 0.0
-    interior = abundance > max(largest, 1.0) * BOUNDARY_RELATIVE_TOLERANCE
+    largest = float(np.max(abundance[estimated]))
+    interior = estimated & (abundance > max(largest, 1.0) * BOUNDARY_RELATIVE_TOLERANCE)
     if not interior.any():
         return errors
 

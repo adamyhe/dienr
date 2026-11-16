@@ -389,7 +389,6 @@ def test_count_sample_batched_equals_per_locus(random_signal, monkeypatch, summa
     monkeypatch.setattr(counts_module, "MAX_CHUNK_BYTES", 1)
     one_per_call = count_sample(design, "s", signal, summary=summary, n_jobs=1)
 
-    lengths = declared_contigs(random_signal)
     for locus in design.loci.iter_rows(named=True):
         locus_id = locus["locus_id"]
         n_bins = design.bin_count(locus_id)
@@ -398,7 +397,8 @@ def test_count_sample_batched_equals_per_locus(random_signal, monkeypatch, summa
             random_signal,
             locus["contig"],
             start,
-            min(start + n_bins * 250, lengths[locus["contig"]]),
+            # The full window: past the contig end is uncovered, never squeezed.
+            start + n_bins * 250,
             n_bins,
             summary=summary,
         )
@@ -430,3 +430,47 @@ def test_importing_dienr_does_not_load_figwig_or_numba():
         "assert not loaded, loaded\n"
     )
     subprocess.run([sys.executable, "-c", code], check=True)
+
+
+@pytest.mark.parametrize("summary", ["sum", "mean"])
+def test_window_past_the_contig_end_keeps_the_design_bin_width(tmp_path, summary):
+    """Bins must stay `bin_size` wide when a window overruns the contig end.
+
+    The overrun path once passed the contig length as the window end with the
+    design's bin count, so the on-contig bases were spread across every bin:
+    250 reads in the first bin came back as ``[220, 30, 0, 0, 0]``.
+    """
+    size = 10_100
+    path = write_intervals(tmp_path / "p.bw", {"c": size}, [("c", 9_000, 9_250, 1.0)])
+    frame = pl.DataFrame(
+        {
+            "transcript_id": ["edge"],
+            "contig": ["c"],
+            "start": [9_000],
+            "end": [10_100],
+            "strand": ["+"],
+        }
+    )
+    design = build_design(Annotation.from_frame(frame), bin_size=250)
+    assert design.window_start(0) + design.bin_count(0) * 250 > size  # does overrun
+    counts = count_sample(design, "s", SignalFile(path, "+"), summary=summary)
+    expected = [250.0 if summary == "sum" else 1.0, 0.0, 0.0, 0.0, 0.0]
+    np.testing.assert_array_equal(counts.values[0], expected)
+
+
+@pytest.mark.parametrize("summary", ["min", "max", "sum", "mean"])
+def test_negatively_signed_file_summarizes_like_its_magnitude(tmp_path, summary):
+    """The magnitude is taken per base: on a negative file `min`/`max` were swapped."""
+    intervals = [("c", 0, 100, 1.0), ("c", 100, 250, 5.0), ("c", 250, 500, 2.0)]
+    positive = write_intervals(tmp_path / "pos.bw", {"c": 5_000}, intervals)
+    negative = write_intervals(
+        tmp_path / "neg.bw", {"c": 5_000}, [(c, a, b, -v) for c, a, b, v in intervals]
+    )
+    single = [read_binned(p, "c", 0, 500, 2, summary=summary) for p in (positive, negative)]
+    np.testing.assert_array_equal(single[0], single[1])
+    batched = [
+        read_loci_binned(BigWigReader(str(p)), [("c", 0, 2)], 250, summary=summary)[0]
+        for p in (positive, negative)
+    ]
+    np.testing.assert_array_equal(batched[0], batched[1])
+    np.testing.assert_array_equal(batched[0], single[0])

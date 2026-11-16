@@ -481,6 +481,7 @@ def test_bin_exposure_is_passed_through(design):
     assert result.summary.n_failures == 0
 
 
+@pytest.mark.filterwarnings("ignore:design predates per-transcript coordinates")
 def test_ill_conditioned_locus_is_escalated_from_ok():
     """The conditioning escalation for near-collinear, full-rank designs.
 
@@ -617,7 +618,9 @@ def test_blas_cap_is_active_while_fitting(design, monkeypatch):
         pytest.skip("no BLAS library visible to threadpoolctl (e.g. Accelerate)")
     seen: list[int] = []
     calls = 0
-    original = pipeline.poisson.fit_locus
+    # The pipeline fits through `fit_locus_with_mean`, which keeps the mean
+    # for the dispersion term (plan 14.7).
+    original = pipeline.poisson.fit_locus_with_mean
 
     def spy(*args, **kwargs):
         nonlocal calls
@@ -625,7 +628,7 @@ def test_blas_cap_is_active_while_fitting(design, monkeypatch):
         seen.extend(i["num_threads"] for i in threadpool_info() if i["user_api"] == "blas")
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(pipeline.poisson, "fit_locus", spy)
+    monkeypatch.setattr(pipeline.poisson, "fit_locus_with_mean", spy)
     fit(design, synthetic_counts(design), likelihood="poisson", blas_threads=1)
     assert calls > 0
     assert seen and set(seen) == {1}
@@ -711,3 +714,215 @@ def test_log_offset_is_recorded_and_only_for_the_log_objective(design):
     assert result.provenance["log_offset"] == 0.01
     with pytest.raises(ValueError, match="log_offset"):
         fit(design, synthetic_counts(design), likelihood="poisson", log_offset=0.01)
+
+
+# --- serial work around the parallel fit (plan 14.6) ------------------------------
+
+
+def test_conditioning_is_assessed_once_per_locus_not_per_sample(design, monkeypatch):
+    """It depends on the design alone; per sample it repeated the same SVDs."""
+    from dienr import diagnostics, pipeline
+
+    calls = 0
+    original = diagnostics.assess
+
+    def counting(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "assess", counting)
+    monkeypatch.setattr(diagnostics, "assess", counting)
+    samples = [synthetic_counts(design, sample_id) for sample_id in ("a", "b", "c")]
+    fit(design, samples)
+    assert calls == design.n_loci
+
+    calls = 0
+    fits = [
+        [fit_locus(design.models[i], s.values[i]) for i in range(design.n_loci)] for s in samples
+    ]
+    collect_results(design, list(zip(samples, fits, strict=True)))
+    assert calls == design.n_loci
+
+
+def test_collect_results_rejects_conditioning_for_the_wrong_number_of_loci(design):
+    counts = synthetic_counts(design)
+    fits = [fit_locus(design.models[i], counts.values[i]) for i in range(design.n_loci)]
+    with pytest.raises(ValueError, match="conditioning covers"):
+        collect_results(design, [(counts, fits)], conditioning=[])
+
+
+def test_parallel_quasi_poisson_errors_match_serial_with_exposure(design):
+    """The standard-error pass runs on the workers; exposure must reach it."""
+    samples = [
+        replace(
+            synthetic_counts(design, sample_id, scale=scale),
+            exposure=scale,
+            provenance={"summary": "sum"},
+        )
+        for sample_id, scale in (("a", 1.0), ("b", 2.5))
+    ]
+    serial = fit(design, samples, likelihood="quasi_poisson", use_bin_exposure=True)
+    parallel = fit(design, samples, likelihood="quasi_poisson", use_bin_exposure=True, n_jobs=3)
+    assert parallel.model_abundance.equals(serial.model_abundance)
+    assert parallel.locus_qc.equals(serial.locus_qc)
+    assert serial.model_abundance["abundance_standard_error"].is_not_nan().any()
+
+
+@pytest.mark.parametrize(
+    ("sample_scale", "use_bin_exposure"), [(1.0, False), (3.0, False), (1.0, True), (2.0, True)]
+)
+def test_pooled_dispersion_is_one_for_poisson_counts_under_any_exposure(
+    design, sample_scale, use_bin_exposure
+):
+    """The dispersion must be evaluated at the exposure each locus was fitted under.
+
+    It once ignored exposure: Pearson residuals were taken against ``M a``
+    instead of ``c e M a``, so exactly-Poisson counts gave phi ~22 at a sample
+    scale of 3 and ~3e5 with 250 bp bin exposure, inflating every quasi-Poisson
+    standard error by its square root (plan 14.6).
+    """
+    rng = np.random.default_rng(11)
+    values = []
+    for locus_id in range(design.n_loci):
+        models = design.models[locus_id]
+        bin_exposure = design.bin_lengths[locus_id] if use_bin_exposure else 1.0
+        expected = sample_scale * bin_exposure * (models @ np.full(models.shape[1], 40.0))
+        values.append(rng.poisson(expected).astype(np.float64))
+    template = synthetic_counts(design)
+    counts = replace(template, values=values, exposure=sample_scale, provenance={"summary": "sum"})
+
+    result = fit(design, counts, likelihood="quasi_poisson", use_bin_exposure=use_bin_exposure)
+    dispersion = result.provenance["dispersion"]
+    noise = result.provenance["dispersion_standard_error"]
+    assert result.provenance["dispersion_degrees_of_freedom"] >= 20
+    assert abs(dispersion - 1.0) < 4 * noise
+
+
+def test_pinned_models_do_not_inflate_the_pooled_dispersion(design):
+    """Bins only a pinned model reaches were excluded from the fit, so from phi too.
+
+    Counting them, with ``mu = MU_FLOOR`` against real counts, took phi from
+    0.91 to 1.5e14 and every standard error in the run with it (plan 14.6).
+    """
+    rng = np.random.default_rng(5)
+    values = [rng.poisson(m @ np.full(m.shape[1], 40.0)).astype(np.float64) for m in design.models]
+    counts = replace(synthetic_counts(design), values=values, provenance={"summary": "sum"})
+    free = fit(design, counts, likelihood="quasi_poisson")
+    # "b" alone reaches the 2-4 kb bins, so pinning it leaves them unexplained.
+    pinned = fit(design, counts, likelihood="quasi_poisson", inactive_transcripts={"b"})
+    for result in (free, pinned):
+        noise = result.provenance["dispersion_standard_error"]
+        assert abs(result.provenance["dispersion"] - 1.0) < 4 * noise
+
+
+@pytest.mark.parametrize("likelihood", ["legacy", "poisson", "quasi_poisson"])
+def test_model_with_no_unmasked_bins_is_nan_and_spares_the_others(likelihood):
+    """A transcript entirely inside masked bins has no estimate, not a made-up one.
+
+    It used to come back as Poisson's start (2.8e-5) or legacy's 0.0 with status
+    ``ok``, and as an interior parameter it made the information matrix
+    singular, so the identifiable models lost their standard errors.
+    """
+    frame = pl.DataFrame(
+        {
+            "transcript_id": ["a", "b", "masked"],
+            "gene_id": ["g", "g", "g"],
+            "contig": ["chr1", "chr1", "chr1"],
+            "start": [0, 0, 0],
+            "end": [5000, 8000, 250],
+            "strand": ["+", "+", "+"],
+        }
+    )
+    with_masked = build_design(Annotation.from_frame(frame), bin_size=250, mask_start_bins=(1, 1))
+    without = build_design(
+        Annotation.from_frame(frame.head(2)), bin_size=250, mask_start_bins=(1, 1)
+    )
+    assert with_masked.unsupported_models.height == 1
+    rng = np.random.default_rng(1)
+    observed = rng.poisson(without.models[0] @ np.array([20.0, 15.0])).astype(np.float64)
+
+    def run(design):
+        counts = replace(synthetic_counts(design), values=[observed], provenance={"summary": "sum"})
+        return fit(design, counts, likelihood=likelihood).model_abundance.sort("model_index")
+
+    full, reference = run(with_masked), run(without)
+    masked_row = full.join(
+        with_masked.model_table.filter(~pl.col("has_support")).select("model_index"),
+        on="model_index",
+    )
+    assert masked_row["abundance_raw"].is_nan().all()
+    estimated = full.filter(pl.col("abundance_raw").is_not_nan())
+    # Same fit up to BLAS summation order (the reduced matrix is a fresh copy).
+    np.testing.assert_allclose(estimated["abundance_raw"], reference["abundance_raw"], rtol=1e-12)
+    assert (estimated["solver_status"] == "ok").all()
+    if likelihood != "legacy":
+        np.testing.assert_allclose(
+            estimated["abundance_standard_error"], reference["abundance_standard_error"], rtol=1e-9
+        )
+        assert estimated["abundance_standard_error"].is_not_nan().all()
+
+
+@pytest.mark.parametrize("likelihood", ["poisson", "quasi_poisson"])
+def test_fitted_signal_in_qc_is_on_the_scale_of_the_counts(design, likelihood):
+    """`total_fitted` and the RSS must use the mean the fit used, ``c e M a``.
+
+    They were computed as ``M a``: 1/c of the observed total at sample scale c.
+    At a power-of-two exposure the fit is exactly the unit fit rescaled, so the
+    fitted signal must be identical to the unit-exposure run's.
+    """
+    rng = np.random.default_rng(2)
+    values = [rng.poisson(m @ np.full(m.shape[1], 40.0)).astype(np.float64) for m in design.models]
+    base = replace(synthetic_counts(design), values=values, provenance={"summary": "sum"})
+    unit = fit(design, base, likelihood=likelihood).locus_qc
+    scaled = fit(design, replace(base, exposure=8.0), likelihood=likelihood).locus_qc
+    for column in ("total_fitted", "residual_sum_of_squares"):
+        np.testing.assert_array_equal(scaled[column], unit[column])
+    ratio = (unit["total_fitted"] / unit["total_observed"]).to_numpy()
+    np.testing.assert_allclose(ratio, 1.0, rtol=0.05)
+
+
+def test_penalty_value_reports_the_penalty_term(design):
+    """It was hard-coded to 0.0, even under ridge; `objective` includes it."""
+    from dienr.solvers import penalties
+
+    rng = np.random.default_rng(3)
+    values = [rng.poisson(m @ np.full(m.shape[1], 40.0)).astype(np.float64) for m in design.models]
+    counts = replace(synthetic_counts(design), values=values, provenance={"summary": "sum"})
+    penalty = penalties.ridge(0.01)
+    result = fit(design, counts, likelihood="poisson", penalty=penalty).model_abundance
+    for _, rows in result.group_by("locus_id"):
+        expected = penalty.value(rows.sort("model_index")["abundance_raw"].to_numpy())
+        assert expected > 0
+        assert (rows["penalty_value"] == expected).all()
+    unpenalized = fit(design, counts, likelihood="poisson").model_abundance
+    assert (unpenalized["penalty_value"] == 0.0).all()
+
+
+def test_inactive_count_covers_only_transcripts_in_the_design(design):
+    """A typo'd list pins nothing; the manifest must not report it as applied."""
+    counts = synthetic_counts(design)
+    with pytest.warns(UserWarning, match="1 of 2 inactive"):
+        result = fit(design, counts, inactive_transcripts={"c", "no_such_tx"})
+    assert result.provenance["n_inactive_transcripts"] == 1
+    assert result.provenance["n_inactive_transcripts_not_in_design"] == 1
+
+
+def test_manifest_is_strict_json(design, tmp_path):
+    """The assumed Poisson dispersion has no standard error: null, not Infinity."""
+    counts = replace(synthetic_counts(design), provenance={"summary": "sum"})
+    out = fit(design, counts, likelihood="poisson").write(tmp_path / "r")
+    text = (out / "manifest.json").read_text()
+    manifest = json.loads(text, parse_constant=lambda name: pytest.fail(f"non-strict {name}"))
+    assert manifest["dispersion_standard_error"] is None
+
+
+def test_transcript_map_carries_each_transcripts_own_coordinates(design):
+    """One row per transcript, so its span -- not the locus span, as it was."""
+    result = fit(design, synthetic_counts(design))
+    spans = {
+        row["transcript_id"]: (row["start"], row["end"])
+        for row in result.transcript_model_map.iter_rows(named=True)
+    }
+    # The fixture's transcripts, 0-based half-open: a and b share locus 0.
+    assert spans == {"a": (0, 2000), "b": (0, 4000), "c": (500_000, 502_000)}

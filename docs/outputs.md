@@ -12,7 +12,7 @@ back to its inputs. Read it back with `dienr.FitResult.read(directory)`.
 | `sample_id` | str | |
 | `locus_id`, `model_index` | u32 | the model's position in the design |
 | `model_id` | str | stable model identifier |
-| `abundance_raw` | f64 | the estimate; `NaN` for any failed fit |
+| `abundance_raw` | f64 | the estimate; `NaN` for any failed fit, and for a model with no unmasked bin (`has_support` false in the transcript map), which no data can estimate |
 | `abundance_standard_error` | f64 | `quasi_poisson`/`poisson` only; `NaN` where a Wald error is undefined; null for `legacy` |
 | `abundance_normalized`, `normalization_method` | f64, str | filled only by an explicit normalization step |
 | `equivalence_class_size` | u32 | transcripts sharing this model |
@@ -23,7 +23,7 @@ back to its inputs. Read it back with `dienr.FitResult.read(directory)`.
 ## `transcript_model_map.parquet`: one row per transcript
 
 `transcript_id`, `gene_id`, `locus_id`, `model_id`, `contig`, `start`, `end`
-(0-based, half-open), `strand`, `equivalence_class_size`,
+(the transcript's own span, 0-based, half-open), `strand`, `equivalence_class_size`,
 `exactly_identifiable`, `has_support` (whether the model occupies any bin at
 this bin size).
 

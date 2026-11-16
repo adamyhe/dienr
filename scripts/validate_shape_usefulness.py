@@ -43,6 +43,7 @@ from dienr.shape import ShapeConfig, apply_shape_profile, fit_shape_profile
 
 EXPRESSED = 1e-6
 PAPER_MASK = {"mask_start_bins": (1, 1), "mask_end_bins": (4, 4)}
+CONVERGED = ("ok", "rank_deficient", "ill_conditioned")
 
 #: (name, shape, likelihood, transform, summary)
 ARMS = (
@@ -134,7 +135,16 @@ def run_seed(sim: Path, *, min_models: int, span: float) -> dict:
             .join(n_models, on="locus_id")
             .filter((pl.col("n_models") >= min_models) & (pl.col("truth") > EXPRESSED))
         )
-        succeeded = table.filter(pl.col("solver_status") == "ok")
+        # Every converged fit, whatever its conditioning. Since defc652,
+        # solver_status carries the locus's conditioning qualifier, so "ok"
+        # alone dropped rank-deficient *binary* loci -- which shape, breaking
+        # the collinearity, keeps -- and scored the arms on different loci
+        # (plan 18.29).
+        ok = table.filter(pl.col("solver_status").is_in(CONVERGED))
+        # A model with no unmasked bins is reported NaN (unestimated), not zero:
+        # leaving it in made Spearman NaN and counted it in zero_fraction.
+        succeeded = ok.filter(pl.col("abundance_raw").is_not_nan())
+        n_unestimated = ok.height - succeeded.height
         estimate = succeeded["abundance_raw"].to_numpy()
         actual = succeeded["truth"].to_numpy()
         positive = estimate > 0
@@ -180,6 +190,7 @@ def run_seed(sim: Path, *, min_models: int, span: float) -> dict:
 
         per_arm[name] = {
             "n_models": float(succeeded.height),
+            "n_unestimated": float(n_unestimated),
             "n_loci_with_choice": float(dominant.height),
             "dominant_accuracy": float(hits.mean()) if hits.size else float("nan"),
             "isoform_spearman": spearman(estimate, actual),
@@ -259,6 +270,7 @@ def main(argv: list[str] | None = None) -> int:
         "isoform_spearman",
         "isoform_median_abs_log2",
         "zero_fraction",
+        "n_unestimated",
     ):
         print(f"  {metric}")
         for name in names:

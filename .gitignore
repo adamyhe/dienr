@@ -81,3 +81,6 @@ site/
 
 # ignore generated parity inputs
 build/
+
+# Claude Code per-user settings
+.claude/settings.local.json

@@ -23,13 +23,30 @@ term and no pseudocount is introduced anywhere.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
+
 import numpy as np
 from scipy.special import xlogy
 
 from ..status import FitStatus, is_failure
-from ._glm import MU_FLOOR, Exposure, mean, moment_initialization, usable_bins
+from ._glm import (
+    MU_FLOOR,
+    Exposure,
+    abundance_unit,
+    mean,
+    moment_initialization,
+    nan_to_zero,
+    usable_bins,
+)
 from ._lbfgsb import minimize_bounded
-from .legacy import _FREE_UPPER, _INACTIVE_UPPER, LocusFit, _short_circuit
+from .legacy import (
+    _FREE_UPPER,
+    _INACTIVE_UPPER,
+    LocusFit,
+    _short_circuit,
+    fit_supported_models,
+    free_gradient_norm,
+)
 from .penalties import NO_PENALTY, Penalty
 
 #: Threshold for declaring the fitted mean collapsed. An order of magnitude
@@ -235,6 +252,111 @@ def fit_locus(
     Returns:
         A `LocusFit`. Failures carry NaN abundance and a reason, never zeros.
     """
+    fit, _ = fit_locus_with_mean(
+        models,
+        observed,
+        exposure=exposure,
+        penalty=penalty,
+        inactive=inactive,
+        initial=initial,
+        max_iterations=max_iterations,
+        min_unmasked_bins=min_unmasked_bins,
+        prior_status=prior_status,
+    )
+    return fit
+
+
+@dataclass(frozen=True)
+class FittedMean:
+    """The mean a general-path fit ended at, kept for the work that follows it.
+
+    `raw` is ``c * e * (M a) + beta`` without the `MU_FLOOR` floor -- the
+    fitted signal on the scale of the counts -- and `usable` the bins the fit
+    used. `fit_locus`'s fitted total and `inference.dispersion_term` each
+    rebuilt both, once per locus (plan 14.7). Internal: it is not a field of
+    `LocusFit`, which every worker pickles back.
+    """
+
+    raw: np.ndarray
+    usable: np.ndarray
+
+    @property
+    def floored(self) -> np.ndarray:
+        """What `_glm.mean` returns for the same fit: `raw` floored at `MU_FLOOR`."""
+        return np.maximum(self.raw, MU_FLOOR)
+
+
+def fit_locus_with_mean(
+    models: np.ndarray,
+    observed: np.ndarray,
+    *,
+    exposure: Exposure | None = None,
+    penalty: Penalty = NO_PENALTY,
+    inactive: np.ndarray | None = None,
+    initial: np.ndarray | None = None,
+    max_iterations: int = 15_000,
+    min_unmasked_bins: int = 1,
+    prior_status: FitStatus | None = None,
+) -> tuple[LocusFit, FittedMean | None]:
+    """`fit_locus`, plus the fitted mean when the general path computed one.
+
+    The mean is None for failures and for every shortcut (single-model closed
+    form, all-zero locus, unsupported columns); callers recompute it then.
+    """
+    mean_out: list[FittedMean] = []
+    fit = _fit_locus(
+        models,
+        observed,
+        exposure=exposure,
+        penalty=penalty,
+        inactive=inactive,
+        initial=initial,
+        max_iterations=max_iterations,
+        min_unmasked_bins=min_unmasked_bins,
+        prior_status=prior_status,
+        mean_out=mean_out,
+    )
+    fitted_mean = mean_out[0] if mean_out else None
+    if is_failure(fit.status) or fit.fitted_total is not None:
+        return fit, fitted_mean
+    # Report the fitted signal on the scale of the counts. `collect_results`
+    # used to compute it as ``M a``, which ignores the exposure: 1/c of the
+    # observed total at sample scale c, 1/250 with 250 bp bin exposure.
+    estimate = nan_to_zero(fit.abundance)
+    if fitted_mean is not None:
+        fitted = fitted_mean.raw
+    else:
+        exposure = exposure or Exposure()
+        n_bins = models.shape[0]
+        fitted = exposure.scale(n_bins) * (models @ estimate) + exposure.offset(n_bins)
+    residual = observed - fitted
+    fit = replace(
+        fit,
+        fitted_total=float(fitted.sum()),
+        residual_sum_of_squares=float(residual @ residual),
+        penalty_value=penalty.value(estimate),
+    )
+    return fit, fitted_mean
+
+
+def _fit_locus(
+    models: np.ndarray,
+    observed: np.ndarray,
+    *,
+    exposure: Exposure | None = None,
+    penalty: Penalty = NO_PENALTY,
+    inactive: np.ndarray | None = None,
+    initial: np.ndarray | None = None,
+    max_iterations: int = 15_000,
+    min_unmasked_bins: int = 1,
+    prior_status: FitStatus | None = None,
+    mean_out: list[FittedMean] | None = None,
+) -> LocusFit:
+    """`fit_locus` without the fitted-signal summary.
+
+    A general-path fit that returns OK or NONCONVERGED appends its
+    `FittedMean` to `mean_out`; every other return leaves it empty.
+    """
     exposure = exposure or Exposure()
     n_bins, n_models = models.shape
 
@@ -242,6 +364,20 @@ def fit_locus(
         return _short_circuit(n_models, prior_status)
     if n_models == 0:
         return _short_circuit(0, FitStatus.INSUFFICIENT_BINS, "locus has no models")
+    unsupported = ~models.any(axis=0)
+    if unsupported.any() and not unsupported.all():
+        return fit_supported_models(
+            fit_locus,
+            models,
+            observed,
+            unsupported,
+            inactive=inactive,
+            initial=initial,
+            exposure=exposure,
+            penalty=penalty,
+            max_iterations=max_iterations,
+            min_unmasked_bins=min_unmasked_bins,
+        )
     if not np.all(np.isfinite(observed)):
         return _short_circuit(
             n_models, FitStatus.NUMERICAL_ERROR, "observed signal contains non-finite values"
@@ -304,20 +440,34 @@ def fit_locus(
         if single is not None:
             return single
 
+    unit = abundance_unit(models, scale)
     if initial is None:
-        start = moment_initialization(models, observed, scale, offset)
+        start = moment_initialization(models, observed, scale, offset, unit=unit)
     else:
         start = np.array(initial, dtype=np.float64)
     start[pinned] = 0.0
     upper = np.where(pinned, _INACTIVE_UPPER, _FREE_UPPER)
 
     fused = _value_and_grad(models, observed, exposure, penalty, pinned)
+    driven = fused
+    if unit != 1.0:
+        # Optimize b = a * unit, so the problem L-BFGS-B sees is O(1) whatever
+        # the exposure (see `abundance_unit`). The objective is unchanged; only
+        # the variable is rescaled, so penalties need no adjustment.
+
+        def driven(scaled: np.ndarray) -> tuple[float, np.ndarray]:
+            value, grad = fused(scaled / unit)
+            return value, grad / unit
+
     try:
         abundance, value, final_gradient, iterations, converged, message = minimize_bounded(
-            fused, start, np.zeros(n_models), upper, maxiter=max_iterations
+            driven, start * unit, np.zeros(n_models), upper * unit, maxiter=max_iterations
         )
     except (ValueError, FloatingPointError) as error:  # pragma: no cover - defensive
         return _short_circuit(n_models, FitStatus.NUMERICAL_ERROR, str(error))
+    if unit != 1.0:
+        abundance = abundance / unit
+        final_gradient = final_gradient * unit
 
     abundance[pinned] = 0.0
     if pinned.any():
@@ -328,7 +478,9 @@ def fit_locus(
             n_models, FitStatus.INVALID_MEAN, "optimizer returned non-finite abundance"
         )
 
-    mu = mean(abundance, models, scale, offset)
+    # `_glm.mean`'s expression, kept unfloored for the fitted total.
+    raw = scale * (models @ abundance) + offset
+    mu = np.maximum(raw, MU_FLOOR)
     if np.any(observed[usable] > 0) and np.any(mu[usable & (observed > 0)] <= MU_FLOOR_CHECK):
         # The mean collapsed where counts exist; the likelihood is unbounded
         # there and the estimate is meaningless.
@@ -338,11 +490,13 @@ def fit_locus(
             "fitted mean vanished in a bin with nonzero counts",
         )
 
+    if mean_out is not None:
+        mean_out.append(FittedMean(raw=raw, usable=usable))
     return LocusFit(
         abundance=abundance,
         status=FitStatus.OK if converged else FitStatus.NONCONVERGED,
         objective=value,
-        gradient_norm=float(np.abs(final_gradient).max()) if n_models else 0.0,
+        gradient_norm=free_gradient_norm(final_gradient, pinned),
         iterations=iterations,
         converged=converged,
         message=message,

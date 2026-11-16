@@ -857,3 +857,62 @@ def test_count_rejects_a_bad_thread_count(tmp_path, bad, capsys):
         )
     assert excinfo.value.code == 2  # argparse usage error, before any work
     assert "--threads" in capsys.readouterr().err
+
+
+def _stranded_inputs(tmp_path, plus_contigs, minus_contigs):
+    """One plus locus on contig "2", one minus locus on "1", and BigWigs with
+    the given header contigs, each carrying signal everywhere."""
+    from .fixtures.bigwig import write_intervals
+
+    gtf = write_gtf(
+        tmp_path / "ann.gtf",
+        [
+            {"transcript_id": "p", "gene_id": "gp", "contig": "2", "start": 1001,
+             "end": 6_000, "strand": "+"},
+            {"transcript_id": "m", "gene_id": "gm", "contig": "1", "start": 1001,
+             "end": 6_000, "strand": "-"},
+        ],
+    )  # fmt: skip
+    paths = {}
+    for strand, contigs in (("plus", plus_contigs), ("minus", minus_contigs)):
+        sizes = {c: 20_000 for c in contigs}
+        intervals = [(c, 0, 20_000, 1.0 if strand == "plus" else -1.0) for c in contigs]
+        paths[strand] = write_intervals(tmp_path / f"{strand}.bw", sizes, intervals)
+    design_dir = tmp_path / "d"
+    assert main(["build-design", "--gtf", str(gtf), "--output", str(design_dir)]) == 0
+    return design_dir, paths
+
+
+def test_contig_check_uses_each_strands_own_bigwig(tmp_path, capsys):
+    """Contig "2" is only in the minus file, so the plus locus on it is missing.
+
+    Checked against the union of both headers, the warning said nothing while
+    that locus came back `missing_contig`.
+    """
+    design_dir, paths = _stranded_inputs(tmp_path, ["1"], ["1", "2"])
+    samples = tmp_path / "s.csv"
+    pl.DataFrame(
+        {"sample_id": ["s"], "bigwig_plus": [str(paths["plus"])],
+         "bigwig_minus": [str(paths["minus"])]}
+    ).write_csv(samples)  # fmt: skip
+    args = ["count", "--design", str(design_dir), "--samples", str(samples)]
+    assert main([*args, "--output", str(tmp_path / "c")]) == 0
+    assert "1 of 2 loci are on contigs absent" in capsys.readouterr().err
+
+
+def test_exposure_column_keeps_an_explicit_zero(tmp_path):
+    """``or 1.0`` turned an exposure of 0 into unit exposure; only a blank is unit."""
+    design_dir, paths = _stranded_inputs(tmp_path, ["1", "2"], ["1", "2"])
+    samples = tmp_path / "s.csv"
+    samples.write_text(
+        "sample_id,bigwig_plus,bigwig_minus,exposure\n"
+        f"zero,{paths['plus']},{paths['minus']},0\n"
+        f"blank,{paths['plus']},{paths['minus']},\n"
+        f"two,{paths['plus']},{paths['minus']},2.5\n"
+    )
+    counts_dir = tmp_path / "c"
+    args = ["count", "--design", str(design_dir), "--samples", str(samples)]
+    assert main([*args, "--output", str(counts_dir)]) == 0
+    with (counts_dir / COUNTS_FILENAME).open("rb") as handle:
+        exposures = {c.sample_id: c.exposure for c in pickle.load(handle)}
+    assert exposures == {"zero": 0.0, "blank": 1.0, "two": 2.5}
