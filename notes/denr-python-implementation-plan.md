@@ -1148,6 +1148,20 @@ takes 0.11 s on the workers. What's left is the fitting pass's own efficiency
 -- 0.58 s against 0.36 s for perfect 4-way scaling -- pool start, pickling and
 chunk imbalance. Not yet re-timed on K562 on one Slurm node.
 
+**A bug found while moving it: the pooled dispersion ignored exposure.**
+`pipeline._dispersion_inputs` took `use_bin_exposure` and never used it, and
+passed no exposures to `estimate_quasi_poisson_dispersion`, so Pearson
+residuals were taken against `M a` while the fit and the standard errors used
+`c e M a`. On exactly-Poisson counts (500 two-model loci): phi 0.99 at unit
+exposure, **22.3 at sample scale 3, 299,565 with 250 bp bin exposure** -- the
+correct values are 1.004 and 0.996. Every quasi-Poisson standard error was too
+large by `sqrt` of that, ~550x in the bin-exposure case. Point estimates were
+unaffected, and so was any run at unit exposure without `--use-bin-exposure`,
+which covers every recorded validation run (`validate_likelihoods.py` calls
+the solvers directly). Fixed in a separate commit from the refactor, which
+kept the bug so its 90-table identity check stayed meaningful; pinned by
+`test_pooled_dispersion_is_one_for_poisson_counts_under_any_exposure`.
+
 ## 15. Normalization and downstream inference
 
 Fitting and between-sample normalization must be separate operations.

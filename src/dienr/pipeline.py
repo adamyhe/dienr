@@ -346,9 +346,13 @@ def _fit_task(task: _LocusTask, options: _FitOptions) -> _TaskOutput:
         is_failure(fit.status) or fit.status is FitStatus.ALL_ZERO
     ):
         # Failed loci have NaN abundance, and an all-zero locus carries no
-        # residual information about overdispersion. The dispersion is
-        # evaluated at unit exposure, as it always has been.
-        term = inference.dispersion_term(task.models, task.observed, fit.abundance)
+        # residual information about overdispersion. The residuals are taken
+        # at the exposure the locus was fitted under: at unit exposure they
+        # measured the fit against the wrong mean, inflating phi ~c-fold for a
+        # sample scale c and ~bin-length-fold with bin exposure (plan 14.6).
+        term = inference.dispersion_term(
+            task.models, task.observed, fit.abundance, exposure=task.exposure
+        )
     return _TaskOutput(
         fit=fit,
         conditioning=assess(task.models, task.mask) if task.mask is not None else None,

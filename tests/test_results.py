@@ -764,3 +764,33 @@ def test_parallel_quasi_poisson_errors_match_serial_with_exposure(design):
     assert parallel.model_abundance.equals(serial.model_abundance)
     assert parallel.locus_qc.equals(serial.locus_qc)
     assert serial.model_abundance["abundance_standard_error"].is_not_nan().any()
+
+
+@pytest.mark.parametrize(
+    ("sample_scale", "use_bin_exposure"), [(1.0, False), (3.0, False), (1.0, True), (2.0, True)]
+)
+def test_pooled_dispersion_is_one_for_poisson_counts_under_any_exposure(
+    design, sample_scale, use_bin_exposure
+):
+    """The dispersion must be evaluated at the exposure each locus was fitted under.
+
+    It once ignored exposure: Pearson residuals were taken against ``M a``
+    instead of ``c e M a``, so exactly-Poisson counts gave phi ~22 at a sample
+    scale of 3 and ~3e5 with 250 bp bin exposure, inflating every quasi-Poisson
+    standard error by its square root (plan 14.6).
+    """
+    rng = np.random.default_rng(11)
+    values = []
+    for locus_id in range(design.n_loci):
+        models = design.models[locus_id]
+        bin_exposure = design.bin_lengths[locus_id] if use_bin_exposure else 1.0
+        expected = sample_scale * bin_exposure * (models @ np.full(models.shape[1], 40.0))
+        values.append(rng.poisson(expected).astype(np.float64))
+    template = synthetic_counts(design)
+    counts = replace(template, values=values, exposure=sample_scale, provenance={"summary": "sum"})
+
+    result = fit(design, counts, likelihood="quasi_poisson", use_bin_exposure=use_bin_exposure)
+    dispersion = result.provenance["dispersion"]
+    noise = result.provenance["dispersion_standard_error"]
+    assert result.provenance["dispersion_degrees_of_freedom"] >= 20
+    assert abs(dispersion - 1.0) < 4 * noise
