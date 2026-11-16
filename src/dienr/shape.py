@@ -673,8 +673,7 @@ def _select_training_genes(
         # Another gene in the locus contaminates it even when nested inside, where
         # the extent can't show it. Isoforms of the gene itself are allowed, and
         # without gene identifiers only the extent can be judged.
-        _other_gene=pl.col("_genes").list.set_difference(pl.concat_list("gene_id")).list.len()
-        > 0,
+        _other_gene=pl.col("_genes").list.set_difference(pl.concat_list("gene_id")).list.len() > 0,
     )
     isolated = joined.filter(
         (pl.col("_fraction") >= config.min_locus_fraction) & ~pl.col("_other_gene")

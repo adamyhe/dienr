@@ -471,7 +471,7 @@ def test_digest_and_guards():
         apply_runon_tail(coarse, _tail())
 
 
-def test_commutes_with_a_shape_profile(tmp_path):
+def test_tail_then_shape_profile_touch_disjoint_bins(tmp_path):
     """The profile reweights a model's own span; the tail lies outside it."""
     from .test_shape import _make_genes, _write_signal
 
@@ -483,10 +483,24 @@ def test_commutes_with_a_shape_profile(tmp_path):
     )
     profile = fit_shape_profile(annotation, signal, config=ShapeConfig(span=0.1))
     design = _two_isoform_design("+")
-    a = apply_runon_tail(apply_shape_profile(design, profile), _tail())
-    b = apply_shape_profile(apply_runon_tail(design, _tail()), profile)
-    for x, y in zip(a.models, b.models, strict=True):
-        np.testing.assert_allclose(x, y)
+    tailed = apply_runon_tail(design, _tail())
+    both = apply_shape_profile(tailed, profile)
+    shaped = apply_shape_profile(design, profile)
+    # Disjoint bins: the profile reshapes each span exactly as without a tail
+    # and leaves the tail (wherever it lands, even on a longer isoform's body)
+    # untouched, so the tail's contribution is the same with or without it.
+    for locus_id in range(design.n_loci):
+        n_old = design.bin_count(locus_id)
+        np.testing.assert_allclose(
+            both.models[locus_id][:n_old] - shaped.models[locus_id],
+            tailed.models[locus_id][:n_old] - design.models[locus_id],
+        )
+        np.testing.assert_array_equal(
+            both.models[locus_id][n_old:], tailed.models[locus_id][n_old:]
+        )
+    # The reverse order is refused: the tail rebuilds loci from transcripts.
+    with pytest.raises(ValueError, match="before the shape profile"):
+        apply_runon_tail(shaped, _tail())
 
 
 # --------------------------------------------------------------------------
@@ -657,3 +671,82 @@ def test_runon_cli_reports_errors(tmp_path):
                 str(tmp_path / "t"),
             ]
         )
+
+
+# --------------------------------------------------------------------------
+# Rebuilt from transcripts: masks, classes and tables (plan 14.6)
+# --------------------------------------------------------------------------
+
+
+def _tail_design(ends, strand, **masks):
+    starts = [0] * len(ends)
+    if strand == "-":  # mirror: shared TSS at 20 kb, PASes going down
+        starts, ends = [20_000 - e for e in ends], [20_000] * len(ends)
+    frame = pl.DataFrame(
+        {
+            "transcript_id": [f"t{i}" for i in range(len(ends))],
+            "contig": [CONTIG] * len(ends),
+            "start": starts,
+            "end": ends,
+            "strand": [strand] * len(ends),
+        }
+    )
+    return dienr.build_design(dienr.Annotation.from_frame(frame), bin_size=250, **masks)
+
+
+@pytest.mark.parametrize("strand", ["+", "-"])
+@pytest.mark.parametrize("masks", [{"mask_end_bins": (0, 4)}, {"mask_pas": (0, 1000)}])
+def test_downstream_pas_mask_covers_the_extended_bins(strand, masks):
+    """The PAS mask must reach into bins the extension added.
+
+    The extension padded the mask with False, so the most downstream isoform's
+    outward PAS mask was clipped at the old window end and its tail bins were
+    fitted unmasked -- the asymmetry the extension was meant to remove.
+    """
+    design = _tail_design([13_000, 15_000], strand, **masks)
+    out = apply_runon_tail(design, _tail())
+    lid = 0
+    starts = out.window_start(lid) + 250 * np.arange(out.bin_count(lid))
+    masked = set(starts[out.masks[lid]].tolist())
+    # 1 kb past each PAS, in the direction of transcription.
+    for pas in (13_000, 15_000):
+        window = (
+            range(pas, pas + 1000, 250)
+            if strand == "+"
+            else range(20_000 - pas - 1000, 20_000 - pas, 250)
+        )
+        assert set(window) <= masked
+        assert not out.models[lid][np.isin(starts, list(window))].any()
+
+
+def test_tail_separates_class_members_with_different_pas_bins():
+    """Masking can hide a PAS difference; the tails must not inherit it.
+
+    Two transcripts ending 500 bp apart collapse to one model under a 4-bin PAS
+    mask, and the tail used to start at the representative's PAS for both.
+    """
+    design = _tail_design([10_000, 10_500], "+", mask_end_bins=(4, 4))
+    assert design.model_table.height == 1
+    out = apply_runon_tail(design, _tail())
+    assert out.model_table.height == 2
+    assert (out.transcript_map["equivalence_class_size"] == 1).all()
+    tail = _tail().values
+    for transcript, pas_bin in (("t0", 39), ("t1", 41)):
+        _, model = _locus_of(out, transcript)
+        column = out.models[0][:, model]
+        past = np.arange(column.size) > pas_bin
+        in_tail = past & (np.arange(column.size) <= pas_bin + tail.size)
+        unmasked = np.flatnonzero(~out.masks[0] & in_tail)
+        assert unmasked.size
+        np.testing.assert_array_equal(column[unmasked], tail[unmasked - pas_bin - 1])
+        assert not column[past & ~in_tail].any()
+
+
+def test_tables_describe_the_tailed_columns():
+    """`has_support` and `model_id` were left from the untailed design."""
+    design = _tail_design([10_000, 10_500], "+", mask_end_bins=(4, 4))
+    out = apply_runon_tail(design, _tail())
+    for row in out.model_table.iter_rows(named=True):
+        column = out.models[row["locus_id"]][:, row["model_index"]]
+        assert row["has_support"] == bool(column.any())
+    assert set(out.model_table["model_id"]).isdisjoint(design.model_table["model_id"])

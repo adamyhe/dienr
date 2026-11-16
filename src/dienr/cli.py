@@ -533,15 +533,16 @@ def cmd_build_design(args: argparse.Namespace) -> int:
         mask_pas=tuple(args.mask_pas) if args.mask_pas else None,
         bin_operation=args.bin_operation,
     )
-    if args.shape_profile is not None:
-        profile = _load_shape_profile(args.shape_profile)
-        design = apply_shape_profile(design, profile)
+    # The tail first: it rebuilds each locus, which would discard a reshaping.
     if args.runon_tail is not None:
         tail = _load_runon_tail(args.runon_tail)
         try:
             design = apply_runon_tail(design, tail)
         except ValueError as error:
             raise SystemExit(f"error: {error}") from error
+    if args.shape_profile is not None:
+        profile = _load_shape_profile(args.shape_profile)
+        design = apply_shape_profile(design, profile)
 
     args.output.mkdir(parents=True, exist_ok=True)
     with (args.output / DESIGN_FILENAME).open("wb") as handle:

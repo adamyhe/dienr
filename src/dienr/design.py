@@ -166,6 +166,11 @@ class Design:
             minus-strand windows downstream -- to lower coordinates -- so
             their windows start before their spans. Read it through
             `window_start`, never from `loci`.
+        transcripts: Every transcript's ``transcript_id``, ``gene_id``,
+            ``locus_id``, ``start``, ``end`` and ``strand``, ordered by locus.
+            The collapsed models lose each transcript's own geometry, and
+            `dienr.runon.apply_runon_tail` needs it to rebuild a locus over a
+            wider window. None for a design pickled before it was recorded.
         contig_map: The ``(old, new)`` contig renaming applied to the
             annotation, or None. Already reflected in `annotation_digest` (the
             contig names changed); kept here so results can record it.
@@ -186,6 +191,7 @@ class Design:
     runon_digest: str | None = None
     contig_map: tuple[tuple[str, str], ...] | None = None
     window_starts: list[int] | None = None
+    transcripts: pl.DataFrame | None = None
 
     @property
     def n_loci(self) -> int:
@@ -329,6 +335,7 @@ def _build(annotation: Annotation, config: DesignConfig) -> Design:
     # DataFrame per locus was a third of the whole stage at genome scale
     # (plan 14.4).
     order = np.argsort(grouped["locus_id"].to_numpy(), kind="stable")
+    transcripts = grouped.select(_TRANSCRIPT_COLUMNS)[order]
     tx_locus = grouped["locus_id"].to_numpy()[order]
     tx_start = grouped["start"].to_numpy()[order]
     tx_end = grouped["end"].to_numpy()[order]
@@ -344,98 +351,34 @@ def _build(annotation: Annotation, config: DesignConfig) -> Design:
     n_bins_all = -(-(locus_hi - locus_lo) // width)  # ceil division
 
     for row in range(n_loci):
-        locus_id = int(locus_ids[row])
         a, b = first[row], last[row]
-        starts, ends, plus = tx_start[a:b], tx_end[a:b], tx_plus[a:b]
         lo, hi = int(locus_lo[row]), int(locus_hi[row])
-        n_bins = int(n_bins_all[row])
-
-        bin_starts = lo + np.arange(n_bins, dtype=np.int64) * width
-        bin_ends = bin_starts + width
-        # The last bin overhangs the locus; its usable extent is shorter.
-        effective = np.minimum(bin_ends, hi) - bin_starts
-
-        matrix = _occupancy_matrix(starts, ends, bin_starts, bin_ends, width)
-
-        # Masks come from the *unrounded* occupancy, and rounding happens after.
-        # The order matters and is not interchangeable: a transcript whose first
-        # bin is less than half covered rounds to zero there, so deriving the
-        # mask from the rounded matrix would put its 5' anchor one bin too far
-        # in and shift every masked bin with it. That silently changed which
-        # models collapsed together on 12 of 124 loci in the benchmark, in both
-        # directions, while every small fixture still passed.
-        if config.uses_base_windows:
-            masked = _mask_bins_by_bases(starts, ends, plus, bin_starts, bin_ends, config)
-        else:
-            masked = _mask_bins(matrix, plus, config)
-        rounded = _BIN_OPERATIONS[config.bin_operation](matrix)
-        # Read the occupied span off the rounded matrix before masking zeroes
-        # its ends, then keep only the representative columns' spans.
-        spans = _occupied_spans(rounded)
-        rounded[masked, :] = 0.0
-
-        representatives, class_members = _collapse(rounded)
-        reduced = rounded[:, representatives]
-        models.append(np.ascontiguousarray(reduced))
-        masks.append(masked)
-        bin_lengths.append(effective.astype(np.float64))
-        model_spans.append(spans[representatives, :])
-
-        transcript_ids = tx_id[a:b]
-        gene_ids = tx_gene[a:b]
-        for model_index, member_columns in enumerate(class_members):
-            size = len(member_columns)
-            model_id = _model_id(locus_names[row], reduced[:, model_index])
-            has_support = bool(reduced[:, model_index].any())
-            model_rows.append(
-                {
-                    "locus_id": locus_id,
-                    "model_index": model_index,
-                    "model_id": model_id,
-                    "equivalence_class_size": size,
-                    "has_support": has_support,
-                }
-            )
-            for column in member_columns:
-                map_rows.append(
-                    {
-                        "transcript_id": transcript_ids[column],
-                        "gene_id": gene_ids[column],
-                        "locus_id": locus_id,
-                        "model_index": model_index,
-                        "model_id": model_id,
-                        "equivalence_class_size": size,
-                        "exactly_identifiable": size == 1,
-                        "has_support": has_support,
-                    }
-                )
+        built = build_locus(
+            LocusTranscripts(
+                starts=tx_start[a:b],
+                ends=tx_end[a:b],
+                plus=tx_plus[a:b],
+                transcript_ids=tx_id[a:b],
+                gene_ids=tx_gene[a:b],
+            ),
+            locus_id=int(locus_ids[row]),
+            locus_name=locus_names[row],
+            window_start=lo,
+            n_bins=int(n_bins_all[row]),
+            clip_end=hi,
+            config=config,
+        )
+        models.append(built.model)
+        masks.append(built.mask)
+        bin_lengths.append(built.bin_lengths)
+        model_spans.append(built.spans)
+        model_rows.extend(built.model_rows)
+        map_rows.extend(built.map_rows)
 
     bins = _bins_table(loci, n_bins_all, width, masks)
 
-    transcript_map = pl.DataFrame(
-        map_rows,
-        schema={
-            "transcript_id": pl.String,
-            "gene_id": pl.String,
-            "locus_id": pl.UInt32,
-            "model_index": pl.UInt32,
-            "model_id": pl.String,
-            "equivalence_class_size": pl.UInt32,
-            "exactly_identifiable": pl.Boolean,
-            "has_support": pl.Boolean,
-        },
-    ).sort("locus_id", "model_index", "transcript_id")
-
-    model_table = pl.DataFrame(
-        model_rows,
-        schema={
-            "locus_id": pl.UInt32,
-            "model_index": pl.UInt32,
-            "model_id": pl.String,
-            "equivalence_class_size": pl.UInt32,
-            "has_support": pl.Boolean,
-        },
-    ).sort("locus_id", "model_index")
+    transcript_map = transcript_map_frame(map_rows)
+    model_table = model_table_frame(model_rows)
 
     return Design(
         bins=bins,
@@ -450,7 +393,178 @@ def _build(annotation: Annotation, config: DesignConfig) -> Design:
         annotation_digest=annotation.digest,
         digest=_design_digest(annotation.digest, config, model_table),
         contig_map=annotation.contig_map,
+        transcripts=transcripts,
     )
+
+
+_TRANSCRIPT_COLUMNS = ["transcript_id", "gene_id", "locus_id", "start", "end", "strand"]
+
+_TRANSCRIPT_MAP_SCHEMA = {
+    "transcript_id": pl.String,
+    "gene_id": pl.String,
+    "locus_id": pl.UInt32,
+    "model_index": pl.UInt32,
+    "model_id": pl.String,
+    "equivalence_class_size": pl.UInt32,
+    "exactly_identifiable": pl.Boolean,
+    "has_support": pl.Boolean,
+}
+
+_MODEL_TABLE_SCHEMA = {
+    "locus_id": pl.UInt32,
+    "model_index": pl.UInt32,
+    "model_id": pl.String,
+    "equivalence_class_size": pl.UInt32,
+    "has_support": pl.Boolean,
+}
+
+
+def transcript_map_frame(rows: list[dict]) -> pl.DataFrame:
+    """`Design.transcript_map` from per-transcript rows."""
+    return pl.DataFrame(rows, schema=_TRANSCRIPT_MAP_SCHEMA).sort(
+        "locus_id", "model_index", "transcript_id"
+    )
+
+
+def model_table_frame(rows: list[dict]) -> pl.DataFrame:
+    """`Design.model_table` from per-model rows."""
+    return pl.DataFrame(rows, schema=_MODEL_TABLE_SCHEMA).sort("locus_id", "model_index")
+
+
+@dataclass(frozen=True)
+class LocusTranscripts:
+    """One locus's transcripts, as parallel arrays in input order."""
+
+    starts: np.ndarray
+    ends: np.ndarray
+    plus: np.ndarray
+    transcript_ids: np.ndarray
+    gene_ids: np.ndarray
+
+
+@dataclass(frozen=True)
+class BuiltLocus:
+    """Everything `build_locus` derives for one locus window."""
+
+    model: np.ndarray
+    mask: np.ndarray
+    bin_lengths: np.ndarray
+    spans: np.ndarray
+    model_rows: list[dict]
+    map_rows: list[dict]
+
+
+def build_locus(
+    transcripts: LocusTranscripts,
+    *,
+    locus_id: int,
+    locus_name: str,
+    window_start: int,
+    n_bins: int,
+    clip_end: int,
+    config: DesignConfig,
+    tail: np.ndarray | None = None,
+) -> BuiltLocus:
+    """Bins, masks, models and equivalence classes for one locus window.
+
+    The single definition, used by `build_design` and -- over a window
+    extended downstream, with a run-on tail -- by
+    `dienr.runon.apply_runon_tail`, so the two can't drift apart.
+
+    Args:
+        transcripts: The locus's transcripts.
+        locus_id, locus_name: Identify the locus in the output rows.
+        window_start: Genomic start of the first bin.
+        n_bins: Bins in the window, each `config.bin_size` wide.
+        clip_end: Coordinate past which a bin's usable length is cut.
+        config: Binning, masking and rounding.
+        tail: Optional run-on tail, one value per bin past the PAS, added to
+            each *transcript's* column past its own pre-mask span before masks
+            zero masked bins and before equivalence classes are formed --
+            members of a class can have different PAS bins once masking hides
+            the difference, and then their tails differ.
+    """
+    width = config.bin_size
+    starts, ends, plus = transcripts.starts, transcripts.ends, transcripts.plus
+    bin_starts = window_start + np.arange(n_bins, dtype=np.int64) * width
+    bin_ends = bin_starts + width
+    # A bin overhanging `clip_end` has a shorter usable extent.
+    effective = np.minimum(bin_ends, clip_end) - bin_starts
+
+    matrix = _occupancy_matrix(starts, ends, bin_starts, bin_ends, width)
+
+    # Masks come from the *unrounded* occupancy, and rounding happens after.
+    # The order matters and is not interchangeable: a transcript whose first
+    # bin is less than half covered rounds to zero there, so deriving the
+    # mask from the rounded matrix would put its 5' anchor one bin too far
+    # in and shift every masked bin with it. That silently changed which
+    # models collapsed together on 12 of 124 loci in the benchmark, in both
+    # directions, while every small fixture still passed.
+    if config.uses_base_windows:
+        masked = _mask_bins_by_bases(starts, ends, plus, bin_starts, bin_ends, config)
+    else:
+        masked = _mask_bins(matrix, plus, config)
+    rounded = _BIN_OPERATIONS[config.bin_operation](matrix)
+    # Read the occupied span off the rounded matrix before masking zeroes
+    # its ends, then keep only the representative columns' spans.
+    spans = _occupied_spans(rounded)
+    if tail is not None:
+        _add_tails(rounded, spans, plus, tail)
+    rounded[masked, :] = 0.0
+
+    representatives, class_members = _collapse(rounded)
+    reduced = rounded[:, representatives]
+
+    model_rows: list[dict] = []
+    map_rows: list[dict] = []
+    for model_index, member_columns in enumerate(class_members):
+        size = len(member_columns)
+        model_id = _model_id(locus_name, reduced[:, model_index])
+        has_support = bool(reduced[:, model_index].any())
+        model_rows.append(
+            {
+                "locus_id": locus_id,
+                "model_index": model_index,
+                "model_id": model_id,
+                "equivalence_class_size": size,
+                "has_support": has_support,
+            }
+        )
+        for column in member_columns:
+            map_rows.append(
+                {
+                    "transcript_id": transcripts.transcript_ids[column],
+                    "gene_id": transcripts.gene_ids[column],
+                    "locus_id": locus_id,
+                    "model_index": model_index,
+                    "model_id": model_id,
+                    "equivalence_class_size": size,
+                    "exactly_identifiable": size == 1,
+                    "has_support": has_support,
+                }
+            )
+    return BuiltLocus(
+        model=np.ascontiguousarray(reduced),
+        mask=masked,
+        bin_lengths=effective.astype(np.float64),
+        spans=spans[representatives, :],
+        model_rows=model_rows,
+        map_rows=map_rows,
+    )
+
+
+def _add_tails(matrix: np.ndarray, spans: np.ndarray, plus: np.ndarray, tail: np.ndarray) -> None:
+    """Add `tail` to each column past its span, downstream of its PAS, in place."""
+    n_bins = matrix.shape[0]
+    for j in range(matrix.shape[1]):
+        first, last = int(spans[j, 0]), int(spans[j, 1])
+        if first < 0:
+            continue  # no occupied bin even before masking
+        if plus[j]:
+            rows = np.arange(last + 1, min(last + 1 + tail.size, n_bins))
+        else:
+            rows = np.arange(first - 1, max(first - 1 - tail.size, -1), -1)
+        matrix[rows, j] += tail[: rows.size]
 
 
 def _occupied_spans(matrix: np.ndarray) -> np.ndarray:

@@ -49,7 +49,13 @@ import polars as pl
 
 from .annotation import Annotation
 from .counts import SignalFile, open_bigwig, read_loci_binned
-from .design import Design
+from .design import (
+    Design,
+    LocusTranscripts,
+    build_locus,
+    model_table_frame,
+    transcript_map_frame,
+)
 
 #: Fewer training genes than this triggers a warning: the tail is a ratio of
 #: sums, so a handful of genes lets one gene's termination set it.
@@ -285,10 +291,16 @@ def fit_runon_tail(
 def apply_runon_tail(design: Design, tail: RunonTail, *, extend: bool = True) -> Design:
     """Add `tail` past every model's PAS, returning a new `Design`.
 
-    For each model the tail starts at the first bin past its pre-mask span
-    (`Design.model_spans`) in the direction of transcription, and masked bins
-    stay zero. The design digest changes and `Design.runon_digest` records the
-    tail, so a run-on design can never be mistaken for its source.
+    For each transcript the tail starts at the first bin past its own
+    pre-mask span in the direction of transcription; masks are drawn over the
+    whole extended window and masked bins stay zero; and equivalence classes
+    are formed afterwards, so transcripts whose PAS bins differ get separate
+    models even if masking made their bodies identical. Each locus is rebuilt
+    from `Design.transcripts` by the same `dienr.design.build_locus` that
+    built it, so `model_table` and `transcript_map` (model ids, class sizes,
+    `has_support`) describe the tailed columns. The design digest changes and
+    `Design.runon_digest` records the tail, so a run-on design can never be
+    mistaken for its source.
 
     **Each locus window is first extended downstream by the tail's length**
     (`extend`, default True), in whole bins, stopping short of the next
@@ -302,16 +314,25 @@ def apply_runon_tail(design: Design, tail: RunonTail, *, extend: bool = True) ->
     `Design.window_start` moves and their spans shift by the bins added).
     ``extend=False`` reproduces the earlier, biased behaviour.
 
-    Commutes with `dienr.shape.apply_shape_profile`, which only reweights a
-    model's own span, but the combination is not recommended (plan 18.13).
+    Apply it before `dienr.shape.apply_shape_profile`, never after: the
+    profile reweights only a model's own span, which the tail lies outside,
+    so that order gives what either order used to, but rebuilding a reshaped
+    design would discard its reshaping. The combination is not recommended
+    (plan 18.13).
 
     Raises:
-        ValueError: If the bin sizes differ or `design` already carries a tail.
+        ValueError: If the bin sizes differ, `design` already carries a tail or
+            a shape profile, or it does not record its transcripts.
     """
     if getattr(design, "runon_digest", None) is not None:
         raise ValueError(
             f"design already carries run-on tail {design.runon_digest}; rebuild it from "
             "the annotation to apply a different one"
+        )
+    if design.shape_digest is not None:
+        raise ValueError(
+            "apply the run-on tail before the shape profile: the tail rebuilds each "
+            "locus from its transcripts, which would discard the reshaping"
         )
     width = design.config.bin_size
     if width != tail.config.bin_size:
@@ -319,46 +340,72 @@ def apply_runon_tail(design: Design, tail: RunonTail, *, extend: bool = True) ->
     n_tail = tail.values.size
     grow = _downstream_room(design, n_tail) if extend else np.zeros(design.n_loci, np.int64)
 
+    if design.transcripts is None:
+        raise ValueError(
+            "design does not record its transcripts' coordinates (built by an older "
+            "dienr); rebuild it with build-design to apply a run-on tail"
+        )
+
+    # Each locus is rebuilt from its transcripts over the extended window,
+    # rather than by padding the collapsed design. Padding left the new bins
+    # unmasked, so a downstream PAS mask missed exactly the isoform the
+    # extension exists for; and it placed one tail per equivalence class at
+    # the representative's PAS, though masking can hide a difference in PAS
+    # between members whose tails then differ (plan 14.6).
+    transcripts = design.transcripts
+    tx_locus = transcripts["locus_id"].to_numpy()
+    tx_start = transcripts["start"].to_numpy()
+    tx_end = transcripts["end"].to_numpy()
+    tx_plus = transcripts["strand"].to_numpy() == "+"
+    tx_id = transcripts["transcript_id"].to_numpy()
+    tx_gene = transcripts["gene_id"].to_numpy()
+    locus_ids = design.loci["locus_id"].to_numpy()
+    first = np.searchsorted(tx_locus, locus_ids, side="left")
+    last = np.searchsorted(tx_locus, locus_ids, side="right")
     strands = design.loci["strand"].to_list()
+    locus_ends = design.loci["end"].to_numpy()
+    names = design.loci["locus_name"].to_list()
+
     models: list[np.ndarray] = []
     masks: list[np.ndarray] = []
     bin_lengths: list[np.ndarray] = []
     model_spans: list[np.ndarray] = []
     window_starts: list[int] = []
-    for locus_id, matrix in enumerate(design.models):
-        plus = strands[locus_id] == "+"
-        k = int(grow[locus_id])
-        n_old = matrix.shape[0]
-        pad = (0, k) if plus else (k, 0)
-        out = np.pad(matrix.astype(np.float64, copy=True), (pad, (0, 0)))
-        mask = np.pad(design.masks[locus_id], pad)
-        lengths = design.bin_lengths[locus_id].astype(np.float64, copy=True)
-        if plus and k:
-            # The overhanging last bin now has a real continuation: full width.
-            lengths[-1] = width
-        lengths = np.pad(lengths, pad, constant_values=float(width))
-        spans = design.model_spans[locus_id].copy()
-        if not plus:
-            spans[spans >= 0] += k
-        start = design.window_start(locus_id) - (0 if plus else k * width)
-
-        n_bins = n_old + k
-        for j in range(out.shape[1]):
-            first, last = int(spans[j, 0]), int(spans[j, 1])
-            if first < 0:
-                continue  # no occupied bin even before masking
-            if plus:
-                tail_bins = np.arange(last + 1, min(last + 1 + n_tail, n_bins))
-            else:
-                tail_bins = np.arange(first - 1, max(first - 1 - n_tail, -1), -1)
-            out[tail_bins, j] += tail.values[: tail_bins.size]
-        out[mask] = 0.0
-        models.append(np.ascontiguousarray(out))
-        masks.append(mask)
-        bin_lengths.append(lengths)
-        model_spans.append(spans)
+    model_rows: list[dict] = []
+    map_rows: list[dict] = []
+    for row, locus_id in enumerate(locus_ids):
+        lid = int(locus_id)
+        plus = strands[lid] == "+"
+        k = int(grow[lid])
+        n_bins = design.bin_count(lid) + k
+        start = design.window_start(lid) - (0 if plus else k * width)
+        # Plus windows grow past the locus end, so the overhanging last bin
+        # gains a real continuation; minus windows grow at the low end.
+        clip_end = start + n_bins * width if plus and k else int(locus_ends[lid])
+        a, b = first[row], last[row]
+        built = build_locus(
+            LocusTranscripts(
+                starts=tx_start[a:b],
+                ends=tx_end[a:b],
+                plus=tx_plus[a:b],
+                transcript_ids=tx_id[a:b],
+                gene_ids=tx_gene[a:b],
+            ),
+            locus_id=lid,
+            locus_name=names[lid],
+            window_start=start,
+            n_bins=n_bins,
+            clip_end=clip_end,
+            config=design.config,
+            tail=tail.values,
+        )
+        models.append(built.model)
+        masks.append(built.mask)
+        bin_lengths.append(built.bin_lengths)
+        model_spans.append(built.spans)
         window_starts.append(int(start))
-
+        model_rows.extend(built.model_rows)
+        map_rows.extend(built.map_rows)
     table = _bins_frame(design, models, masks, bin_lengths, window_starts)
     return replace(
         design,
@@ -368,6 +415,8 @@ def apply_runon_tail(design: Design, tail: RunonTail, *, extend: bool = True) ->
         model_spans=model_spans,
         window_starts=window_starts,
         bins=table,
+        model_table=model_table_frame(model_rows),
+        transcript_map=transcript_map_frame(map_rows),
         runon_digest=tail.digest,
         digest=_combined_digest(design.digest, tail.digest + ("|extended" if extend else "")),
     )
