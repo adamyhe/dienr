@@ -29,6 +29,7 @@ likewise NaN.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import numpy as np
@@ -125,24 +126,70 @@ def estimate_quasi_poisson_dispersion(
         usable degrees of freedom, which is the correct answer: no evidence of
         overdispersion means no adjustment.
     """
+    return pool_dispersion(
+        dispersion_term(
+            models,
+            observed,
+            abundance,
+            exposure=exposures[index] if exposures is not None else None,
+        )
+        for index, (models, observed, abundance) in enumerate(loci)
+    )
+
+
+@dataclass(frozen=True)
+class DispersionTerm:
+    """One locus's contribution to the pooled dispersion.
+
+    Split out so each term can be computed where the locus was fitted -- in a
+    worker process -- and only these three numbers sent back for pooling.
+    """
+
+    chi_squared: float
+    n_bins: int
+    n_parameters: int
+
+
+def dispersion_term(
+    models: np.ndarray,
+    observed: np.ndarray,
+    abundance: np.ndarray,
+    *,
+    exposure: Exposure | None = None,
+) -> DispersionTerm | None:
+    """One completed Poisson fit's Pearson statistic, or None if it has no usable bins."""
+    exposure = exposure or Exposure()
+    n_bins = models.shape[0]
+    usable = usable_bins(models, exposure)
+    if not usable.any():
+        return None
+    fitted = mean(abundance, models, exposure.scale(n_bins), exposure.offset(n_bins))
+    residuals = pearson_residuals(observed, fitted, usable)
+    return DispersionTerm(
+        chi_squared=float(residuals @ residuals),
+        n_bins=int(usable.sum()),
+        # Free parameters, not columns: a model pinned at zero consumed no
+        # degree of freedom.
+        n_parameters=int(np.count_nonzero(abundance)),
+    )
+
+
+def pool_dispersion(terms: Iterable[DispersionTerm | None]) -> DispersionEstimate:
+    """Pool per-locus terms into one dispersion; see `estimate_quasi_poisson_dispersion`.
+
+    Terms are summed in the order given, so the same loci in the same order
+    give a bit-identical estimate wherever each term was computed.
+    """
     chi_squared = 0.0
     total_bins = 0
     total_parameters = 0
     contributing = 0
-
-    for index, (models, observed, abundance) in enumerate(loci):
-        exposure = exposures[index] if exposures is not None else Exposure()
-        n_bins = models.shape[0]
-        usable = usable_bins(models, exposure)
-        if not usable.any():
+    for term in terms:
+        if term is None:
             continue
-        fitted = mean(abundance, models, exposure.scale(n_bins), exposure.offset(n_bins))
-        residuals = pearson_residuals(observed, fitted, usable)
-        chi_squared += float(residuals @ residuals)
-        total_bins += int(usable.sum())
-        # Free parameters, not columns: a model pinned at zero consumed no
-        # degree of freedom.
-        total_parameters += int(np.count_nonzero(abundance))
+        chi_squared += term.chi_squared
+        total_bins += term.n_bins
+        total_parameters += term.n_parameters
         contributing += 1
 
     degrees_of_freedom = total_bins - total_parameters

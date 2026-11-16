@@ -11,6 +11,7 @@ factors live in their own table; nothing here silently rescales an estimate.
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -23,6 +24,7 @@ from .status import FitStatus, is_failure
 if TYPE_CHECKING:
     from .counts import SampleCounts
     from .design import Design
+    from .diagnostics import LocusConditioning
     from .solvers.legacy import LocusFit
 
 #: Bumped whenever an output schema changes incompatibly.
@@ -287,6 +289,7 @@ def collect_results(
     samples: list[tuple[SampleCounts, list[LocusFit]]],
     *,
     provenance: dict[str, Any] | None = None,
+    conditioning: Sequence[LocusConditioning] | None = None,
 ) -> FitResult:
     """Assemble per-locus fits into the versioned output tables.
 
@@ -295,6 +298,10 @@ def collect_results(
         samples: One ``(counts, fits)`` pair per sample, where ``fits`` is
             indexed by ``locus_id``.
         provenance: Extra fields to merge into the manifest.
+        conditioning: ``assess(design.models[i], design.mask(i))`` for every
+            locus, if already computed (`dienr.pipeline.fit` does it in its
+            workers). Otherwise computed here, once per locus: it depends on
+            the design alone, so it is the same for every sample.
 
     Returns:
         A `FitResult`.
@@ -304,6 +311,17 @@ def collect_results(
             or if its fit list does not cover every locus.
     """
     from .diagnostics import assess, residual_sum_of_squares
+
+    if conditioning is None:
+        conditioning = (
+            [assess(design.models[i], design.mask(i)) for i in range(design.n_loci)]
+            if samples
+            else []
+        )
+    elif len(conditioning) != design.n_loci:
+        raise ValueError(
+            f"conditioning covers {len(conditioning)} loci, design has {design.n_loci}"
+        )
 
     abundance_rows: list[dict[str, Any]] = []
     qc_rows: list[dict[str, Any]] = []
@@ -334,7 +352,7 @@ def collect_results(
         for locus_id, fit in enumerate(fits):
             models = design.models[locus_id]
             observed = counts.values[locus_id]
-            conditioning = assess(models, design.mask(locus_id))
+            locus_conditioning = conditioning[locus_id]
 
             if is_failure(fit.status):
                 total_fitted = float("nan")
@@ -353,12 +371,12 @@ def collect_results(
                     "sample_id": counts.sample_id,
                     "locus_id": locus_id,
                     "locus_name": locus_names[locus_id],
-                    "n_bins": conditioning.n_bins,
-                    "n_unmasked_bins": conditioning.n_unmasked_bins,
+                    "n_bins": locus_conditioning.n_bins,
+                    "n_unmasked_bins": locus_conditioning.n_unmasked_bins,
                     "n_models_before_collapse": before_collapse[locus_id],
-                    "n_models_after_collapse": conditioning.n_models,
-                    "matrix_rank": conditioning.matrix_rank,
-                    "condition_number": conditioning.condition_number,
+                    "n_models_after_collapse": locus_conditioning.n_models,
+                    "matrix_rank": locus_conditioning.matrix_rank,
+                    "condition_number": locus_conditioning.condition_number,
                     "total_observed": total_observed,
                     "total_observed_all_bins": (
                         counts.totals_all_bins[locus_id]
@@ -369,7 +387,7 @@ def collect_results(
                     "total_fitted": total_fitted,
                     "residual_sum_of_squares": rss,
                     "gradient_norm": fit.gradient_norm,
-                    "solver_status": _qualified_status(fit.status, conditioning),
+                    "solver_status": _qualified_status(fit.status, locus_conditioning),
                     "failure_reason": fit.failure_reason,
                 }
             )

@@ -1095,6 +1095,59 @@ multi-sample runs, and would move results by solver tolerance (single-model
 loci already take the closed form). Next to the above it isn't worth the
 change in outputs.
 
+### 14.6 The serial tail of a parallel fit (November 2026)
+
+14.5 left ~2.5 s of a K562 fit serial. A fresh profile (synthetic, 30,000
+transcripts / 9,423 loci, one sample, TSS mask 1 bin; Apple M4 laptop, not
+Slurm -- ratios, not absolute times) showed where. Quasi-Poisson at
+`n_jobs=4`: 0.49 s fitting in workers, then **0.67 s serial** in the main
+process: 0.28 s of standard errors (`_attach_standard_errors`), 0.10 s of
+pooled dispersion, 0.29 s in `collect_results`, two thirds of it one SVD per
+locus *per sample* in `diagnostics.assess`. Legacy: 0.30 s serial of 1.0 s.
+Half the parallel quasi-Poisson fit wasn't parallel.
+
+The JIT question was re-asked and the answer is unchanged (14.3): the fused
+closures are still 50-68% of fitting, but at 4 workers a ~2x closure saves
+~0.25 s, about half what moving the serial work does, with none of 14.3's
+costs.
+
+Three changes, every output bit-identical:
+
+- **Dispersion terms come back from the workers.** `inference.dispersion_term`
+  is one locus's Pearson chi-squared, usable bins and free parameters;
+  `pool_dispersion` sums them in task order, which is the order
+  `estimate_quasi_poisson_dispersion` always summed in (it is now defined
+  through the two).
+- **Standard errors are a second pass on the same pool.** They need the pooled
+  dispersion, so they can't be computed during the fit, but they can be split
+  across the same workers once it is known (`pipeline._Workers` keeps the pool
+  alive across both passes). Rescaling unit-dispersion errors by `sqrt(phi)`
+  would have saved the second pass but is not exact: `fisher_information`
+  floors the variance at `MU_FLOOR`.
+- **Conditioning is assessed once per locus**, in the worker that fits the
+  first sample's copy of it, and handed to `collect_results(conditioning=)`.
+  Called without it, `collect_results` still assesses once per locus, not once
+  per locus per sample.
+
+Checked against the previous code on the dense, sparse and 30k datasets x
+legacy log, legacy identity, Poisson, quasi-Poisson, quasi-Poisson with bin
+exposure x `n_jobs` 1 and 4, with non-unit sample exposures: 90 of 90 output
+tables and dispersion records identical. Fit time, best of 3:
+
+| dataset, likelihood | jobs 1 | jobs 4 | jobs 8 |
+|---|---|---|---|
+| 30k, legacy | 2.41 -> 2.48 s | 1.02 -> 0.87 s (1.17x) | 0.81 -> 0.67 s (1.20x) |
+| 30k, quasi-Poisson | 2.11 -> 2.16 s | 1.17 -> 0.88 s (1.33x) | 1.04 -> 0.71 s (1.47x) |
+| dense (3 samples), legacy | 0.68 -> 0.60 s | 0.40 -> 0.28 s (1.41x) | 0.34 -> 0.23 s (1.49x) |
+| dense (3 samples), quasi-Poisson | 0.63 -> 0.55 s | 0.39 -> 0.30 s (1.32x) | 0.37 -> 0.27 s (1.40x) |
+
+One job is unchanged within noise for one sample, and faster with several
+(the SVDs no longer repeat). On the 30k quasi-Poisson fit at 4 jobs the serial
+remainder is `collect_results`' row assembly, 0.12 s; the standard-error pass
+takes 0.11 s on the workers. What's left is the fitting pass's own efficiency
+-- 0.58 s against 0.36 s for perfect 4-way scaling -- pool start, pickling and
+chunk imbalance. Not yet re-timed on K562 on one Slurm node.
+
 ## 15. Normalization and downstream inference
 
 Fitting and between-sample normalization must be separate operations.

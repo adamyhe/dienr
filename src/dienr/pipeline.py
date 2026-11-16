@@ -10,6 +10,7 @@ from __future__ import annotations
 import multiprocessing as mp
 import threading
 import warnings
+from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
@@ -22,6 +23,7 @@ from threadpoolctl import threadpool_limits
 
 from .counts import COUNT_LIKELIHOODS, SampleCounts, require_count_equivalent
 from .design import Design
+from .diagnostics import LocusConditioning, assess
 from .results import FitResult, collect_results
 from .solvers import inference, poisson
 from .solvers._glm import Exposure
@@ -202,32 +204,57 @@ def _fit(
                 if likelihood != "legacy"
                 else None
             ),
+            # Conditioning depends on the design alone, so it is assessed once
+            # per locus, alongside the first sample's fit.
+            mask=design.mask(locus_id) if sample_index == 0 else None,
         )
-        for sample in samples
+        for sample_index, sample in enumerate(samples)
         for locus_id in range(design.n_loci)
     ]
-    results = _run_tasks(tasks, options, n_jobs=n_jobs, blas_threads=blas_threads)
-    fitted: list[tuple[SampleCounts, list[LocusFit]]] = [
-        (sample, results[index * design.n_loci : (index + 1) * design.n_loci])
-        for index, sample in enumerate(samples)
-    ]
+    cost = np.array([t.models.shape[0] * max(t.models.shape[1], 1) ** 2 for t in tasks], float)
 
     dispersion_record: dict[str, Any] = {}
-    if likelihood in COUNT_LIKELIHOODS:
-        # Quasi-Poisson needs a second pass: the dispersion is pooled over
-        # every locus of every sample, which cannot be known while fitting one
-        # locus. Section 4.3 forbids per-locus dispersion.
-        estimate = (
-            inference.POISSON_DISPERSION
-            if likelihood == "poisson"
-            else inference.estimate_quasi_poisson_dispersion(
-                _dispersion_inputs(design, fitted, use_bin_exposure)
+    with _Workers(n_jobs=n_jobs, blas_threads=blas_threads) as workers:
+        outputs = workers.map(_fit_task, tasks, cost, options)
+        fits = [output.fit for output in outputs]
+
+        if likelihood in COUNT_LIKELIHOODS:
+            # Quasi-Poisson needs a second pass: the dispersion is pooled over
+            # every locus of every sample, which cannot be known while fitting
+            # one locus. Section 4.3 forbids per-locus dispersion. Each worker
+            # returned its loci's Pearson terms; pooling them in task order
+            # gives the same estimate as computing them all here.
+            estimate = (
+                inference.POISSON_DISPERSION
+                if likelihood == "poisson"
+                else inference.pool_dispersion(output.dispersion_term for output in outputs)
             )
-        )
-        dispersion_record = dict(estimate.describe())
-        if likelihood == "poisson":
-            dispersion_record["dispersion_method"] = "poisson_assumed"
-        _attach_standard_errors(design, fitted, estimate.dispersion, use_bin_exposure)
+            dispersion_record = dict(estimate.describe())
+            if likelihood == "poisson":
+                dispersion_record["dispersion_method"] = "poisson_assumed"
+            # The standard errors need that pooled dispersion, so they are a
+            # second parallel pass on the same workers rather than serial work
+            # here, which left half of a 4-worker fit serial (plan 14.6).
+            wanted = [i for i, fit in enumerate(fits) if not is_failure(fit.status)]
+            errors = workers.map(
+                _standard_error_task,
+                [_ErrorTask(tasks[i].models, fits[i].abundance, tasks[i].exposure) for i in wanted],
+                cost[wanted],
+                estimate.dispersion,
+            )
+            for i, error in zip(wanted, errors, strict=True):
+                fits[i] = replace(fits[i], standard_error=error)
+
+    fitted: list[tuple[SampleCounts, list[LocusFit]]] = [
+        (sample, fits[index * design.n_loci : (index + 1) * design.n_loci])
+        for index, sample in enumerate(samples)
+    ]
+    # Every first-sample task assessed its locus, so this covers every locus.
+    conditioning = (
+        [output.conditioning for output in outputs[: design.n_loci] if output.conditioning]
+        if samples
+        else None
+    )
 
     merged: dict[str, Any] = {"likelihood": likelihood}
     merged.update(dispersion_record)
@@ -242,7 +269,12 @@ def _fit(
         merged["n_inactive_transcripts"] = len(inactive_transcripts)
     if provenance:
         merged.update(provenance)
-    return collect_results(design, fitted, provenance=merged)
+    return collect_results(
+        design,
+        fitted,
+        provenance=merged,
+        conditioning=conditioning,
+    )
 
 
 @dataclass(frozen=True)
@@ -264,11 +296,31 @@ class _LocusTask:
     inactive: np.ndarray | None
     prior: FitStatus
     exposure: Exposure | None
+    #: The locus's design mask, set on exactly one task per locus: the one
+    #: that also assesses the locus's conditioning.
+    mask: np.ndarray | None = None
 
 
-def _fit_task(task: _LocusTask, options: _FitOptions) -> LocusFit:
+@dataclass(frozen=True)
+class _TaskOutput:
+    """A locus fit plus what the main process would otherwise compute serially."""
+
+    fit: LocusFit
+    conditioning: LocusConditioning | None
+    dispersion_term: inference.DispersionTerm | None
+
+
+@dataclass(frozen=True)
+class _ErrorTask:
+    models: np.ndarray
+    abundance: np.ndarray
+    exposure: Exposure | None
+
+
+def _fit_task(task: _LocusTask, options: _FitOptions) -> _TaskOutput:
+    fit: LocusFit
     if options.likelihood == "legacy":
-        return fit_locus(
+        fit = fit_locus(
             task.models,
             task.observed,
             transform=options.transform,
@@ -278,26 +330,46 @@ def _fit_task(task: _LocusTask, options: _FitOptions) -> LocusFit:
             prior_status=task.prior,
             log_offset=options.log_offset,
         )
-    return poisson.fit_locus(
-        task.models,
-        task.observed,
-        exposure=task.exposure,
-        penalty=options.penalty,
-        inactive=task.inactive,
-        max_iterations=options.max_iterations,
-        min_unmasked_bins=options.min_unmasked_bins,
-        prior_status=task.prior,
+    else:
+        fit = poisson.fit_locus(
+            task.models,
+            task.observed,
+            exposure=task.exposure,
+            penalty=options.penalty,
+            inactive=task.inactive,
+            max_iterations=options.max_iterations,
+            min_unmasked_bins=options.min_unmasked_bins,
+            prior_status=task.prior,
+        )
+    term = None
+    if options.likelihood == "quasi_poisson" and not (
+        is_failure(fit.status) or fit.status is FitStatus.ALL_ZERO
+    ):
+        # Failed loci have NaN abundance, and an all-zero locus carries no
+        # residual information about overdispersion. The dispersion is
+        # evaluated at unit exposure, as it always has been.
+        term = inference.dispersion_term(task.models, task.observed, fit.abundance)
+    return _TaskOutput(
+        fit=fit,
+        conditioning=assess(task.models, task.mask) if task.mask is not None else None,
+        dispersion_term=term,
     )
 
 
-def _fit_chunk(
-    tasks: list[_LocusTask], options: _FitOptions, blas_threads: int | None
-) -> list[LocusFit]:
-    """Worker entry point: fit a chunk of loci under the same BLAS limit."""
+def _standard_error_task(task: _ErrorTask, dispersion: float) -> np.ndarray:
+    return inference.standard_errors(
+        task.models, task.abundance, exposure=task.exposure, dispersion=dispersion
+    )
+
+
+def _run_chunk(
+    items: list[Any], function: Callable[..., Any], args: tuple[Any, ...], blas_threads: int | None
+) -> list[Any]:
+    """Worker entry point: run a chunk of items under the same BLAS limit."""
     if blas_threads is None:
-        return [_fit_task(task, options) for task in tasks]
+        return [function(item, *args) for item in items]
     with threadpool_limits(limits=blas_threads, user_api="blas"):
-        return [_fit_task(task, options) for task in tasks]
+        return [function(item, *args) for item in items]
 
 
 #: Chunks per worker. More than one lets fast workers take up the slack of
@@ -306,37 +378,62 @@ def _fit_chunk(
 _CHUNKS_PER_WORKER = 8
 
 
-def _run_tasks(
-    tasks: list[_LocusTask], options: _FitOptions, *, n_jobs: int, blas_threads: int | None
-) -> list[LocusFit]:
-    """Fit every task, in order, in this process or across `n_jobs` workers.
+class _Workers:
+    """Per-locus work, in this process or in one pool shared by every pass.
 
-    Each locus's data is sent to exactly one worker, once; the design is never
-    copied whole. Chunks are contiguous runs of tasks balanced by an estimate
-    of their cost (bins x models^2), and results come back in task order.
+    The pool starts on the first `map` that needs it and lives until the
+    ``with`` block ends, so the standard-error pass reuses the fitting workers
+    instead of starting new ones. Each item is sent to exactly one worker, once
+    per pass; the design is never copied whole.
     """
-    if n_jobs == 1 or len(tasks) < 2:
-        return [_fit_task(task, options) for task in tasks]
-    cost = np.array([t.models.shape[0] * max(t.models.shape[1], 1) ** 2 for t in tasks], float)
-    n_chunks = min(len(tasks), n_jobs * _CHUNKS_PER_WORKER)
-    edges = np.searchsorted(np.cumsum(cost), np.linspace(0, cost.sum(), n_chunks + 1)[1:-1])
-    bounds = [0, *sorted(set(int(e) + 1 for e in edges)), len(tasks)]
-    chunks = [tasks[a:b] for a, b in zip(bounds[:-1], bounds[1:], strict=True) if b > a]
-    with warnings.catch_warnings():
-        # Python 3.12+ warns before any fork in a process with more than one OS
-        # thread, and NumPy's OpenBLAS starts idle worker threads at import, so
-        # it would fire on every call. `_start_context` only forks when no
-        # other *Python* thread exists; the native pools left are OpenBLAS's,
-        # which reinitializes itself in the child via pthread_atfork, and the
-        # workers never call numba or figwig.
-        warnings.filterwarnings(
-            "ignore",
-            message=r".*use of fork\(\) may lead to deadlocks",
-            category=DeprecationWarning,
-        )
-        with ProcessPoolExecutor(max_workers=n_jobs, mp_context=_start_context()) as pool:
-            parts = list(pool.map(_fit_chunk, chunks, repeat(options), repeat(blas_threads)))
-    return [fit for part in parts for fit in part]
+
+    def __init__(self, *, n_jobs: int, blas_threads: int | None) -> None:
+        self.n_jobs = n_jobs
+        self.blas_threads = blas_threads
+        self._pool: ProcessPoolExecutor | None = None
+
+    def __enter__(self) -> _Workers:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        if self._pool is not None:
+            self._pool.shutdown()
+            self._pool = None
+
+    def map(
+        self, function: Callable[..., Any], items: list[Any], cost: np.ndarray, *args: Any
+    ) -> list[Any]:
+        """``[function(item, *args) for item in items]``, in order.
+
+        Chunks are contiguous runs of items balanced by `cost`, an estimate of
+        each item's work (bins x models^2).
+        """
+        if self.n_jobs == 1 or len(items) < 2:
+            return [function(item, *args) for item in items]
+        n_chunks = min(len(items), self.n_jobs * _CHUNKS_PER_WORKER)
+        edges = np.searchsorted(np.cumsum(cost), np.linspace(0, cost.sum(), n_chunks + 1)[1:-1])
+        bounds = [0, *sorted(set(int(e) + 1 for e in edges)), len(items)]
+        chunks = [items[a:b] for a, b in zip(bounds[:-1], bounds[1:], strict=True) if b > a]
+        with warnings.catch_warnings():
+            # Python 3.12+ warns before any fork in a process with more than
+            # one OS thread, and NumPy's OpenBLAS starts idle worker threads at
+            # import, so it would fire on every call. `_start_context` only
+            # forks when no other *Python* thread exists; the native pools left
+            # are OpenBLAS's, which reinitializes itself in the child via
+            # pthread_atfork, and the workers never call numba or figwig.
+            warnings.filterwarnings(
+                "ignore",
+                message=r".*use of fork\(\) may lead to deadlocks",
+                category=DeprecationWarning,
+            )
+            if self._pool is None:
+                self._pool = ProcessPoolExecutor(
+                    max_workers=self.n_jobs, mp_context=_start_context()
+                )
+            parts = self._pool.map(
+                _run_chunk, chunks, repeat(function), repeat(args), repeat(self.blas_threads)
+            )
+            return [result for part in parts for result in part]
 
 
 def _start_context() -> mp.context.BaseContext:
@@ -370,49 +467,6 @@ def _sample_exposure(
         sample_scale=sample.exposure,
         bin_exposure=design.bin_lengths[locus_id] if use_bin_exposure else None,
     )
-
-
-def _dispersion_inputs(
-    design: Design,
-    fitted: list[tuple[SampleCounts, list[LocusFit]]],
-    use_bin_exposure: bool,
-) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-    """Completed fits eligible to contribute to a pooled dispersion.
-
-    Failed loci are excluded: their abundance is NaN, and an all-zero locus
-    contributes no residual information about overdispersion either.
-    """
-    triples = []
-    for sample, fits in fitted:
-        for locus_id, fit in enumerate(fits):
-            if is_failure(fit.status) or fit.status is FitStatus.ALL_ZERO:
-                continue
-            triples.append((design.models[locus_id], sample.values[locus_id], fit.abundance))
-    return triples
-
-
-def _attach_standard_errors(
-    design: Design,
-    fitted: list[tuple[SampleCounts, list[LocusFit]]],
-    dispersion: float,
-    use_bin_exposure: bool,
-) -> None:
-    """Fill in each fit's `standard_error` at the pooled dispersion.
-
-    `LocusFit` is frozen, so this replaces entries in place rather than
-    mutating them.
-    """
-    for sample, fits in fitted:
-        for locus_id, fit in enumerate(fits):
-            if is_failure(fit.status):
-                continue
-            errors = inference.standard_errors(
-                design.models[locus_id],
-                fit.abundance,
-                exposure=_sample_exposure(design, sample, locus_id, use_bin_exposure),
-                dispersion=dispersion,
-            )
-            fits[locus_id] = replace(fit, standard_error=errors)
 
 
 def _pinned_models(

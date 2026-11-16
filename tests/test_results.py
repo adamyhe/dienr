@@ -711,3 +711,56 @@ def test_log_offset_is_recorded_and_only_for_the_log_objective(design):
     assert result.provenance["log_offset"] == 0.01
     with pytest.raises(ValueError, match="log_offset"):
         fit(design, synthetic_counts(design), likelihood="poisson", log_offset=0.01)
+
+
+# --- serial work around the parallel fit (plan 14.6) ------------------------------
+
+
+def test_conditioning_is_assessed_once_per_locus_not_per_sample(design, monkeypatch):
+    """It depends on the design alone; per sample it repeated the same SVDs."""
+    from dienr import diagnostics, pipeline
+
+    calls = 0
+    original = diagnostics.assess
+
+    def counting(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "assess", counting)
+    monkeypatch.setattr(diagnostics, "assess", counting)
+    samples = [synthetic_counts(design, sample_id) for sample_id in ("a", "b", "c")]
+    fit(design, samples)
+    assert calls == design.n_loci
+
+    calls = 0
+    fits = [
+        [fit_locus(design.models[i], s.values[i]) for i in range(design.n_loci)] for s in samples
+    ]
+    collect_results(design, list(zip(samples, fits, strict=True)))
+    assert calls == design.n_loci
+
+
+def test_collect_results_rejects_conditioning_for_the_wrong_number_of_loci(design):
+    counts = synthetic_counts(design)
+    fits = [fit_locus(design.models[i], counts.values[i]) for i in range(design.n_loci)]
+    with pytest.raises(ValueError, match="conditioning covers"):
+        collect_results(design, [(counts, fits)], conditioning=[])
+
+
+def test_parallel_quasi_poisson_errors_match_serial_with_exposure(design):
+    """The standard-error pass runs on the workers; exposure must reach it."""
+    samples = [
+        replace(
+            synthetic_counts(design, sample_id, scale=scale),
+            exposure=scale,
+            provenance={"summary": "sum"},
+        )
+        for sample_id, scale in (("a", 1.0), ("b", 2.5))
+    ]
+    serial = fit(design, samples, likelihood="quasi_poisson", use_bin_exposure=True)
+    parallel = fit(design, samples, likelihood="quasi_poisson", use_bin_exposure=True, n_jobs=3)
+    assert parallel.model_abundance.equals(serial.model_abundance)
+    assert parallel.locus_qc.equals(serial.locus_qc)
+    assert serial.model_abundance["abundance_standard_error"].is_not_nan().any()
