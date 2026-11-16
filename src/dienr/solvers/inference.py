@@ -88,14 +88,18 @@ class DispersionEstimate:
         """
         return self.dispersion > 1.0 + z * self.standard_error
 
-    def describe(self) -> dict[str, float | str]:
+    def describe(self) -> dict[str, float | str | None]:
         """Provenance record, so a reported error is never unattributed."""
         return {
             "dispersion": self.dispersion,
             "dispersion_method": "quasi_poisson_pearson_pooled",
             "dispersion_n_bins": float(self.n_bins),
             "dispersion_degrees_of_freedom": float(self.degrees_of_freedom),
-            "dispersion_standard_error": self.standard_error,
+            # None, not infinity, when there are no degrees of freedom (the
+            # assumed Poisson dispersion): infinity is not valid strict JSON.
+            "dispersion_standard_error": (
+                self.standard_error if np.isfinite(self.standard_error) else None
+            ),
             "overdispersion_detected": float(self.is_overdispersed()),
         }
 

@@ -207,7 +207,10 @@ class FitResult:
             "n_fits": self.summary.n_fits,
             "n_failures": self.summary.n_failures,
         }
-        (out / MANIFEST_FILENAME).write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+        # Strict JSON: a non-finite float (no JSON spelling) is written as null
+        # rather than as the non-standard `Infinity`/`NaN` other readers reject.
+        text = json.dumps(_finite_or_null(manifest), indent=2, sort_keys=True, allow_nan=False)
+        (out / MANIFEST_FILENAME).write_text(text + "\n")
         return out
 
     @classmethod
@@ -474,6 +477,17 @@ def collect_results(
         normalization_factors=_empty(NORMALIZATION_FACTORS_SCHEMA),
         provenance=manifest,
     )
+
+
+def _finite_or_null(value: Any) -> Any:
+    """`value` with every non-finite float, at any depth, replaced by None."""
+    if isinstance(value, float):
+        return value if np.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _finite_or_null(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_finite_or_null(item) for item in value]
+    return value
 
 
 def _qualified_status(status: FitStatus, conditioning: Any) -> str:

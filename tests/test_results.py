@@ -894,3 +894,21 @@ def test_penalty_value_reports_the_penalty_term(design):
         assert (rows["penalty_value"] == expected).all()
     unpenalized = fit(design, counts, likelihood="poisson").model_abundance
     assert (unpenalized["penalty_value"] == 0.0).all()
+
+
+def test_inactive_count_covers_only_transcripts_in_the_design(design):
+    """A typo'd list pins nothing; the manifest must not report it as applied."""
+    counts = synthetic_counts(design)
+    with pytest.warns(UserWarning, match="1 of 2 inactive"):
+        result = fit(design, counts, inactive_transcripts={"c", "no_such_tx"})
+    assert result.provenance["n_inactive_transcripts"] == 1
+    assert result.provenance["n_inactive_transcripts_not_in_design"] == 1
+
+
+def test_manifest_is_strict_json(design, tmp_path):
+    """The assumed Poisson dispersion has no standard error: null, not Infinity."""
+    counts = replace(synthetic_counts(design), provenance={"summary": "sum"})
+    out = fit(design, counts, likelihood="poisson").write(tmp_path / "r")
+    text = (out / "manifest.json").read_text()
+    manifest = json.loads(text, parse_constant=lambda name: pytest.fail(f"non-strict {name}"))
+    assert manifest["dispersion_standard_error"] is None

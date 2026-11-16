@@ -266,7 +266,18 @@ def _fit(
         merged.update(penalty.describe())
         merged["use_bin_exposure"] = use_bin_exposure
     if inactive_transcripts:
-        merged["n_inactive_transcripts"] = len(inactive_transcripts)
+        # Only identifiers in the design pin anything; a typo'd list pinned
+        # nothing while the manifest still reported its full length.
+        known = set(design.transcript_map["transcript_id"].to_list())
+        unknown = len(set(inactive_transcripts) - known)
+        merged["n_inactive_transcripts"] = len(set(inactive_transcripts)) - unknown
+        if unknown:
+            merged["n_inactive_transcripts_not_in_design"] = unknown
+            warnings.warn(
+                f"{unknown} of {len(set(inactive_transcripts))} inactive transcript(s) "
+                "are not in the design and pin nothing",
+                stacklevel=3,
+            )
     if provenance:
         merged.update(provenance)
     return collect_results(
