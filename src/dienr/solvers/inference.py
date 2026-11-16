@@ -161,6 +161,8 @@ def dispersion_term(
     *,
     exposure: Exposure | None = None,
     pinned: np.ndarray | None = None,
+    fitted: np.ndarray | None = None,
+    usable: np.ndarray | None = None,
 ) -> DispersionTerm | None:
     """One completed Poisson fit's Pearson statistic, or None if it has no usable bins.
 
@@ -168,15 +170,21 @@ def dispersion_term(
     only they reach, and so must this. Counting them put ``mu = MU_FLOOR``
     against real counts, and one pinned model took a pooled phi of 0.91 to
     1.5e14 -- and with it every standard error in the run.
+
+    `fitted` (the floored mean, as `_glm.mean` computes it) and `usable` may be
+    passed when the fit already has them -- `poisson.fit_locus_with_mean` does
+    -- and must then be exactly what this function would compute (plan 14.7).
     """
     exposure = exposure or Exposure()
     n_bins = models.shape[0]
-    usable = usable_bins(models, exposure, pinned)
+    if usable is None:
+        usable = usable_bins(models, exposure, pinned)
     if not usable.any():
         return None
     # NaN marks a model with no unmasked bins; its column is zero.
     abundance = nan_to_zero(abundance)
-    fitted = mean(abundance, models, exposure.scale(n_bins), exposure.offset(n_bins))
+    if fitted is None:
+        fitted = mean(abundance, models, exposure.scale(n_bins), exposure.offset(n_bins))
     residuals = pearson_residuals(observed, fitted, usable)
     return DispersionTerm(
         chi_squared=float(residuals @ residuals),

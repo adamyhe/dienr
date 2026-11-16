@@ -23,7 +23,7 @@ term and no pseudocount is introduced anywhere.
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import numpy as np
 from scipy.special import xlogy
@@ -252,7 +252,7 @@ def fit_locus(
     Returns:
         A `LocusFit`. Failures carry NaN abundance and a reason, never zeros.
     """
-    fit = _fit_locus(
+    fit, _ = fit_locus_with_mean(
         models,
         observed,
         exposure=exposure,
@@ -263,22 +263,80 @@ def fit_locus(
         min_unmasked_bins=min_unmasked_bins,
         prior_status=prior_status,
     )
+    return fit
+
+
+@dataclass(frozen=True)
+class FittedMean:
+    """The mean a general-path fit ended at, kept for the work that follows it.
+
+    `raw` is ``c * e * (M a) + beta`` without the `MU_FLOOR` floor -- the
+    fitted signal on the scale of the counts -- and `usable` the bins the fit
+    used. `fit_locus`'s fitted total and `inference.dispersion_term` each
+    rebuilt both, once per locus (plan 14.7). Internal: it is not a field of
+    `LocusFit`, which every worker pickles back.
+    """
+
+    raw: np.ndarray
+    usable: np.ndarray
+
+    @property
+    def floored(self) -> np.ndarray:
+        """What `_glm.mean` returns for the same fit: `raw` floored at `MU_FLOOR`."""
+        return np.maximum(self.raw, MU_FLOOR)
+
+
+def fit_locus_with_mean(
+    models: np.ndarray,
+    observed: np.ndarray,
+    *,
+    exposure: Exposure | None = None,
+    penalty: Penalty = NO_PENALTY,
+    inactive: np.ndarray | None = None,
+    initial: np.ndarray | None = None,
+    max_iterations: int = 15_000,
+    min_unmasked_bins: int = 1,
+    prior_status: FitStatus | None = None,
+) -> tuple[LocusFit, FittedMean | None]:
+    """`fit_locus`, plus the fitted mean when the general path computed one.
+
+    The mean is None for failures and for every shortcut (single-model closed
+    form, all-zero locus, unsupported columns); callers recompute it then.
+    """
+    mean_out: list[FittedMean] = []
+    fit = _fit_locus(
+        models,
+        observed,
+        exposure=exposure,
+        penalty=penalty,
+        inactive=inactive,
+        initial=initial,
+        max_iterations=max_iterations,
+        min_unmasked_bins=min_unmasked_bins,
+        prior_status=prior_status,
+        mean_out=mean_out,
+    )
+    fitted_mean = mean_out[0] if mean_out else None
     if is_failure(fit.status) or fit.fitted_total is not None:
-        return fit
+        return fit, fitted_mean
     # Report the fitted signal on the scale of the counts. `collect_results`
     # used to compute it as ``M a``, which ignores the exposure: 1/c of the
     # observed total at sample scale c, 1/250 with 250 bp bin exposure.
-    exposure = exposure or Exposure()
-    n_bins = models.shape[0]
     estimate = nan_to_zero(fit.abundance)
-    fitted = exposure.scale(n_bins) * (models @ estimate) + exposure.offset(n_bins)
+    if fitted_mean is not None:
+        fitted = fitted_mean.raw
+    else:
+        exposure = exposure or Exposure()
+        n_bins = models.shape[0]
+        fitted = exposure.scale(n_bins) * (models @ estimate) + exposure.offset(n_bins)
     residual = observed - fitted
-    return replace(
+    fit = replace(
         fit,
         fitted_total=float(fitted.sum()),
         residual_sum_of_squares=float(residual @ residual),
         penalty_value=penalty.value(estimate),
     )
+    return fit, fitted_mean
 
 
 def _fit_locus(
@@ -292,8 +350,13 @@ def _fit_locus(
     max_iterations: int = 15_000,
     min_unmasked_bins: int = 1,
     prior_status: FitStatus | None = None,
+    mean_out: list[FittedMean] | None = None,
 ) -> LocusFit:
-    """`fit_locus` without the fitted-signal summary."""
+    """`fit_locus` without the fitted-signal summary.
+
+    A general-path fit that returns OK or NONCONVERGED appends its
+    `FittedMean` to `mean_out`; every other return leaves it empty.
+    """
     exposure = exposure or Exposure()
     n_bins, n_models = models.shape
 
@@ -415,7 +478,9 @@ def _fit_locus(
             n_models, FitStatus.INVALID_MEAN, "optimizer returned non-finite abundance"
         )
 
-    mu = mean(abundance, models, scale, offset)
+    # `_glm.mean`'s expression, kept unfloored for the fitted total.
+    raw = scale * (models @ abundance) + offset
+    mu = np.maximum(raw, MU_FLOOR)
     if np.any(observed[usable] > 0) and np.any(mu[usable & (observed > 0)] <= MU_FLOOR_CHECK):
         # The mean collapsed where counts exist; the likelihood is unbounded
         # there and the estimate is meaningless.
@@ -425,6 +490,8 @@ def _fit_locus(
             "fitted mean vanished in a bin with nonzero counts",
         )
 
+    if mean_out is not None:
+        mean_out.append(FittedMean(raw=raw, usable=usable))
     return LocusFit(
         abundance=abundance,
         status=FitStatus.OK if converged else FitStatus.NONCONVERGED,

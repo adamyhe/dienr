@@ -1218,7 +1218,9 @@ identical (`model_abundance`, `locus_qc`, both cases), pinned by
 half to two-thirds the profile suggested: cProfile inflates cheap per-call
 functions most.
 
-**What is left, and what is not worth taking now.** ~30 us (legacy) and ~60 us
+**What is left, and what is not worth taking now.** *Corrected below: the
+second candidate's mechanism was wrong, and both were taken before release.*
+~30 us (legacy) and ~60 us
 (quasi-Poisson) per locus. The arithmetic the fixes require -- one more
 matrix-vector product for the fitted total, the fitted mean for the dispersion,
 one pass over `M` for the unit -- is a few microseconds at a median 64 x 1-3
@@ -1232,6 +1234,42 @@ goes through 14.6's task packaging; a direct serial path would recover most of
 Estimated together: one job within ~2-5% of 0.1.0. Shipped without them in
 0.2.0 -- 0.6-1.1 s on an ~8 s whole-genome fit, and only for library callers who
 keep `n_jobs=1`.
+
+**Both taken after all; the estimate was wrong on both counts.** Timed as above
+(job 4122294, two interleaved rounds, one-job cells within 1% between rounds;
+the 2-4 job cells moved 10-20% between rounds on a busy node and are not read):
+
+| one job, s | 0.1.0 | 0.2.0 as above | + one `mu` | + `assess` as its own pass |
+|---|---|---|---|---|
+| legacy | 7.57 | 8.32 | 8.27 | **8.02 (0.94x)** |
+| quasi-Poisson | 6.24 | 7.49 | 7.36 | **7.04 (0.89x)** |
+
+- **One `mu` per Poisson locus** (`poisson.fit_locus_with_mean`,
+  `FittedMean`): the general path keeps the unfloored `c e (M a) + beta` and its
+  usable mask; the fitted total reuses it and `dispersion_term(fitted=,
+  usable=)` takes both. Not a `LocusFit` field, so nothing more is pickled.
+  Worth **0.13 s**, not "most of the quasi-Poisson-specific cost": the
+  standard-error pass, which is in a separate pass and still rebuilds its own,
+  was most of it.
+- **There was no packaging to skip at one job.** 0.1.0 already fitted through
+  a task list, and `32cd20e` adds *no calls* at one job for legacy -- the same
+  call counts for every hot function, each 1-17% slower in self time (job
+  4122288; `gc.disable()` changed nothing). What it changed was *order*: the
+  conditioning SVD ran interleaved with every locus's fit instead of in a loop
+  afterwards. Moving it back to its own pass at `n_jobs=1` (with workers it
+  stays on them, where it parallelizes) recovered **0.25 s / 0.32 s** of
+  `32cd20e`'s +0.37-0.41 s. The likeliest reading is cache locality -- LAPACK's
+  SVD and L-BFGS-B's working set evicting each other -- but that is inferred
+  from "same calls, slower", not measured.
+
+Output identical for both (`model_abundance`, `locus_qc`, both cases, vs 0.2.0
+as above); pinned by `test_fit_locus_with_mean_hands_on_exactly_what_would_be_recomputed`
+(four exposure kinds, with and without pinning) and by
+`test_parallel_fit_is_identical_to_serial`, which now compares the two
+conditioning paths. What remains at one job -- ~0.45 s legacy, ~0.8 s
+quasi-Poisson -- is the correctness fixes' own work plus the standard-error
+pass's recomputation. **Lesson: when the call counts don't change and time
+does, look at order before overhead.**
 
 ## 15. Normalization and downstream inference
 

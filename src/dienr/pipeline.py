@@ -184,6 +184,11 @@ def _fit(
             )
 
     pinned = _pinned_models(design, inactive_transcripts)
+    # With workers, conditioning is assessed alongside each locus's first fit
+    # so the SVDs run in parallel (14.6). In one process that interleaving made
+    # every fit ~5% slower -- same calls, colder caches -- so there it is a
+    # separate pass after fitting instead (14.7). Same values either way.
+    assess_with_fit = n_jobs > 1
 
     options = _FitOptions(
         likelihood=likelihood,
@@ -206,7 +211,7 @@ def _fit(
             ),
             # Conditioning depends on the design alone, so it is assessed once
             # per locus, alongside the first sample's fit.
-            mask=design.mask(locus_id) if sample_index == 0 else None,
+            mask=design.mask(locus_id) if assess_with_fit and sample_index == 0 else None,
         )
         for sample_index, sample in enumerate(samples)
         for locus_id in range(design.n_loci)
@@ -249,12 +254,14 @@ def _fit(
         (sample, fits[index * design.n_loci : (index + 1) * design.n_loci])
         for index, sample in enumerate(samples)
     ]
-    # Every first-sample task assessed its locus, so this covers every locus.
-    conditioning = (
-        [output.conditioning for output in outputs[: design.n_loci] if output.conditioning]
-        if samples
-        else None
-    )
+    conditioning: list[LocusConditioning] | None
+    if not samples:
+        conditioning = None
+    elif assess_with_fit:
+        # Every first-sample task assessed its locus, so this covers every locus.
+        conditioning = [o.conditioning for o in outputs[: design.n_loci] if o.conditioning]
+    else:
+        conditioning = [assess(design.models[i], design.mask(i)) for i in range(design.n_loci)]
 
     merged: dict[str, Any] = {"likelihood": likelihood}
     merged.update(dispersion_record)
@@ -330,6 +337,7 @@ class _ErrorTask:
 
 def _fit_task(task: _LocusTask, options: _FitOptions) -> _TaskOutput:
     fit: LocusFit
+    fitted_mean: poisson.FittedMean | None = None
     if options.likelihood == "legacy":
         fit = fit_locus(
             task.models,
@@ -342,7 +350,7 @@ def _fit_task(task: _LocusTask, options: _FitOptions) -> _TaskOutput:
             log_offset=options.log_offset,
         )
     else:
-        fit = poisson.fit_locus(
+        fit, fitted_mean = poisson.fit_locus_with_mean(
             task.models,
             task.observed,
             exposure=task.exposure,
@@ -367,6 +375,10 @@ def _fit_task(task: _LocusTask, options: _FitOptions) -> _TaskOutput:
             fit.abundance,
             exposure=task.exposure,
             pinned=task.inactive,
+            # The fit's own mean and usable bins, when it has them: the same
+            # arrays this would rebuild, since the fit used the same `inactive`.
+            fitted=fitted_mean.floored if fitted_mean is not None else None,
+            usable=fitted_mean.usable if fitted_mean is not None else None,
         )
     return _TaskOutput(
         fit=fit,

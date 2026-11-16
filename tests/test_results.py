@@ -618,7 +618,9 @@ def test_blas_cap_is_active_while_fitting(design, monkeypatch):
         pytest.skip("no BLAS library visible to threadpoolctl (e.g. Accelerate)")
     seen: list[int] = []
     calls = 0
-    original = pipeline.poisson.fit_locus
+    # The pipeline fits through `fit_locus_with_mean`, which keeps the mean
+    # for the dispersion term (plan 14.7).
+    original = pipeline.poisson.fit_locus_with_mean
 
     def spy(*args, **kwargs):
         nonlocal calls
@@ -626,7 +628,7 @@ def test_blas_cap_is_active_while_fitting(design, monkeypatch):
         seen.extend(i["num_threads"] for i in threadpool_info() if i["user_api"] == "blas")
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(pipeline.poisson, "fit_locus", spy)
+    monkeypatch.setattr(pipeline.poisson, "fit_locus_with_mean", spy)
     fit(design, synthetic_counts(design), likelihood="poisson", blas_threads=1)
     assert calls > 0
     assert seen and set(seen) == {1}
