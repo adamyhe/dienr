@@ -138,6 +138,38 @@ def test_exposure_rescales_abundance_not_signal(design):
     np.testing.assert_allclose(without.abundance / scale, with_exposure.abundance, rtol=0.05)
 
 
+@pytest.mark.parametrize("power", [-6, 3, 13, 23, 33])
+def test_fit_is_exactly_equivariant_in_a_power_of_two_exposure(design, power):
+    """Exposure ``2**k`` must divide out of the estimate exactly.
+
+    The solver optimizes ``a * abundance_unit``, a power of two, so at such an
+    exposure it solves the unit-exposure problem bit for bit. Before, the
+    unscaled problem broke at large exposure: at 1e7 two models with truth
+    [22.25, 19.87] came back [59.0, 59.0] after one iteration, reported ``ok``.
+    """
+    observed = simulate(design, np.array([20.0, 35.0]), seed=2)
+    unit = poisson.fit_locus(design, observed)
+    scaled = poisson.fit_locus(design, observed, exposure=Exposure(sample_scale=2.0**power))
+    assert scaled.status is FitStatus.OK
+    np.testing.assert_array_equal(scaled.abundance * 2.0**power, unit.abundance)
+
+
+@pytest.mark.parametrize(
+    ("sample_scale", "bin_length"), [(1e7, None), (1e9, None), (1e4, 250.0), (30.0, 250.0)]
+)
+def test_large_exposure_recovers_the_unit_exposure_fit(design, sample_scale, bin_length):
+    """A library size in reads, or bin exposure, is a realistic exposure scale."""
+    observed = simulate(design, np.array([20.0, 35.0]), seed=2)
+    unit = poisson.fit_locus(design, observed)
+    bins = None if bin_length is None else np.full(design.shape[0], bin_length)
+    fit = poisson.fit_locus(
+        design, observed, exposure=Exposure(sample_scale=sample_scale, bin_exposure=bins)
+    )
+    assert fit.status is FitStatus.OK
+    total = sample_scale * (1.0 if bin_length is None else bin_length)
+    np.testing.assert_allclose(fit.abundance * total, unit.abundance, rtol=1e-4)
+
+
 def test_bin_exposure_accounts_for_partial_terminal_bins(design):
     """A half-length bin has had half the opportunity to accumulate reads."""
     lengths = np.ones(8)

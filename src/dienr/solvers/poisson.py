@@ -27,7 +27,14 @@ import numpy as np
 from scipy.special import xlogy
 
 from ..status import FitStatus, is_failure
-from ._glm import MU_FLOOR, Exposure, mean, moment_initialization, usable_bins
+from ._glm import (
+    MU_FLOOR,
+    Exposure,
+    abundance_unit,
+    mean,
+    moment_initialization,
+    usable_bins,
+)
 from ._lbfgsb import minimize_bounded
 from .legacy import _FREE_UPPER, _INACTIVE_UPPER, LocusFit, _short_circuit
 from .penalties import NO_PENALTY, Penalty
@@ -312,12 +319,26 @@ def fit_locus(
     upper = np.where(pinned, _INACTIVE_UPPER, _FREE_UPPER)
 
     fused = _value_and_grad(models, observed, exposure, penalty, pinned)
+    unit = abundance_unit(models, scale)
+    driven = fused
+    if unit != 1.0:
+        # Optimize b = a * unit, so the problem L-BFGS-B sees is O(1) whatever
+        # the exposure (see `abundance_unit`). The objective is unchanged; only
+        # the variable is rescaled, so penalties need no adjustment.
+
+        def driven(scaled: np.ndarray) -> tuple[float, np.ndarray]:
+            value, grad = fused(scaled / unit)
+            return value, grad / unit
+
     try:
         abundance, value, final_gradient, iterations, converged, message = minimize_bounded(
-            fused, start, np.zeros(n_models), upper, maxiter=max_iterations
+            driven, start * unit, np.zeros(n_models), upper * unit, maxiter=max_iterations
         )
     except (ValueError, FloatingPointError) as error:  # pragma: no cover - defensive
         return _short_circuit(n_models, FitStatus.NUMERICAL_ERROR, str(error))
+    if unit != 1.0:
+        abundance = abundance / unit
+        final_gradient = final_gradient * unit
 
     abundance[pinned] = 0.0
     if pinned.any():
