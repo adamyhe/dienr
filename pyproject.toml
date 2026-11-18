@@ -39,7 +39,7 @@ dependencies = [
 Homepage = "https://github.com/adamyhe/dienr"
 Documentation = "https://github.com/adamyhe/dienr/tree/main/docs"
 Issues = "https://github.com/adamyhe/dienr/issues"
-Changelog = "https://github.com/adamyhe/dienr/commits/main"
+Changelog = "https://github.com/adamyhe/dienr/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 # Polars' default runtime needs AVX2 and fails to import on older x86 CPUs.

@@ -108,6 +108,8 @@ coverage: the README badge is updated by hand from `uv run pytest --cov`.
 
 1. Bump `version` in `pyproject.toml` (the package reads it from there) and in
    `CITATION.cff`; `tests/test_version.py` fails if they disagree.
+   Move the `[Unreleased]` entries in `CHANGELOG.md` under the new version and
+   date, and add its compare link at the bottom.
 2. Optionally, run the *Publish* workflow by hand to upload to TestPyPI.
 3. Publish a GitHub release tagged `v<version>`. `.github/workflows/publish.yml`
    checks the tag against the package version, builds, and uploads to PyPI by

@@ -80,7 +80,8 @@ User guide (`docs/`):
 - [Outputs](docs/outputs.md): every output table and file.
 - [Differences from R DENR](docs/differences-from-denr.md).
 
-To contribute, see [CONTRIBUTING.md](CONTRIBUTING.md). For developers (`notes/`): the [implementation plan](notes/denr-python-implementation-plan.md)
+Release notes are in [CHANGELOG.md](CHANGELOG.md), plans in
+[ROADMAP.md](ROADMAP.md). To contribute, see [CONTRIBUTING.md](CONTRIBUTING.md). For developers (`notes/`): the [implementation plan](notes/denr-python-implementation-plan.md)
 is the binding design spec and the record of every validation experiment. See
 [notes/README.md](notes/README.md).
 
